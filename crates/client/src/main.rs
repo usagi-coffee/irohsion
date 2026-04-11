@@ -154,11 +154,13 @@ impl PathConnection {
 }
 
 async fn connect_path(binding: InterfaceBinding, server_addr: EndpointAddr) -> Result<PathConnection> {
-    let endpoint = Endpoint::builder(presets::N0)
+    let mut builder = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate(&mut rand::rng()))
         .alpns(vec![ALPN.to_vec()])
         .relay_mode(RelayMode::Default)
-        .clear_ip_transports()
+        .clear_ip_transports();
+    builder = builder.relay_bind_device(binding.name.clone());
+    let endpoint = builder
         .bind_addr(binding.bind_addr)
         .with_context(|| format!("failed to configure bind for {}", binding.bind_addr))?
         .bind()

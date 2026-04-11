@@ -164,6 +164,7 @@ async fn connect_path(binding: InterfaceBinding, server_addr: EndpointAddr) -> R
         .alpns(vec![ALPN.to_vec()])
         .relay_mode(RelayMode::Default)
         .clear_ip_transports()
+        .relay_bind_device(binding.name.clone())
         .bind_addr(binding.bind_addr)
         .with_context(|| format!("failed to configure bind for {}", binding.bind_addr))?
         .bind()
