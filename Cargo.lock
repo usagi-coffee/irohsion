@@ -1656,6 +1656,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "0.97.0"
+source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#eba93e44a101845eb68664c48183250c519964d6"
 dependencies = [
  "backon",
  "bytes",
@@ -1707,6 +1708,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "0.97.0"
+source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#eba93e44a101845eb68664c48183250c519964d6"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1753,6 +1755,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "0.97.0"
+source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#eba93e44a101845eb68664c48183250c519964d6"
 dependencies = [
  "blake3",
  "bytes",

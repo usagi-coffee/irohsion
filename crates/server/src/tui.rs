@@ -44,6 +44,7 @@ pub struct ServerUiState {
     buffered_packets: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
     current_session: Arc<AtomicU32>,
+    connection_activity_counter: Arc<AtomicU64>,
     connections: Arc<RwLock<BTreeMap<String, ConnectionView>>>,
 }
 
@@ -61,6 +62,7 @@ pub struct ConnectionView {
     pub received_bytes: u64,
     pub last_error: Option<String>,
     pub paths: Vec<PathRow>,
+    pub last_activity: u64,
 }
 
 pub struct ServerUi {
@@ -88,6 +90,7 @@ impl ServerUiState {
             buffered_packets: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
             current_session: Arc::new(AtomicU32::new(0)),
+            connection_activity_counter: Arc::new(AtomicU64::new(0)),
             connections: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
@@ -124,14 +127,18 @@ impl ServerUiState {
 
     pub fn record_connection(&self, remote: String, rows: Vec<PathRow>) {
         let mut connections = self.connections.write();
+        let activity = self.connection_activity_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let entry = connections.entry(remote).or_default();
         entry.paths = rows;
+        entry.last_activity = activity;
     }
 
     pub fn record_disconnect(&self, remote: String, error: String) {
         let mut connections = self.connections.write();
+        let activity = self.connection_activity_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let entry = connections.entry(remote).or_default();
         entry.last_error = Some(error.clone());
+        entry.last_activity = activity;
         entry.paths.iter_mut().for_each(|row| {
             row.status = format!("closed: {error}");
         });
@@ -139,9 +146,11 @@ impl ServerUiState {
 
     pub fn record_connection_receive(&self, remote: &str, bytes: u64) {
         let mut connections = self.connections.write();
+        let activity = self.connection_activity_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let entry = connections.entry(remote.to_string()).or_default();
         entry.received_packets += 1;
         entry.received_bytes += bytes;
+        entry.last_activity = activity;
     }
 
     pub fn record_received(&self, bytes: u64) {
@@ -212,6 +221,24 @@ fn run(state: ServerUiState) -> io::Result<()> {
                     state.request_quit();
                     break;
                 }
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        snapshot.connection_scroll = snapshot.connection_scroll.saturating_add(1);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        snapshot.connection_scroll = snapshot.connection_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown => {
+                        snapshot.connection_scroll = snapshot.connection_scroll.saturating_add(10);
+                    }
+                    KeyCode::PageUp => {
+                        snapshot.connection_scroll = snapshot.connection_scroll.saturating_sub(10);
+                    }
+                    KeyCode::Home => {
+                        snapshot.connection_scroll = 0;
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -231,6 +258,7 @@ struct Snapshot {
     last_received_bytes: u64,
     last_forwarded_bytes: u64,
     connection_last_bytes: BTreeMap<String, u64>,
+    connection_scroll: usize,
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Snapshot) {
@@ -306,7 +334,17 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
     frame.render_widget(stats, layout[1]);
 
     let connections = state.connections.read();
-    let rows = connections
+    let mut ordered = connections
+        .iter()
+        .map(|(remote, connection)| (remote.clone(), connection.clone()))
+        .collect::<Vec<_>>();
+    ordered.sort_by(|a, b| {
+        b.1.last_activity
+            .cmp(&a.1.last_activity)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let all_rows = ordered
         .iter()
         .flat_map(|(remote, connection)| {
             let previous_bytes = snapshot.connection_last_bytes.get(remote).copied().unwrap_or(0);
@@ -326,6 +364,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
             })
         })
         .collect::<Vec<_>>();
+    let visible_rows = layout[2].height.saturating_sub(3) as usize;
+    let max_scroll = all_rows.len().saturating_sub(visible_rows);
+    snapshot.connection_scroll = snapshot.connection_scroll.min(max_scroll);
+    let rows = all_rows
+        .into_iter()
+        .skip(snapshot.connection_scroll)
+        .take(visible_rows)
+        .collect::<Vec<_>>();
     let table = Table::new(
         rows,
         [
@@ -343,10 +389,17 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         Row::new(vec!["Remote", "Recv Pkts", "Recv MB", "Mbps", "Transport", "Selected", "Status", "Path"])
             .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     )
-    .block(Block::default().borders(Borders::ALL).title("Connections"));
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Connections {}-{}",
+        snapshot.connection_scroll.saturating_add(1),
+        snapshot
+            .connection_scroll
+            .saturating_add(visible_rows)
+            .min(max_scroll.saturating_add(visible_rows))
+    )));
     frame.render_widget(table, layout[2]);
 
-    snapshot.connection_last_bytes = connections
+    snapshot.connection_last_bytes = ordered
         .iter()
         .map(|(remote, connection)| (remote.clone(), connection.received_bytes))
         .collect();

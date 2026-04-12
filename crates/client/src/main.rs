@@ -114,21 +114,20 @@ async fn main() -> Result<()> {
         if let Some(ui) = &ui {
             ui.state.record_ingest(len as u64, src.to_string());
         }
-        let packet = Arc::new(encode_packet(
-            PacketHeader { session_id, seq },
-            &buf[..len],
-        ));
+        let packet = Arc::new(encode_packet(PacketHeader { session_id, seq }, &buf[..len]));
 
         info!(seq, bytes = len, from = %src, "ingested udp packet");
 
         for path in &paths {
             if let Err(err) = path.send(packet.clone()) {
                 if let Some(ui) = &ui {
-                    ui.state.record_send_error(path.interface_name.clone(), err.to_string());
+                    ui.state
+                        .record_send_error(path.interface_name.clone(), err.to_string());
                 }
                 error!(interface = %path.interface_name, seq, error = %err, "failed to send duplicated packet");
             } else if let Some(ui) = &ui {
-                ui.state.record_send(path.interface_name.clone(), len as u64);
+                ui.state
+                    .record_send(path.interface_name.clone(), len as u64);
             }
         }
 
@@ -153,7 +152,10 @@ impl PathConnection {
     }
 }
 
-async fn connect_path(binding: InterfaceBinding, server_addr: EndpointAddr) -> Result<PathConnection> {
+async fn connect_path(
+    binding: InterfaceBinding,
+    server_addr: EndpointAddr,
+) -> Result<PathConnection> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate(&mut rand::rng()))
         .alpns(vec![ALPN.to_vec()])
@@ -189,10 +191,7 @@ fn build_server_addr(
     relays: &[RelayUrl],
 ) -> Result<EndpointAddr> {
     let effective_relays = if relays.is_empty() {
-        vec![
-            RelayUrl::from_str(DEFAULT_RELAY_URL)
-                .context("invalid built-in default relay URL")?,
-        ]
+        vec![RelayUrl::from_str(DEFAULT_RELAY_URL).context("invalid built-in default relay URL")?]
     } else {
         relays.to_vec()
     };
@@ -303,8 +302,13 @@ async fn wait_for_shutdown(ui_state: Option<tui::ClientUiState>) {
 }
 
 fn init_tracing(ui_state: Option<tui::ClientUiState>) -> Result<()> {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| if ui_state.is_some() { "warn".into() } else { "client=info".into() });
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if ui_state.is_some() {
+            "warn".into()
+        } else {
+            "client=info".into()
+        }
+    });
     let builder = tracing_subscriber::fmt().with_env_filter(env_filter);
 
     if let Some(ui_state) = ui_state {
