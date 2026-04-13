@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/protocol",
+    "crates/transport",
     "crates/client",
     "crates/bench",
     "crates/server",
@@ -20,6 +21,7 @@ iroh = { git = "https://github.com/usagi-coffee/iroh", branch = "bindtodevice" }
 libc = "0.2"
 parking_lot = "0.12"
 protocol = { path = "crates/protocol" }
+transport = { path = "crates/transport" }
 rand = "0.9"
 ratatui = "0.29"
 tokio = { version = "1.48", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

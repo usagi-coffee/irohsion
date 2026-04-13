@@ -1,25 +1,14 @@
-use std::{
-    ffi::CStr,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    ptr,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, anyhow, bail};
-use bytes::Bytes;
+use anyhow::{Result, bail};
 use clap::Parser;
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
-    endpoint::presets,
-};
+use iroh::{EndpointId, RelayUrl};
 use protocol::{PacketHeader, encode_packet};
 use tokio::time::{Instant, sleep_until};
 use tracing::{error, info};
-
-const ALPN: &[u8] = b"irohsion/v1";
-const DEFAULT_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link";
+use transport::{
+    build_server_addr, connect_path, current_session_id, resolve_interface_ipv4, transport_kind,
+};
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -39,27 +28,6 @@ struct Cli {
     duration_secs: Option<u64>,
 }
 
-#[derive(Debug)]
-struct InterfaceBinding {
-    name: String,
-    bind_addr: SocketAddrV4,
-}
-
-struct PathConnection {
-    interface_name: String,
-    bound_addr: SocketAddrV4,
-    connection: iroh::endpoint::Connection,
-    _endpoint: Endpoint,
-}
-
-impl PathConnection {
-    fn send(&self, packet: Arc<Bytes>) -> Result<()> {
-        self.connection
-            .send_datagram((*packet).clone())
-            .map_err(|err| anyhow!("send_datagram failed on {}: {err}", self.interface_name))
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -76,6 +44,7 @@ async fn main() -> Result<()> {
     let mut paths = Vec::with_capacity(interface_bindings.len());
     for binding in interface_bindings {
         let path = connect_path(binding, remote_addr.clone()).await?;
+        log_connection_paths(&path.interface_name, &path.connection);
         info!(
             interface = %path.interface_name,
             local_addr = %path.bound_addr,
@@ -91,7 +60,9 @@ async fn main() -> Result<()> {
     let interval = Duration::from_secs_f64(1.0 / packets_per_second);
     let start = Instant::now();
     let mut next_tick = start;
-    let deadline = cli.duration_secs.map(|secs| start + Duration::from_secs(secs));
+    let deadline = cli
+        .duration_secs
+        .map(|secs| start + Duration::from_secs(secs));
 
     info!(
         session_id,
@@ -112,10 +83,7 @@ async fn main() -> Result<()> {
             break;
         }
 
-        let packet = Arc::new(encode_packet(
-            PacketHeader { session_id, seq },
-            &payload,
-        ));
+        let packet = Arc::new(encode_packet(PacketHeader { session_id, seq }, &payload));
         for path in &paths {
             if let Err(err) = path.send(packet.clone()) {
                 error!(interface = %path.interface_name, seq, error = %err, "failed to send bench packet");
@@ -129,7 +97,12 @@ async fn main() -> Result<()> {
         if sent_packets % 1000 == 0 {
             let elapsed = start.elapsed().as_secs_f64().max(0.001);
             let mbps = sent_payload_bytes as f64 * 8.0 / elapsed / 1_000_000.0;
-            info!(sent_packets, sent_payload_bytes, effective_mbps = mbps, "bench progress");
+            info!(
+                sent_packets,
+                sent_payload_bytes,
+                effective_mbps = mbps,
+                "bench progress"
+            );
         }
 
         next_tick += interval;
@@ -158,109 +131,6 @@ fn validate_cli(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn connect_path(binding: InterfaceBinding, server_addr: EndpointAddr) -> Result<PathConnection> {
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::generate(&mut rand::rng()))
-        .alpns(vec![ALPN.to_vec()])
-        .relay_mode(RelayMode::Default)
-        .clear_ip_transports()
-        .relay_bind_device(binding.name.clone())
-        .bind_addr(binding.bind_addr)
-        .with_context(|| format!("failed to configure bind for {}", binding.bind_addr))?
-        .bind()
-        .await
-        .with_context(|| format!("failed to bind iroh endpoint for {}", binding.bind_addr))?;
-
-    endpoint.online().await;
-
-    let connection = endpoint
-        .connect(server_addr, ALPN)
-        .await
-        .with_context(|| format!("failed to connect path {}", binding.name))?;
-    log_connection_paths(&binding.name, &connection);
-
-    Ok(PathConnection {
-        interface_name: binding.name,
-        bound_addr: binding.bind_addr,
-        connection,
-        _endpoint: endpoint,
-    })
-}
-
-fn build_server_addr(
-    endpoint: EndpointId,
-    addrs: &[SocketAddr],
-    relays: &[RelayUrl],
-) -> Result<EndpointAddr> {
-    let effective_relays = if relays.is_empty() {
-        vec![
-            RelayUrl::from_str(DEFAULT_RELAY_URL)
-                .context("invalid built-in default relay URL")?,
-        ]
-    } else {
-        relays.to_vec()
-    };
-
-    let transports = addrs
-        .iter()
-        .copied()
-        .map(TransportAddr::Ip)
-        .chain(effective_relays.into_iter().map(TransportAddr::Relay));
-
-    Ok(EndpointAddr::from_parts(endpoint, transports))
-}
-
-fn resolve_interface_ipv4(name: &str) -> Result<InterfaceBinding> {
-    let addr = find_interface_ipv4(name)?;
-    Ok(InterfaceBinding {
-        name: name.to_string(),
-        bind_addr: SocketAddrV4::new(addr, 0),
-    })
-}
-
-fn find_interface_ipv4(name: &str) -> Result<Ipv4Addr> {
-    let mut ifaddrs = ptr::null_mut();
-    let rc = unsafe { libc::getifaddrs(&mut ifaddrs) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error()).context("getifaddrs failed");
-    }
-
-    let mut cursor = ifaddrs;
-    let mut saw_name = false;
-    let mut found = None;
-
-    while !cursor.is_null() {
-        let item = unsafe { &*cursor };
-        let iface_name = unsafe { CStr::from_ptr(item.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
-
-        if iface_name == name {
-            saw_name = true;
-            let addr_ptr = item.ifa_addr;
-            if !addr_ptr.is_null() && unsafe { (*addr_ptr).sa_family as i32 } == libc::AF_INET {
-                let sin = unsafe { *(addr_ptr as *const libc::sockaddr_in) };
-                found = Some(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
-                break;
-            }
-        }
-
-        cursor = item.ifa_next;
-    }
-
-    unsafe {
-        libc::freeifaddrs(ifaddrs);
-    }
-
-    if let Some(addr) = found {
-        return Ok(addr);
-    }
-    if saw_name {
-        bail!("interface `{name}` does not have an IPv4 address");
-    }
-    bail!("interface `{name}` does not exist");
-}
-
 fn log_connection_paths(interface_name: &str, connection: &iroh::endpoint::Connection) {
     for path in connection.paths() {
         info!(
@@ -272,24 +142,6 @@ fn log_connection_paths(interface_name: &str, connection: &iroh::endpoint::Conne
             "bench connection path"
         );
     }
-}
-
-fn transport_kind(path: &iroh::endpoint::PathInfo) -> &'static str {
-    if path.is_ip() {
-        "direct"
-    } else if path.is_relay() {
-        "relay"
-    } else {
-        "other"
-    }
-}
-
-fn current_session_id() -> Result<u32> {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_secs();
-    u32::try_from(seconds).context("current unix timestamp does not fit in u32 session_id")
 }
 
 fn init_tracing() {

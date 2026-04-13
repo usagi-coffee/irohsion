@@ -23,7 +23,10 @@ impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DecodeError::TooShort { actual } => {
-                write!(f, "packet too short: expected at least {HEADER_LEN} bytes, got {actual}")
+                write!(
+                    f,
+                    "packet too short: expected at least {HEADER_LEN} bytes, got {actual}"
+                )
             }
         }
     }

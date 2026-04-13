@@ -23,7 +23,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
-use tracing_subscriber::fmt::writer::MakeWriter;
+use transport::transport_kind;
 
 #[derive(Clone)]
 pub struct ClientUiState {
@@ -53,6 +53,19 @@ pub struct PathRow {
 pub struct ClientUi {
     pub state: ClientUiState,
     _join: thread::JoinHandle<()>,
+}
+
+pub fn describe_paths(connection: &iroh::endpoint::Connection) -> Vec<PathRow> {
+    connection
+        .paths()
+        .into_iter()
+        .map(|path| PathRow {
+            remote_addr: path.remote_addr().to_string(),
+            transport: transport_kind(&path).to_string(),
+            selected: path.is_selected(),
+            status: if path.is_closed() { "closed" } else { "up" }.to_string(),
+        })
+        .collect()
 }
 
 impl ClientUiState {
@@ -93,12 +106,16 @@ impl ClientUiState {
 
     pub fn record_send_error(&self, interface: String, error: String) {
         self.send_errors.fetch_add(1, Ordering::Relaxed);
-        self.paths.write().entry(interface).or_default().push(PathRow {
-            remote_addr: error,
-            transport: "error".to_string(),
-            selected: false,
-            status: "failed".to_string(),
-        });
+        self.paths
+            .write()
+            .entry(interface)
+            .or_default()
+            .push(PathRow {
+                remote_addr: error,
+                transport: "error".to_string(),
+                selected: false,
+                status: "failed".to_string(),
+            });
     }
 
     pub fn record_path(&self, interface: String, rows: Vec<PathRow>) {
@@ -111,12 +128,6 @@ impl ClientUiState {
             logs.pop_front();
         }
         logs.push_back(line);
-    }
-
-    pub fn log_writer(&self) -> TuiLogWriterFactory {
-        TuiLogWriterFactory {
-            state: self.clone(),
-        }
     }
 
     pub fn request_quit(&self) {
@@ -152,7 +163,9 @@ fn run(state: ClientUiState) -> io::Result<()> {
             if let Event::Key(key) = event::read()? {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
                     || matches!(key.code, KeyCode::Char('c'))
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
                 {
                     state.request_quit();
                     break;
@@ -197,20 +210,39 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         .unwrap_or(1.0);
     let ingested_bytes = state.ingested_bytes.load(Ordering::Relaxed);
     let sent_bytes = state.sent_bytes.load(Ordering::Relaxed);
-    let ingest_mbps = (ingested_bytes.saturating_sub(snapshot.last_ingested_bytes)) as f64 * 8.0 / delta / 1_000_000.0;
-    let send_mbps = (sent_bytes.saturating_sub(snapshot.last_sent_bytes)) as f64 * 8.0 / delta / 1_000_000.0;
+    let ingest_mbps = (ingested_bytes.saturating_sub(snapshot.last_ingested_bytes)) as f64 * 8.0
+        / delta
+        / 1_000_000.0;
+    let send_mbps =
+        (sent_bytes.saturating_sub(snapshot.last_sent_bytes)) as f64 * 8.0 / delta / 1_000_000.0;
     snapshot.last_at = Some(now);
     snapshot.last_ingested_bytes = ingested_bytes;
     snapshot.last_sent_bytes = sent_bytes;
 
     let header = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Irohsion Client", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Irohsion Client",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("uptime {}", fmt_uptime(state.started_at.elapsed())), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("uptime {}", fmt_uptime(state.started_at.elapsed())),
+                Style::default().fg(Color::Gray),
+            ),
         ]),
-        Line::from(format!("endpoint {}  port {}  interfaces {}", state.endpoint, state.port, state.interfaces.join(", "))),
-        Line::from(format!("last ingest from {}", state.last_ingest_from.read().clone())),
+        Line::from(format!(
+            "endpoint {}  port {}  interfaces {}",
+            state.endpoint,
+            state.port,
+            state.interfaces.join(", ")
+        )),
+        Line::from(format!(
+            "last ingest from {}",
+            state.last_ingest_from.read().clone()
+        )),
     ])
     .block(Block::default().borders(Borders::ALL).title("Overview"))
     .wrap(Wrap { trim: true });
@@ -266,8 +298,18 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         ],
     )
     .header(
-        Row::new(vec!["Interface", "Transport", "Selected", "Status", "Remote"])
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Row::new(vec![
+            "Interface",
+            "Transport",
+            "Selected",
+            "Status",
+            "Remote",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .block(Block::default().borders(Borders::ALL).title("Paths"));
     frame.render_widget(table, layout[2]);
@@ -296,50 +338,4 @@ fn fmt_uptime(elapsed: Duration) -> String {
         (elapsed.as_secs() / 60) % 60,
         elapsed.as_secs() % 60
     )
-}
-
-#[derive(Clone)]
-pub struct TuiLogWriterFactory {
-    state: ClientUiState,
-}
-
-impl<'a> MakeWriter<'a> for TuiLogWriterFactory {
-    type Writer = TuiLogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        TuiLogWriter {
-            state: self.state.clone(),
-            buffer: Vec::new(),
-        }
-    }
-}
-
-pub struct TuiLogWriter {
-    state: ClientUiState,
-    buffer: Vec<u8>,
-}
-
-impl io::Write for TuiLogWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
-            let line = self.buffer.drain(..=pos).collect::<Vec<_>>();
-            let line = String::from_utf8_lossy(&line).trim().to_string();
-            if !line.is_empty() {
-                self.state.push_log_line(line);
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if !self.buffer.is_empty() {
-            let line = String::from_utf8_lossy(&self.buffer).trim().to_string();
-            if !line.is_empty() {
-                self.state.push_log_line(line);
-            }
-            self.buffer.clear();
-        }
-        Ok(())
-    }
 }

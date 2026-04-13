@@ -1,33 +1,33 @@
+mod context;
+mod runtime;
 mod tui;
 
 use std::{
-    ffi::CStr,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    ptr,
     str::FromStr,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use bytes::Bytes;
+use anyhow::{Context, Result};
 use clap::Parser;
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
-    endpoint::presets,
-};
+use context::ClientCtx;
+use iroh::{EndpointId, RelayUrl, SecretKey};
+use parking_lot::RwLock;
 use protocol::{PacketHeader, encode_packet};
+use runtime::wait_for_shutdown;
 use tokio::net::UdpSocket;
-use tracing::{error, info};
+use transport::{
+    build_server_addr, connect_path_with_secret, current_session_id, resolve_interface_ipv4,
+};
 
-const ALPN: &[u8] = b"irohsion/v1";
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
-const DEFAULT_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link";
 
 #[derive(Debug, Parser)]
 struct Cli {
     #[arg(long)]
     port: u16,
+    #[arg(long)]
+    secret: Option<String>,
     #[arg(long)]
     endpoint: EndpointId,
     #[arg(long = "addr")]
@@ -40,12 +40,6 @@ struct Cli {
     tui: bool,
 }
 
-#[derive(Debug)]
-struct InterfaceBinding {
-    name: String,
-    bind_addr: SocketAddrV4,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -56,7 +50,14 @@ async fn main() -> Result<()> {
             cli.interfaces.clone(),
         ))
     });
-    init_tracing(ui.as_ref().map(|ui| ui.state.clone()))?;
+    let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
+
+    let secret_key = match cli.secret.as_deref() {
+        Some(secret) => {
+            SecretKey::from_str(secret).context("invalid --secret; expected iroh secret key hex")
+        }
+        None => Ok(SecretKey::generate(&mut rand::rng())),
+    }?;
 
     let interface_bindings = cli
         .interfaces
@@ -67,42 +68,65 @@ async fn main() -> Result<()> {
     let listen_udp = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, cli.port));
     let server_addr = build_server_addr(cli.endpoint, &cli.addrs, &cli.relays)?;
     let session_id = current_session_id()?;
-    let listen_socket = UdpSocket::bind(listen_udp)
-        .await
-        .with_context(|| format!("failed to bind local UDP ingest socket on {listen_udp}"))?;
+    let listen_socket = Arc::new(
+        UdpSocket::bind(listen_udp)
+            .await
+            .with_context(|| format!("failed to bind local UDP ingest socket on {listen_udp}"))?,
+    );
+    // Replies from the server are sent back to whichever local UDP peer most recently fed us data.
+    let last_ingest_peer = Arc::new(RwLock::new(None::<SocketAddr>));
 
+    // Each configured interface gets its own iroh connection/path to the server.
     let mut paths = Vec::with_capacity(interface_bindings.len());
     for binding in interface_bindings {
-        let path = connect_path(binding, server_addr.clone()).await?;
-        if let Some(ui) = &ui {
-            ui.state.record_path(
-                path.interface_name.clone(),
-                path.connection
-                    .paths()
-                    .into_iter()
-                    .map(|path| tui::PathRow {
-                        remote_addr: path.remote_addr().to_string(),
-                        transport: transport_kind(&path).to_string(),
-                        selected: path.is_selected(),
-                        status: if path.is_closed() { "closed" } else { "up" }.to_string(),
-                    })
-                    .collect(),
-            );
-        }
-        info!(
-            interface = %path.interface_name,
-            local_addr = %path.bound_addr,
-            "connected interface-bound iroh path"
-        );
+        let path =
+            connect_path_with_secret(binding, server_addr.clone(), secret_key.clone()).await?;
+        ctx.record_connection_paths(path.interface_name.clone(), &path.connection);
+        ctx.connected_path(&path.interface_name, SocketAddr::V4(path.bound_addr));
         paths.push(path);
     }
 
-    info!(session_id, udp_listen = %listen_udp, paths = paths.len(), "client ready");
+    for path in &paths {
+        let interface_name = path.interface_name.clone();
+        let connection = path.connection.clone();
+        let listen_socket = listen_socket.clone();
+        let last_ingest_peer = last_ingest_peer.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            // Server-to-client replies arrive over iroh and are bridged back onto the local UDP socket.
+            loop {
+                match connection.read_datagram().await {
+                    Ok(payload) => {
+                        let Some(peer) = last_ingest_peer.read().as_ref().copied() else {
+                            ctx.missing_return_peer(&interface_name, payload.len());
+                            continue;
+                        };
+
+                        if let Err(err) = listen_socket.send_to(&payload, peer).await {
+                            ctx.return_forward_error(&interface_name, peer, &err.to_string());
+                        } else {
+                            ctx.forwarded_return_packet(&interface_name, peer, payload.len());
+                        }
+                    }
+                    Err(err) => {
+                        ctx.record_send_error(
+                            interface_name.clone(),
+                            format!("return path closed: {err}"),
+                        );
+                        ctx.return_path_closed(&interface_name, &err.to_string());
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    ctx.client_ready(session_id, listen_udp, paths.len());
 
     let mut seq = 0_u64;
     let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];
     loop {
-        let shutdown = wait_for_shutdown(ui.as_ref().map(|ui| ui.state.clone()));
+        let shutdown = wait_for_shutdown(ctx.ui_state());
         let (len, src) = tokio::select! {
             res = listen_socket.recv_from(&mut buf) => {
                 res.context("failed reading from local UDP ingest socket")?
@@ -111,215 +135,28 @@ async fn main() -> Result<()> {
                 break;
             }
         };
-        if let Some(ui) = &ui {
-            ui.state.record_ingest(len as u64, src.to_string());
-        }
+
+        // Remember the active local UDP peer so reverse traffic has somewhere to go.
+        *last_ingest_peer.write() = Some(src);
+        ctx.record_ingest(len as u64, src.to_string());
+
         let packet = Arc::new(encode_packet(PacketHeader { session_id, seq }, &buf[..len]));
+        ctx.ingested_packet(seq, len, src);
 
-        info!(seq, bytes = len, from = %src, "ingested udp packet");
-
+        // Duplicate each ingested packet over every active interface-bound iroh path.
         for path in &paths {
-            if let Err(err) = path.send(packet.clone()) {
-                if let Some(ui) = &ui {
-                    ui.state
-                        .record_send_error(path.interface_name.clone(), err.to_string());
+            match path.send(packet.clone()) {
+                Ok(()) => {
+                    ctx.record_send(path.interface_name.clone(), len as u64);
                 }
-                error!(interface = %path.interface_name, seq, error = %err, "failed to send duplicated packet");
-            } else if let Some(ui) = &ui {
-                ui.state
-                    .record_send(path.interface_name.clone(), len as u64);
+                Err(err) => {
+                    ctx.record_send_error(path.interface_name.clone(), err.to_string());
+                    ctx.send_failure(&path.interface_name, seq, &err.to_string());
+                }
             }
         }
 
         seq = seq.wrapping_add(1);
-    }
-
-    Ok(())
-}
-
-struct PathConnection {
-    interface_name: String,
-    bound_addr: SocketAddrV4,
-    connection: iroh::endpoint::Connection,
-    _endpoint: Endpoint,
-}
-
-impl PathConnection {
-    fn send(&self, packet: Arc<Bytes>) -> Result<()> {
-        self.connection
-            .send_datagram((*packet).clone())
-            .map_err(|err| anyhow!("send_datagram failed on {}: {err}", self.interface_name))
-    }
-}
-
-async fn connect_path(
-    binding: InterfaceBinding,
-    server_addr: EndpointAddr,
-) -> Result<PathConnection> {
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::generate(&mut rand::rng()))
-        .alpns(vec![ALPN.to_vec()])
-        .relay_mode(RelayMode::Default)
-        .clear_ip_transports();
-    builder = builder.relay_bind_device(binding.name.clone());
-    let endpoint = builder
-        .bind_addr(binding.bind_addr)
-        .with_context(|| format!("failed to configure bind for {}", binding.bind_addr))?
-        .bind()
-        .await
-        .with_context(|| format!("failed to bind iroh endpoint for {}", binding.bind_addr))?;
-
-    endpoint.online().await;
-
-    let connection = endpoint
-        .connect(server_addr, ALPN)
-        .await
-        .with_context(|| format!("failed to connect path {}", binding.name))?;
-    log_connection_paths("client", &binding.name, &connection);
-
-    Ok(PathConnection {
-        interface_name: binding.name,
-        bound_addr: binding.bind_addr,
-        connection,
-        _endpoint: endpoint,
-    })
-}
-
-fn build_server_addr(
-    endpoint: EndpointId,
-    addrs: &[SocketAddr],
-    relays: &[RelayUrl],
-) -> Result<EndpointAddr> {
-    let effective_relays = if relays.is_empty() {
-        vec![RelayUrl::from_str(DEFAULT_RELAY_URL).context("invalid built-in default relay URL")?]
-    } else {
-        relays.to_vec()
-    };
-
-    let transports = addrs
-        .iter()
-        .copied()
-        .map(TransportAddr::Ip)
-        .chain(effective_relays.into_iter().map(TransportAddr::Relay));
-
-    Ok(EndpointAddr::from_parts(endpoint, transports))
-}
-
-fn resolve_interface_ipv4(name: &str) -> Result<InterfaceBinding> {
-    let addr = find_interface_ipv4(name)?;
-    Ok(InterfaceBinding {
-        name: name.to_string(),
-        bind_addr: SocketAddrV4::new(addr, 0),
-    })
-}
-
-fn find_interface_ipv4(name: &str) -> Result<Ipv4Addr> {
-    let mut ifaddrs = ptr::null_mut();
-    let rc = unsafe { libc::getifaddrs(&mut ifaddrs) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error()).context("getifaddrs failed");
-    }
-
-    let mut cursor = ifaddrs;
-    let mut saw_name = false;
-    let mut found = None;
-
-    while !cursor.is_null() {
-        let item = unsafe { &*cursor };
-        let iface_name = unsafe { CStr::from_ptr(item.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
-
-        if iface_name == name {
-            saw_name = true;
-            let addr_ptr = item.ifa_addr;
-            if !addr_ptr.is_null() && unsafe { (*addr_ptr).sa_family as i32 } == libc::AF_INET {
-                let sin = unsafe { *(addr_ptr as *const libc::sockaddr_in) };
-                found = Some(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
-                break;
-            }
-        }
-
-        cursor = item.ifa_next;
-    }
-
-    unsafe {
-        libc::freeifaddrs(ifaddrs);
-    }
-
-    if let Some(addr) = found {
-        return Ok(addr);
-    }
-    if saw_name {
-        bail!("interface `{name}` does not have an IPv4 address");
-    }
-    bail!("interface `{name}` does not exist");
-}
-
-fn log_connection_paths(side: &str, interface_name: &str, connection: &iroh::endpoint::Connection) {
-    for path in connection.paths() {
-        info!(
-            side,
-            interface = interface_name,
-            selected = path.is_selected(),
-            closed = path.is_closed(),
-            transport = transport_kind(&path),
-            remote_addr = %path.remote_addr(),
-            "connection path"
-        );
-    }
-}
-
-fn transport_kind(path: &iroh::endpoint::PathInfo) -> &'static str {
-    if path.is_ip() {
-        "direct"
-    } else if path.is_relay() {
-        "relay"
-    } else {
-        "other"
-    }
-}
-
-fn current_session_id() -> Result<u32> {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_secs();
-    u32::try_from(seconds).context("current unix timestamp does not fit in u32 session_id")
-}
-
-async fn wait_for_shutdown(ui_state: Option<tui::ClientUiState>) {
-    if let Some(ui_state) = ui_state {
-        loop {
-            if ui_state.should_quit() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    } else {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-fn init_tracing(ui_state: Option<tui::ClientUiState>) -> Result<()> {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if ui_state.is_some() {
-            "warn".into()
-        } else {
-            "client=info".into()
-        }
-    });
-    let builder = tracing_subscriber::fmt().with_env_filter(env_filter);
-
-    if let Some(ui_state) = ui_state {
-        builder
-            .with_writer(ui_state.log_writer())
-            .try_init()
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    } else {
-        builder
-            .try_init()
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     }
 
     Ok(())

@@ -13,7 +13,7 @@ The system should:
 - receive duplicated packets on the server
 - drop duplicates
 - forward payloads in order to target socket
-- feed clean output into FFmpeg, then RTMP
+- forward responses back to the client
 
 ## Crate Responsibilities
 

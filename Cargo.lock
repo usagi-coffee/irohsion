@@ -227,6 +227,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "transport",
 ]
 
 [[package]]
@@ -399,8 +400,7 @@ dependencies = [
  "rand",
  "ratatui",
  "tokio",
- "tracing",
- "tracing-subscriber",
+ "transport",
 ]
 
 [[package]]
@@ -3040,6 +3040,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "crossterm 0.29.0",
  "iroh",
@@ -3048,8 +3049,7 @@ dependencies = [
  "rand",
  "ratatui",
  "tokio",
- "tracing",
- "tracing-subscriber",
+ "transport",
 ]
 
 [[package]]
@@ -3612,6 +3612,18 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "iroh",
+ "libc",
+ "rand",
+ "tracing",
 ]
 
 [[package]]

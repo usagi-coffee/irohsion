@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     io::{self, Stdout},
     sync::{
         Arc,
@@ -23,16 +23,14 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
-use tracing_subscriber::fmt::writer::MakeWriter;
+use transport::transport_kind;
 
 #[derive(Clone)]
 pub struct ServerUiState {
     started_at: Instant,
     endpoint: Arc<RwLock<String>>,
-    rtmp: String,
-    ffmpeg_input_udp: String,
+    udp_dest: String,
     server_addrs: Arc<RwLock<Vec<String>>>,
-    logs: Arc<RwLock<VecDeque<String>>>,
     quit_requested: Arc<AtomicBool>,
     received_packets: Arc<AtomicU64>,
     received_bytes: Arc<AtomicU64>,
@@ -70,15 +68,39 @@ pub struct ServerUi {
     _join: thread::JoinHandle<()>,
 }
 
+pub fn server_addrs(endpoint: &iroh::Endpoint) -> Vec<String> {
+    let addr = endpoint.addr();
+    let mut lines = Vec::new();
+    lines.push(format!("server_id={}", endpoint.id()));
+    for ip in addr.ip_addrs() {
+        lines.push(format!("server_addr=ip:{ip}"));
+    }
+    for relay in addr.relay_urls() {
+        lines.push(format!("server_addr=relay:{relay}"));
+    }
+    lines
+}
+
+pub fn describe_paths(connection: &iroh::endpoint::Connection) -> Vec<PathRow> {
+    connection
+        .paths()
+        .into_iter()
+        .map(|path| PathRow {
+            remote_addr: path.remote_addr().to_string(),
+            transport: transport_kind(&path).to_string(),
+            selected: path.is_selected(),
+            status: if path.is_closed() { "closed" } else { "up" }.to_string(),
+        })
+        .collect()
+}
+
 impl ServerUiState {
-    pub fn new(rtmp: String, ffmpeg_input_udp: String) -> Self {
+    pub fn new(udp_dest: String) -> Self {
         Self {
             started_at: Instant::now(),
             endpoint: Arc::new(RwLock::new("-".to_string())),
-            rtmp,
-            ffmpeg_input_udp,
+            udp_dest,
             server_addrs: Arc::new(RwLock::new(Vec::new())),
-            logs: Arc::new(RwLock::new(VecDeque::with_capacity(128))),
             quit_requested: Arc::new(AtomicBool::new(false)),
             received_packets: Arc::new(AtomicU64::new(0)),
             received_bytes: Arc::new(AtomicU64::new(0)),
@@ -103,20 +125,6 @@ impl ServerUiState {
         *self.server_addrs.write() = addrs;
     }
 
-    pub fn push_log_line(&self, line: String) {
-        let mut logs = self.logs.write();
-        if logs.len() >= 120 {
-            logs.pop_front();
-        }
-        logs.push_back(line);
-    }
-
-    pub fn log_writer(&self) -> TuiLogWriterFactory {
-        TuiLogWriterFactory {
-            state: self.clone(),
-        }
-    }
-
     pub fn request_quit(&self) {
         self.quit_requested.store(true, Ordering::Relaxed);
     }
@@ -127,7 +135,10 @@ impl ServerUiState {
 
     pub fn record_connection(&self, remote: String, rows: Vec<PathRow>) {
         let mut connections = self.connections.write();
-        let activity = self.connection_activity_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let activity = self
+            .connection_activity_counter
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         let entry = connections.entry(remote).or_default();
         entry.paths = rows;
         entry.last_activity = activity;
@@ -135,7 +146,10 @@ impl ServerUiState {
 
     pub fn record_disconnect(&self, remote: String, error: String) {
         let mut connections = self.connections.write();
-        let activity = self.connection_activity_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let activity = self
+            .connection_activity_counter
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         let entry = connections.entry(remote).or_default();
         entry.last_error = Some(error.clone());
         entry.last_activity = activity;
@@ -146,7 +160,10 @@ impl ServerUiState {
 
     pub fn record_connection_receive(&self, remote: &str, bytes: u64) {
         let mut connections = self.connections.write();
-        let activity = self.connection_activity_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let activity = self
+            .connection_activity_counter
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         let entry = connections.entry(remote.to_string()).or_default();
         entry.received_packets += 1;
         entry.received_bytes += bytes;
@@ -216,7 +233,9 @@ fn run(state: ServerUiState) -> io::Result<()> {
             if let Event::Key(key) = event::read()? {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
                     || matches!(key.code, KeyCode::Char('c'))
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
                 {
                     state.request_quit();
                     break;
@@ -268,8 +287,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         .constraints([
             Constraint::Length(7),
             Constraint::Length(8),
-            Constraint::Min(6),
-            Constraint::Length(8),
+            Constraint::Min(14),
         ])
         .split(area);
 
@@ -281,22 +299,40 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         .unwrap_or(1.0);
     let recv_bytes = state.received_bytes.load(Ordering::Relaxed);
     let fwd_bytes = state.forwarded_bytes.load(Ordering::Relaxed);
-    let recv_mbps = (recv_bytes.saturating_sub(snapshot.last_received_bytes)) as f64 * 8.0 / delta / 1_000_000.0;
-    let fwd_mbps = (fwd_bytes.saturating_sub(snapshot.last_forwarded_bytes)) as f64 * 8.0 / delta / 1_000_000.0;
+    let recv_mbps = (recv_bytes.saturating_sub(snapshot.last_received_bytes)) as f64 * 8.0
+        / delta
+        / 1_000_000.0;
+    let fwd_mbps = (fwd_bytes.saturating_sub(snapshot.last_forwarded_bytes)) as f64 * 8.0
+        / delta
+        / 1_000_000.0;
     snapshot.last_at = Some(now);
     snapshot.last_received_bytes = recv_bytes;
     snapshot.last_forwarded_bytes = fwd_bytes;
 
     let header = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Irohsion Server", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Irohsion Server",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
-            Span::styled(format!("uptime {}", fmt_uptime(state.started_at.elapsed())), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("uptime {}", fmt_uptime(state.started_at.elapsed())),
+                Style::default().fg(Color::Gray),
+            ),
         ]),
         Line::from(format!("endpoint {}", state.endpoint.read().clone())),
-        Line::from(format!("rtmp {}  ffmpeg udp {}", state.rtmp, state.ffmpeg_input_udp)),
-        Line::from(format!("direct {}", format_addrs(&state.server_addrs.read(), "ip:"))),
-        Line::from(format!("relay  {}", format_addrs(&state.server_addrs.read(), "relay:"))),
+        Line::from(format!("udp destination {}", state.udp_dest)),
+        Line::from(format!(
+            "direct {}",
+            format_addrs(&state.server_addrs.read(), "ip:")
+        )),
+        Line::from(format!(
+            "relay  {}",
+            format_addrs(&state.server_addrs.read(), "relay:")
+        )),
     ])
     .block(Block::default().borders(Borders::ALL).title("Overview"))
     .wrap(Wrap { trim: true });
@@ -347,14 +383,22 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
     let all_rows = ordered
         .iter()
         .flat_map(|(remote, connection)| {
-            let previous_bytes = snapshot.connection_last_bytes.get(remote).copied().unwrap_or(0);
-            let conn_mbps =
-                (connection.received_bytes.saturating_sub(previous_bytes)) as f64 * 8.0 / delta / 1_000_000.0;
+            let previous_bytes = snapshot
+                .connection_last_bytes
+                .get(remote)
+                .copied()
+                .unwrap_or(0);
+            let conn_mbps = (connection.received_bytes.saturating_sub(previous_bytes)) as f64 * 8.0
+                / delta
+                / 1_000_000.0;
             connection.paths.iter().map(move |row| {
                 Row::new(vec![
                     Cell::from(remote.clone()),
                     Cell::from(connection.received_packets.to_string()),
-                    Cell::from(format!("{:.2} MB", connection.received_bytes as f64 / 1_000_000.0)),
+                    Cell::from(format!(
+                        "{:.2} MB",
+                        connection.received_bytes as f64 / 1_000_000.0
+                    )),
                     Cell::from(format!("{:.2}", conn_mbps)),
                     Cell::from(row.transport.clone()),
                     Cell::from(if row.selected { "yes" } else { "no" }),
@@ -364,6 +408,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
             })
         })
         .collect::<Vec<_>>();
+
     let visible_rows = layout[2].height.saturating_sub(3) as usize;
     let max_scroll = all_rows.len().saturating_sub(visible_rows);
     snapshot.connection_scroll = snapshot.connection_scroll.min(max_scroll);
@@ -386,8 +431,21 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         ],
     )
     .header(
-        Row::new(vec!["Remote", "Recv Pkts", "Recv MB", "Mbps", "Transport", "Selected", "Status", "Path"])
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Row::new(vec![
+            "Remote",
+            "Recv Pkts",
+            "Recv MB",
+            "Mbps",
+            "Transport",
+            "Selected",
+            "Status",
+            "Path",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .block(Block::default().borders(Borders::ALL).title(format!(
         "Connections {}-{}",
@@ -403,22 +461,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         .iter()
         .map(|(remote, connection)| (remote.clone(), connection.received_bytes))
         .collect();
-
-    let log_lines = state
-        .logs
-        .read()
-        .iter()
-        .rev()
-        .take(5)
-        .rev()
-        .cloned()
-        .map(Line::from)
-        .collect::<Vec<_>>();
-    let log_panel = Paragraph::new(log_lines)
-        .block(Block::default().borders(Borders::ALL).title("Logs"))
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::Gray));
-    frame.render_widget(log_panel, layout[3]);
 }
 
 fn fmt_uptime(elapsed: Duration) -> String {
@@ -433,58 +475,15 @@ fn fmt_uptime(elapsed: Duration) -> String {
 fn format_addrs(lines: &[String], kind: &str) -> String {
     let values = lines
         .iter()
-        .filter_map(|line| line.split_once(&format!("server_addr={kind}")).map(|(_, value)| value))
+        .filter_map(|line| {
+            line.split_once(&format!("server_addr={kind}"))
+                .map(|(_, value)| value)
+        })
         .collect::<Vec<_>>();
 
     if values.is_empty() {
         "-".to_string()
     } else {
         values.join("  |  ")
-    }
-}
-
-#[derive(Clone)]
-pub struct TuiLogWriterFactory {
-    state: ServerUiState,
-}
-
-impl<'a> MakeWriter<'a> for TuiLogWriterFactory {
-    type Writer = TuiLogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        TuiLogWriter {
-            state: self.state.clone(),
-            buffer: Vec::new(),
-        }
-    }
-}
-
-pub struct TuiLogWriter {
-    state: ServerUiState,
-    buffer: Vec<u8>,
-}
-
-impl io::Write for TuiLogWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
-            let line = self.buffer.drain(..=pos).collect::<Vec<_>>();
-            let line = String::from_utf8_lossy(&line).trim().to_string();
-            if !line.is_empty() {
-                self.state.push_log_line(line);
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if !self.buffer.is_empty() {
-            let line = String::from_utf8_lossy(&self.buffer).trim().to_string();
-            if !line.is_empty() {
-                self.state.push_log_line(line);
-            }
-            self.buffer.clear();
-        }
-        Ok(())
     }
 }
