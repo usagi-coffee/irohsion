@@ -6,7 +6,7 @@ pub async fn wait_for_shutdown(ui_state: Option<tui::ClientUiState>) {
             if ui_state.should_quit() {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     } else {
         let _ = tokio::signal::ctrl_c().await;

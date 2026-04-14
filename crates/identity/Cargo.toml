@@ -1,0 +1,10 @@
+[package]
+name = "identity"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap.workspace = true
+data-encoding.workspace = true
+iroh.workspace = true
+rand.workspace = true

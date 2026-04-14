@@ -4,7 +4,7 @@ mod tui;
 
 use std::{
     collections::{BTreeMap, HashSet},
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
     sync::Arc,
 };
@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{ArgAction, Parser};
 use context::ServerCtx;
-use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
+use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, endpoint::presets};
 use parking_lot::RwLock;
 use protocol::{DecodedPacket, PacketHeader, decode_packet};
 use runtime::wait_for_shutdown;
@@ -25,7 +25,9 @@ const MAX_UDP_PACKET_SIZE: usize = 65_507;
 #[derive(Debug, Parser)]
 struct Cli {
     #[arg(long)]
-    udp_dest: SocketAddr,
+    port: u16,
+    #[arg(long = "relay")]
+    relays: Vec<RelayUrl>,
     #[arg(long)]
     secret: Option<String>,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
@@ -51,17 +53,22 @@ async fn main() -> Result<()> {
         }
         None => Ok(SecretKey::generate(&mut rand::rng())),
     }?;
+    let udp_dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, cli.port));
 
     let ui = cli
         .tui
-        .then(|| tui::ServerUi::spawn(tui::ServerUiState::new(cli.udp_dest.to_string())));
+        .then(|| tui::ServerUi::spawn(tui::ServerUiState::new(udp_dest.to_string())));
     let ctx = ServerCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
 
     // The server owns a single public iroh endpoint and accepts every client path on it.
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
-        .relay_mode(RelayMode::Default)
+        .relay_mode(if cli.relays.is_empty() {
+            RelayMode::Default
+        } else {
+            RelayMode::custom(cli.relays)
+        })
         .bind()
         .await
         .context("failed to bind server iroh endpoint")?;
@@ -83,7 +90,6 @@ async fn main() -> Result<()> {
     {
         // Client-to-server packets are deduped/reordered centrally before hitting the UDP target.
         let out_socket = out_socket.clone();
-        let udp_dest = cli.udp_dest;
         let reply_routes = reply_routes.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
@@ -97,7 +103,7 @@ async fn main() -> Result<()> {
         let connections = connections.clone();
         let reply_routes = reply_routes.clone();
         tokio::spawn(async move {
-            let _ = response_loop(out_socket, cli.udp_dest, connections, reply_routes).await;
+            let _ = response_loop(out_socket, udp_dest, connections, reply_routes).await;
         });
     }
 

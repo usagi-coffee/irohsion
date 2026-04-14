@@ -25,7 +25,7 @@ const MAX_UDP_PACKET_SIZE: usize = 65_507;
 #[derive(Debug, Parser)]
 struct Cli {
     #[arg(long)]
-    port: u16,
+    port: Option<u16>,
     #[arg(long)]
     secret: Option<String>,
     #[arg(long)]
@@ -43,14 +43,6 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let ui = cli.tui.then(|| {
-        tui::ClientUi::spawn(tui::ClientUiState::new(
-            cli.port,
-            cli.endpoint.to_string(),
-            cli.interfaces.clone(),
-        ))
-    });
-    let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
 
     let secret_key = match cli.secret.as_deref() {
         Some(secret) => {
@@ -65,14 +57,30 @@ async fn main() -> Result<()> {
         .map(|name| resolve_interface_ipv4(name))
         .collect::<Result<Vec<_>>>()?;
 
-    let listen_udp = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, cli.port));
+    let listen_udp = SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        cli.port.unwrap_or(0),
+    ));
     let server_addr = build_server_addr(cli.endpoint, &cli.addrs, &cli.relays)?;
     let session_id = current_session_id()?;
+    let client_endpoint_id = secret_key.public().to_string();
     let listen_socket = Arc::new(
         UdpSocket::bind(listen_udp)
             .await
             .with_context(|| format!("failed to bind local UDP ingest socket on {listen_udp}"))?,
     );
+    let listen_udp = listen_socket
+        .local_addr()
+        .context("failed to read local UDP ingest socket address")?;
+    let ui = cli.tui.then(|| {
+        tui::ClientUi::spawn(tui::ClientUiState::new(
+            listen_udp.port(),
+            client_endpoint_id.clone(),
+            cli.endpoint.to_string(),
+            cli.interfaces.clone(),
+        ))
+    });
+    let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
     // Replies from the server are sent back to whichever local UDP peer most recently fed us data.
     let last_ingest_peer = Arc::new(RwLock::new(None::<SocketAddr>));
 
@@ -121,13 +129,14 @@ async fn main() -> Result<()> {
         });
     }
 
-    ctx.client_ready(session_id, listen_udp, paths.len());
+    ctx.client_ready(&client_endpoint_id, session_id, listen_udp, paths.len());
 
     let mut seq = 0_u64;
     let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];
     loop {
         let shutdown = wait_for_shutdown(ctx.ui_state());
         let (len, src) = tokio::select! {
+            biased;
             res = listen_socket.recv_from(&mut buf) => {
                 res.context("failed reading from local UDP ingest socket")?
             }

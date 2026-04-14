@@ -229,7 +229,7 @@ fn run(state: ServerUiState) -> io::Result<()> {
 
     loop {
         terminal.draw(|frame| draw(frame, &state, &mut snapshot))?;
-        if event::poll(Duration::from_millis(250))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
                     || matches!(key.code, KeyCode::Char('c'))

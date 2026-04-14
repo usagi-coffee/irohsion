@@ -29,7 +29,8 @@ use transport::transport_kind;
 pub struct ClientUiState {
     started_at: Instant,
     port: u16,
-    endpoint: String,
+    client_endpoint: String,
+    server_endpoint: String,
     interfaces: Vec<String>,
     ingested_packets: Arc<AtomicU64>,
     ingested_bytes: Arc<AtomicU64>,
@@ -52,7 +53,7 @@ pub struct PathRow {
 
 pub struct ClientUi {
     pub state: ClientUiState,
-    _join: thread::JoinHandle<()>,
+    join: Option<thread::JoinHandle<()>>,
 }
 
 pub fn describe_paths(connection: &iroh::endpoint::Connection) -> Vec<PathRow> {
@@ -69,11 +70,17 @@ pub fn describe_paths(connection: &iroh::endpoint::Connection) -> Vec<PathRow> {
 }
 
 impl ClientUiState {
-    pub fn new(port: u16, endpoint: String, interfaces: Vec<String>) -> Self {
+    pub fn new(
+        port: u16,
+        client_endpoint: String,
+        server_endpoint: String,
+        interfaces: Vec<String>,
+    ) -> Self {
         Self {
             started_at: Instant::now(),
             port,
-            endpoint,
+            client_endpoint,
+            server_endpoint,
             interfaces,
             ingested_packets: Arc::new(AtomicU64::new(0)),
             ingested_bytes: Arc::new(AtomicU64::new(0)),
@@ -145,7 +152,19 @@ impl ClientUi {
         let join = thread::spawn(move || {
             let _ = run(thread_state);
         });
-        Self { state, _join: join }
+        Self {
+            state,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for ClientUi {
+    fn drop(&mut self) {
+        self.state.request_quit();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
 }
 
@@ -159,7 +178,7 @@ fn run(state: ClientUiState) -> io::Result<()> {
 
     loop {
         terminal.draw(|frame| draw(frame, &state, &mut snapshot))?;
-        if event::poll(Duration::from_millis(250))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
                     || matches!(key.code, KeyCode::Char('c'))
@@ -233,9 +252,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
                 Style::default().fg(Color::Gray),
             ),
         ]),
+        Line::from(format!("client {}", state.client_endpoint)),
+        Line::from(format!("server {}", state.server_endpoint)),
         Line::from(format!(
-            "endpoint {}  port {}  interfaces {}",
-            state.endpoint,
+            "port {}  interfaces {}",
             state.port,
             state.interfaces.join(", ")
         )),

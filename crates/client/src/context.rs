@@ -46,14 +46,20 @@ impl ClientCtx {
         }
     }
 
-    pub fn client_ready(&self, session_id: u32, udp_listen: SocketAddr, paths: usize) {
+    pub fn client_ready(
+        &self,
+        endpoint_id: &str,
+        session_id: u32,
+        udp_listen: SocketAddr,
+        paths: usize,
+    ) {
         if let Some(ui) = &self.ui {
             ui.push_log_line(format!(
-                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths}"
+                "INFO client ready endpoint_id={endpoint_id} session_id={session_id} udp_listen={udp_listen} paths={paths}"
             ));
         } else {
             println!(
-                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths}"
+                "INFO client ready endpoint_id={endpoint_id} session_id={session_id} udp_listen={udp_listen} paths={paths}"
             );
         }
     }
