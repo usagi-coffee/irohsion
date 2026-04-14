@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         ))
     });
     let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
-    let health = spawn_health_receiver(&cli.secret, ctx.ui_state()).await?;
+    let health = spawn_health_receiver(&cli.secret, ctx.clone()).await?;
     let health_endpoint_id = health.endpoint_id.clone();
     ctx.set_health_endpoint(health_endpoint_id.clone());
     let listen_udp = listen_socket

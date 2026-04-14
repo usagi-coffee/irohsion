@@ -1,10 +1,11 @@
 use std::{
+    collections::BTreeMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
 };
 
 use anyhow::Result;
-use iroh::{RelayMode, RelayUrl, SecretKey};
+use iroh::{EndpointId, RelayMode, RelayUrl, SecretKey};
 use transport::{InterfaceBinding, resolve_interface_ipv4};
 
 #[derive(Clone, Debug)]
@@ -23,6 +24,12 @@ pub struct InterfaceConfig {
     pub binding: InterfaceBinding,
     pub endpoint_id: String,
     pub secret_key: SecretKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct EndpointTarget {
+    pub endpoint_id: EndpointId,
+    pub target_mbps: f32,
 }
 
 impl FromStr for InterfaceSpec {
@@ -89,6 +96,29 @@ impl SecretArg {
     }
 }
 
+impl FromStr for EndpointTarget {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (endpoint_id, target_mbps) = s.rsplit_once(':').ok_or_else(|| {
+            "invalid --endpoint-target; expected <endpoint_id>:<mbps>".to_string()
+        })?;
+        let endpoint_id = EndpointId::from_str(endpoint_id)
+            .map_err(|_| "invalid --endpoint-target endpoint id".to_string())?;
+        let target_mbps = target_mbps
+            .parse::<f32>()
+            .map_err(|_| "invalid --endpoint-target throughput; expected number".to_string())?;
+        if !target_mbps.is_finite() || target_mbps <= 0.0 {
+            return Err("invalid --endpoint-target throughput; expected > 0".to_string());
+        }
+
+        Ok(Self {
+            endpoint_id,
+            target_mbps,
+        })
+    }
+}
+
 pub fn local_udp_dest(port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
 }
@@ -99,6 +129,13 @@ pub fn relay_mode(relays: Vec<RelayUrl>) -> RelayMode {
     } else {
         RelayMode::custom(relays)
     }
+}
+
+pub fn endpoint_targets(specs: &[EndpointTarget]) -> BTreeMap<String, f32> {
+    specs
+        .iter()
+        .map(|spec| (spec.endpoint_id.to_string(), spec.target_mbps))
+        .collect()
 }
 
 pub fn parse_interface_configs(specs: &[InterfaceSpec]) -> Result<Vec<InterfaceConfig>> {

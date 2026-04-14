@@ -16,8 +16,22 @@ use iroh::{
 
 pub const ALPN: &[u8] = b"irohsion/v1";
 pub const HEALTH_ALPN: &[u8] = b"irohsion/health/v1";
-pub const HEALTH_BEACON: &[u8] = b"irohsion-health/v1";
+const HEALTH_REPORT_MAGIC: &str = "irohsion-health/v2";
 const DEFAULT_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link";
+
+#[derive(Clone, Debug)]
+pub struct EndpointHealth {
+    pub endpoint_id: String,
+    pub target_mbps: f32,
+    pub achieved_mbps: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct HealthReport {
+    pub seq: u64,
+    pub unix_ms: u64,
+    pub endpoints: Vec<EndpointHealth>,
+}
 
 #[derive(Debug)]
 pub struct InterfaceBinding {
@@ -125,6 +139,76 @@ pub fn current_session_id() -> Result<u32> {
         .context("system clock is before unix epoch")?
         .as_secs();
     u32::try_from(seconds).context("current unix timestamp does not fit in u32 session_id")
+}
+
+pub fn encode_health_report(report: &HealthReport) -> Bytes {
+    let mut payload = format!(
+        "{HEALTH_REPORT_MAGIC}\t{}\t{}\n",
+        report.seq, report.unix_ms
+    );
+    for endpoint in &report.endpoints {
+        payload.push_str(&format!(
+            "endpoint\t{}\t{:.4}\t{:.4}\n",
+            endpoint.endpoint_id, endpoint.target_mbps, endpoint.achieved_mbps
+        ));
+    }
+    Bytes::from(payload)
+}
+
+pub fn decode_health_report(data: &[u8]) -> Result<HealthReport> {
+    let text = std::str::from_utf8(data).context("health report is not valid utf-8")?;
+    let mut lines = text.lines();
+    let header = lines.next().context("missing health report header")?;
+    let mut header_fields = header.split('\t');
+    let magic = header_fields
+        .next()
+        .context("missing health report magic")?;
+    if magic != HEALTH_REPORT_MAGIC {
+        bail!("unexpected health report magic");
+    }
+
+    let seq = header_fields
+        .next()
+        .context("missing health report seq")?
+        .parse()
+        .context("invalid health report seq")?;
+    let unix_ms = header_fields
+        .next()
+        .context("missing health report unix_ms")?
+        .parse()
+        .context("invalid health report unix_ms")?;
+    let mut endpoints = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut fields = line.split('\t');
+        let kind = fields.next().context("missing health report row kind")?;
+        if kind != "endpoint" {
+            bail!("unexpected health report row kind");
+        }
+
+        endpoints.push(EndpointHealth {
+            endpoint_id: fields.next().context("missing endpoint id")?.to_string(),
+            target_mbps: fields
+                .next()
+                .context("missing target throughput")?
+                .parse()
+                .context("invalid target throughput")?,
+            achieved_mbps: fields
+                .next()
+                .context("missing achieved throughput")?
+                .parse()
+                .context("invalid achieved throughput")?,
+        });
+    }
+
+    Ok(HealthReport {
+        seq,
+        unix_ms,
+        endpoints,
+    })
 }
 
 fn find_interface_ipv4(name: &str) -> Result<Ipv4Addr> {

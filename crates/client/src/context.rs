@@ -1,6 +1,6 @@
 use crate::tui;
 use std::net::SocketAddr;
-use transport::transport_kind;
+use transport::{HealthReport, transport_kind};
 
 #[derive(Clone, Default)]
 pub struct ClientCtx {
@@ -40,6 +40,21 @@ impl ClientCtx {
         }
     }
 
+    pub fn record_health_report(&self, report: &HealthReport) {
+        if let Some(ui) = &self.ui {
+            ui.record_health_received();
+            ui.record_endpoint_health(&report.endpoints);
+        }
+    }
+
+    pub fn invalid_health_report(&self, error: &str) {
+        if let Some(ui) = &self.ui {
+            ui.push_log_line(format!("WARN invalid health report error={error}"));
+        } else {
+            eprintln!("WARN invalid health report error={error}");
+        }
+    }
+
     pub fn connected_path(&self, interface: &str, endpoint_id: &str, local_addr: SocketAddr) {
         if let Some(ui) = &self.ui {
             ui.push_log_line(format!(
@@ -71,13 +86,7 @@ impl ClientCtx {
     }
 
     pub fn ingested_packet(&self, seq: u64, bytes: usize, from: SocketAddr) {
-        if let Some(ui) = &self.ui {
-            ui.push_log_line(format!(
-                "INFO ingested udp packet seq={seq} bytes={bytes} from={from}"
-            ));
-        } else {
-            println!("INFO ingested udp packet seq={seq} bytes={bytes} from={from}");
-        }
+        let _ = (seq, bytes, from);
     }
 
     pub fn forwarded_return_packet(&self, interface: &str, peer: SocketAddr, bytes: usize) {

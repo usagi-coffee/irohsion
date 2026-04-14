@@ -1,9 +1,9 @@
-use crate::tui;
+use crate::context::ClientCtx;
 use anyhow::{Context, Result};
 use cli::SecretArg;
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use tokio::task::JoinHandle;
-use transport::HEALTH_ALPN;
+use transport::{HEALTH_ALPN, decode_health_report};
 
 pub struct HealthReceiver {
     pub endpoint_id: String,
@@ -11,10 +11,7 @@ pub struct HealthReceiver {
     _task: JoinHandle<()>,
 }
 
-pub async fn spawn_health_receiver(
-    secret: &SecretArg,
-    ui_state: Option<tui::ClientUiState>,
-) -> Result<HealthReceiver> {
+pub async fn spawn_health_receiver(secret: &SecretArg, ctx: ClientCtx) -> Result<HealthReceiver> {
     let secret_key = secret.resolve();
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
@@ -40,15 +37,14 @@ pub async fn spawn_health_receiver(
                 continue;
             };
 
-            let ui_state = ui_state.clone();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
                 loop {
                     match connection.read_datagram().await {
-                        Ok(_) => {
-                            if let Some(ui_state) = &ui_state {
-                                ui_state.record_health_received();
-                            }
-                        }
+                        Ok(payload) => match decode_health_report(&payload) {
+                            Ok(report) => ctx.record_health_report(&report),
+                            Err(err) => ctx.invalid_health_report(&err.to_string()),
+                        },
                         Err(_) => break,
                     }
                 }

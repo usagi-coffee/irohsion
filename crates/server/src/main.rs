@@ -1,4 +1,5 @@
 mod context;
+mod health;
 mod runtime;
 mod tui;
 
@@ -12,14 +13,17 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{ArgAction, Parser};
-use cli::{SecretArg, local_udp_dest, relay_mode};
+use cli::{EndpointTarget, SecretArg, endpoint_targets, local_udp_dest, relay_mode};
 use context::ServerCtx;
+use health::{
+    HealthConnection, HealthStats, health_loop, maintain_health_connection, record_health_bytes,
+};
 use iroh::{Endpoint, EndpointId, RelayUrl, endpoint::presets};
 use parking_lot::RwLock;
 use protocol::{DecodedPacket, PacketHeader, decode_packet};
 use runtime::wait_for_shutdown;
 use tokio::{net::UdpSocket, sync::mpsc};
-use transport::{ALPN, HEALTH_ALPN, HEALTH_BEACON, build_server_addr};
+use transport::{ALPN, build_server_addr};
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
 
@@ -29,6 +33,8 @@ struct Cli {
     port: u16,
     #[arg(long)]
     health_endpoint: Option<EndpointId>,
+    #[arg(long = "endpoint-target")]
+    endpoint_targets: Vec<EndpointTarget>,
     #[arg(long, default_value_t = 1000)]
     health_interval_ms: u64,
     #[arg(long = "relay")]
@@ -48,7 +54,6 @@ struct ReceivedPacket {
 
 type ConnectionRegistry = Arc<RwLock<BTreeMap<String, iroh::endpoint::Connection>>>;
 type ReplyRoutes = Arc<RwLock<Vec<String>>>;
-type HealthConnection = Arc<RwLock<Option<iroh::endpoint::Connection>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -56,6 +61,7 @@ async fn main() -> Result<()> {
     let secret_key = cli.secret.resolve();
     let udp_dest = local_udp_dest(cli.port);
     let relays = cli.relays.clone();
+    let endpoint_targets = Arc::new(endpoint_targets(&cli.endpoint_targets));
 
     let ui = cli
         .tui
@@ -86,6 +92,7 @@ async fn main() -> Result<()> {
     let connections: ConnectionRegistry = Arc::new(RwLock::new(BTreeMap::new()));
     let reply_routes: ReplyRoutes = Arc::new(RwLock::new(Vec::new()));
     let health_connection: HealthConnection = Arc::new(RwLock::new(None));
+    let health_stats: HealthStats = Arc::new(RwLock::new(BTreeMap::new()));
 
     {
         // Client-to-server packets are deduped/reordered centrally before hitting the UDP target.
@@ -109,9 +116,11 @@ async fn main() -> Result<()> {
 
     {
         let health_connection = health_connection.clone();
+        let health_stats = health_stats.clone();
+        let endpoint_targets = endpoint_targets.clone();
         let interval = Duration::from_millis(cli.health_interval_ms);
         tokio::spawn(async move {
-            let _ = health_loop(health_connection, interval).await;
+            let _ = health_loop(health_connection, health_stats, endpoint_targets, interval).await;
         });
     }
 
@@ -136,6 +145,7 @@ async fn main() -> Result<()> {
 
         let tx = tx.clone();
         let connections = connections.clone();
+        let health_stats = health_stats.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
             // Each accepted iroh connection represents one client path; all paths feed the same
@@ -164,6 +174,11 @@ async fn main() -> Result<()> {
                         ctx.record_connection_receive(&remote_key, data.len() as u64);
                         match parse_packet(&data, remote_key.clone()) {
                             Ok(packet) => {
+                                record_health_bytes(
+                                    &health_stats,
+                                    &remote_key,
+                                    packet.payload.len() as u64,
+                                );
                                 if tx.send(packet).await.is_err() {
                                     break;
                                 }
@@ -325,46 +340,6 @@ async fn response_loop(
 
             if connection.send_datagram(payload.clone()).is_ok() {
                 break;
-            }
-        }
-    }
-}
-
-async fn health_loop(health_connection: HealthConnection, interval: Duration) -> Result<()> {
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        ticker.tick().await;
-        let connection = health_connection.read().clone();
-        let Some(connection) = connection else {
-            continue;
-        };
-
-        if connection
-            .send_datagram(Bytes::from_static(HEALTH_BEACON))
-            .is_err()
-        {
-            *health_connection.write() = None;
-        }
-    }
-}
-
-async fn maintain_health_connection(
-    endpoint: Endpoint,
-    health_addr: iroh::EndpointAddr,
-    health_connection: HealthConnection,
-) -> Result<()> {
-    loop {
-        if health_connection.read().is_some() {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            continue;
-        }
-
-        match endpoint.connect(health_addr.clone(), HEALTH_ALPN).await {
-            Ok(connection) => {
-                *health_connection.write() = Some(connection);
-            }
-            Err(_) => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }
