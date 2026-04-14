@@ -29,7 +29,6 @@ use transport::transport_kind;
 pub struct ClientUiState {
     started_at: Instant,
     port: u16,
-    client_endpoint: String,
     server_endpoint: String,
     interfaces: Vec<String>,
     ingested_packets: Arc<AtomicU64>,
@@ -45,6 +44,7 @@ pub struct ClientUiState {
 
 #[derive(Clone)]
 pub struct PathRow {
+    pub endpoint_id: String,
     pub remote_addr: String,
     pub transport: String,
     pub selected: bool,
@@ -56,11 +56,12 @@ pub struct ClientUi {
     join: Option<thread::JoinHandle<()>>,
 }
 
-pub fn describe_paths(connection: &iroh::endpoint::Connection) -> Vec<PathRow> {
+pub fn describe_paths(connection: &iroh::endpoint::Connection, endpoint_id: &str) -> Vec<PathRow> {
     connection
         .paths()
         .into_iter()
         .map(|path| PathRow {
+            endpoint_id: endpoint_id.to_string(),
             remote_addr: path.remote_addr().to_string(),
             transport: transport_kind(&path).to_string(),
             selected: path.is_selected(),
@@ -70,16 +71,10 @@ pub fn describe_paths(connection: &iroh::endpoint::Connection) -> Vec<PathRow> {
 }
 
 impl ClientUiState {
-    pub fn new(
-        port: u16,
-        client_endpoint: String,
-        server_endpoint: String,
-        interfaces: Vec<String>,
-    ) -> Self {
+    pub fn new(port: u16, server_endpoint: String, interfaces: Vec<String>) -> Self {
         Self {
             started_at: Instant::now(),
             port,
-            client_endpoint,
             server_endpoint,
             interfaces,
             ingested_packets: Arc::new(AtomicU64::new(0)),
@@ -118,6 +113,7 @@ impl ClientUiState {
             .entry(interface)
             .or_default()
             .push(PathRow {
+                endpoint_id: "-".to_string(),
                 remote_addr: error,
                 transport: "error".to_string(),
                 selected: false,
@@ -214,7 +210,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(7),
             Constraint::Min(6),
             Constraint::Length(8),
@@ -238,34 +234,33 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
     snapshot.last_ingested_bytes = ingested_bytes;
     snapshot.last_sent_bytes = sent_bytes;
 
-    let header = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(
-                "Irohsion Client",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("uptime {}", fmt_uptime(state.started_at.elapsed())),
-                Style::default().fg(Color::Gray),
-            ),
-        ]),
-        Line::from(format!("client {}", state.client_endpoint)),
-        Line::from(format!("server {}", state.server_endpoint)),
-        Line::from(format!(
-            "port {}  interfaces {}",
-            state.port,
-            state.interfaces.join(", ")
-        )),
-        Line::from(format!(
-            "last ingest from {}",
-            state.last_ingest_from.read().clone()
-        )),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Overview"))
-    .wrap(Wrap { trim: true });
+    let mut header_lines = vec![Line::from(vec![
+        Span::styled(
+            "Irohsion Client",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("uptime {}", fmt_uptime(state.started_at.elapsed())),
+            Style::default().fg(Color::Gray),
+        ),
+    ])];
+    header_lines.push(Line::from(format!("server {}", state.server_endpoint)));
+    header_lines.push(Line::from(format!(
+        "port {}  interfaces {}",
+        state.port,
+        state.interfaces.join(", ")
+    )));
+    header_lines.push(Line::from(format!(
+        "last ingest from {}",
+        state.last_ingest_from.read().clone()
+    )));
+
+    let header = Paragraph::new(header_lines)
+        .block(Block::default().borders(Borders::ALL).title("Overview"))
+        .wrap(Wrap { trim: true });
     frame.render_widget(header, layout[0]);
 
     let stats = Paragraph::new(vec![
@@ -299,6 +294,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
             rows.iter().map(move |row| {
                 Row::new(vec![
                     Cell::from(interface.clone()),
+                    Cell::from(row.endpoint_id.clone()),
                     Cell::from(row.transport.clone()),
                     Cell::from(if row.selected { "yes" } else { "no" }),
                     Cell::from(row.status.clone()),
@@ -311,6 +307,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         rows,
         [
             Constraint::Length(12),
+            Constraint::Length(32),
             Constraint::Length(10),
             Constraint::Length(8),
             Constraint::Length(10),
@@ -320,6 +317,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
     .header(
         Row::new(vec![
             "Interface",
+            "Endpoint",
             "Transport",
             "Selected",
             "Status",

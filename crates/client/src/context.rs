@@ -34,32 +34,26 @@ impl ClientCtx {
         }
     }
 
-    pub fn connected_path(&self, interface: &str, local_addr: SocketAddr) {
+    pub fn connected_path(&self, interface: &str, endpoint_id: &str, local_addr: SocketAddr) {
         if let Some(ui) = &self.ui {
             ui.push_log_line(format!(
-                "INFO connected interface-bound iroh path interface={interface} local_addr={local_addr}"
+                "INFO connected interface-bound iroh path interface={interface} endpoint_id={endpoint_id} local_addr={local_addr}"
             ));
         } else {
             println!(
-                "INFO connected interface-bound iroh path interface={interface} local_addr={local_addr}"
+                "INFO connected interface-bound iroh path interface={interface} endpoint_id={endpoint_id} local_addr={local_addr}"
             );
         }
     }
 
-    pub fn client_ready(
-        &self,
-        endpoint_id: &str,
-        session_id: u32,
-        udp_listen: SocketAddr,
-        paths: usize,
-    ) {
+    pub fn client_ready(&self, session_id: u32, udp_listen: SocketAddr, paths: usize) {
         if let Some(ui) = &self.ui {
             ui.push_log_line(format!(
-                "INFO client ready endpoint_id={endpoint_id} session_id={session_id} udp_listen={udp_listen} paths={paths}"
+                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths}"
             ));
         } else {
             println!(
-                "INFO client ready endpoint_id={endpoint_id} session_id={session_id} udp_listen={udp_listen} paths={paths}"
+                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths}"
             );
         }
     }
@@ -135,6 +129,7 @@ impl ClientCtx {
     pub fn record_connection_paths(
         &self,
         interface: String,
+        endpoint_id: &str,
         connection: &iroh::endpoint::Connection,
     ) {
         for path in connection.paths() {
@@ -160,7 +155,7 @@ impl ClientCtx {
         }
 
         if let Some(ui) = &self.ui {
-            ui.record_path(interface, tui::describe_paths(connection));
+            ui.record_path(interface, tui::describe_paths(connection, endpoint_id));
         }
     }
 }

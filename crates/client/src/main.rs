@@ -4,21 +4,19 @@ mod tui;
 
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    str::FromStr,
     sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use cli::{InterfaceSpec, parse_interface_configs};
 use context::ClientCtx;
-use iroh::{EndpointId, RelayUrl, SecretKey};
+use iroh::{EndpointId, RelayUrl};
 use parking_lot::RwLock;
 use protocol::{PacketHeader, encode_packet};
 use runtime::wait_for_shutdown;
 use tokio::net::UdpSocket;
-use transport::{
-    build_server_addr, connect_path_with_secret, current_session_id, resolve_interface_ipv4,
-};
+use transport::{build_server_addr, connect_path_with_secret, current_session_id};
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
 
@@ -27,15 +25,13 @@ struct Cli {
     #[arg(long)]
     port: Option<u16>,
     #[arg(long)]
-    secret: Option<String>,
-    #[arg(long)]
     endpoint: EndpointId,
     #[arg(long = "addr")]
     addrs: Vec<SocketAddr>,
     #[arg(long = "relay")]
     relays: Vec<RelayUrl>,
     #[arg(long = "interfaces", required = true, num_args = 1..)]
-    interfaces: Vec<String>,
+    interfaces: Vec<InterfaceSpec>,
     #[arg(long)]
     tui: bool,
 }
@@ -43,19 +39,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    let secret_key = match cli.secret.as_deref() {
-        Some(secret) => {
-            SecretKey::from_str(secret).context("invalid --secret; expected iroh secret key hex")
-        }
-        None => Ok(SecretKey::generate(&mut rand::rng())),
-    }?;
-
-    let interface_bindings = cli
-        .interfaces
-        .iter()
-        .map(|name| resolve_interface_ipv4(name))
-        .collect::<Result<Vec<_>>>()?;
+    let interface_configs = parse_interface_configs(&cli.interfaces)?;
 
     let listen_udp = SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::LOCALHOST,
@@ -63,7 +47,6 @@ async fn main() -> Result<()> {
     ));
     let server_addr = build_server_addr(cli.endpoint, &cli.addrs, &cli.relays)?;
     let session_id = current_session_id()?;
-    let client_endpoint_id = secret_key.public().to_string();
     let listen_socket = Arc::new(
         UdpSocket::bind(listen_udp)
             .await
@@ -75,9 +58,11 @@ async fn main() -> Result<()> {
     let ui = cli.tui.then(|| {
         tui::ClientUi::spawn(tui::ClientUiState::new(
             listen_udp.port(),
-            client_endpoint_id.clone(),
             cli.endpoint.to_string(),
-            cli.interfaces.clone(),
+            interface_configs
+                .iter()
+                .map(|config| config.binding.name.clone())
+                .collect(),
         ))
     });
     let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
@@ -85,12 +70,20 @@ async fn main() -> Result<()> {
     let last_ingest_peer = Arc::new(RwLock::new(None::<SocketAddr>));
 
     // Each configured interface gets its own iroh connection/path to the server.
-    let mut paths = Vec::with_capacity(interface_bindings.len());
-    for binding in interface_bindings {
-        let path =
-            connect_path_with_secret(binding, server_addr.clone(), secret_key.clone()).await?;
-        ctx.record_connection_paths(path.interface_name.clone(), &path.connection);
-        ctx.connected_path(&path.interface_name, SocketAddr::V4(path.bound_addr));
+    let mut paths = Vec::with_capacity(interface_configs.len());
+    for config in interface_configs {
+        let cli::InterfaceConfig {
+            binding,
+            endpoint_id,
+            secret_key,
+        } = config;
+        let path = connect_path_with_secret(binding, server_addr.clone(), secret_key).await?;
+        ctx.record_connection_paths(path.interface_name.clone(), &endpoint_id, &path.connection);
+        ctx.connected_path(
+            &path.interface_name,
+            &endpoint_id,
+            SocketAddr::V4(path.bound_addr),
+        );
         paths.push(path);
     }
 
@@ -129,7 +122,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    ctx.client_ready(&client_endpoint_id, session_id, listen_udp, paths.len());
+    ctx.client_ready(session_id, listen_udp, paths.len());
 
     let mut seq = 0_u64;
     let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];

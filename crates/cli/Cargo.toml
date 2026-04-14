@@ -1,0 +1,10 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+iroh.workspace = true
+rand.workspace = true
+transport.workspace = true

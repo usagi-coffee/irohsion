@@ -5,15 +5,15 @@ mod tui;
 use std::{
     collections::{BTreeMap, HashSet},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    str::FromStr,
     sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{ArgAction, Parser};
+use cli::SecretArg;
 use context::ServerCtx;
-use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, endpoint::presets};
+use iroh::{Endpoint, RelayMode, RelayUrl, endpoint::presets};
 use parking_lot::RwLock;
 use protocol::{DecodedPacket, PacketHeader, decode_packet};
 use runtime::wait_for_shutdown;
@@ -28,8 +28,8 @@ struct Cli {
     port: u16,
     #[arg(long = "relay")]
     relays: Vec<RelayUrl>,
-    #[arg(long)]
-    secret: Option<String>,
+    #[arg(long, default_value = "", hide_default_value = true)]
+    secret: SecretArg,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     tui: bool,
 }
@@ -47,12 +47,7 @@ type ReplyRoutes = Arc<RwLock<Vec<String>>>;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let secret_key = match cli.secret.as_deref() {
-        Some(secret) => {
-            SecretKey::from_str(secret).context("invalid --secret; expected iroh secret key hex")
-        }
-        None => Ok(SecretKey::generate(&mut rand::rng())),
-    }?;
+    let secret_key = cli.secret.resolve();
     let udp_dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, cli.port));
 
     let ui = cli
