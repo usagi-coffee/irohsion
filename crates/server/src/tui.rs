@@ -29,6 +29,7 @@ use transport::transport_kind;
 pub struct ServerUiState {
     started_at: Instant,
     endpoint: Arc<RwLock<String>>,
+    health_endpoint: Arc<RwLock<String>>,
     udp_dest: String,
     server_addrs: Arc<RwLock<Vec<String>>>,
     quit_requested: Arc<AtomicBool>,
@@ -99,6 +100,7 @@ impl ServerUiState {
         Self {
             started_at: Instant::now(),
             endpoint: Arc::new(RwLock::new("-".to_string())),
+            health_endpoint: Arc::new(RwLock::new("-".to_string())),
             udp_dest,
             server_addrs: Arc::new(RwLock::new(Vec::new())),
             quit_requested: Arc::new(AtomicBool::new(false)),
@@ -123,6 +125,10 @@ impl ServerUiState {
 
     pub fn set_server_addrs(&self, addrs: Vec<String>) {
         *self.server_addrs.write() = addrs;
+    }
+
+    pub fn set_health_endpoint(&self, endpoint: Option<String>) {
+        *self.health_endpoint.write() = endpoint.unwrap_or_else(|| "-".to_string());
     }
 
     pub fn request_quit(&self) {
@@ -324,6 +330,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
             ),
         ]),
         Line::from(format!("endpoint {}", state.endpoint.read().clone())),
+        Line::from(format!(
+            "health endpoint {}",
+            state.health_endpoint.read().clone()
+        )),
         Line::from(format!("udp destination {}", state.udp_dest)),
         Line::from(format!(
             "direct {}",

@@ -30,6 +30,7 @@ pub struct ClientUiState {
     started_at: Instant,
     port: u16,
     server_endpoint: String,
+    health_endpoint: Arc<RwLock<String>>,
     interfaces: Vec<String>,
     ingested_packets: Arc<AtomicU64>,
     ingested_bytes: Arc<AtomicU64>,
@@ -37,6 +38,7 @@ pub struct ClientUiState {
     sent_bytes: Arc<AtomicU64>,
     send_errors: Arc<AtomicU64>,
     last_ingest_from: Arc<RwLock<String>>,
+    last_health_received: Arc<RwLock<Option<Instant>>>,
     paths: Arc<RwLock<BTreeMap<String, Vec<PathRow>>>>,
     logs: Arc<RwLock<VecDeque<String>>>,
     quit_requested: Arc<AtomicBool>,
@@ -71,11 +73,17 @@ pub fn describe_paths(connection: &iroh::endpoint::Connection, endpoint_id: &str
 }
 
 impl ClientUiState {
-    pub fn new(port: u16, server_endpoint: String, interfaces: Vec<String>) -> Self {
+    pub fn new(
+        port: u16,
+        server_endpoint: String,
+        health_endpoint: String,
+        interfaces: Vec<String>,
+    ) -> Self {
         Self {
             started_at: Instant::now(),
             port,
             server_endpoint,
+            health_endpoint: Arc::new(RwLock::new(health_endpoint)),
             interfaces,
             ingested_packets: Arc::new(AtomicU64::new(0)),
             ingested_bytes: Arc::new(AtomicU64::new(0)),
@@ -83,6 +91,7 @@ impl ClientUiState {
             sent_bytes: Arc::new(AtomicU64::new(0)),
             send_errors: Arc::new(AtomicU64::new(0)),
             last_ingest_from: Arc::new(RwLock::new("-".to_string())),
+            last_health_received: Arc::new(RwLock::new(None)),
             paths: Arc::new(RwLock::new(BTreeMap::new())),
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(128))),
             quit_requested: Arc::new(AtomicBool::new(false)),
@@ -123,6 +132,14 @@ impl ClientUiState {
 
     pub fn record_path(&self, interface: String, rows: Vec<PathRow>) {
         self.paths.write().insert(interface, rows);
+    }
+
+    pub fn set_health_endpoint(&self, endpoint: String) {
+        *self.health_endpoint.write() = endpoint;
+    }
+
+    pub fn record_health_received(&self) {
+        *self.last_health_received.write() = Some(Instant::now());
     }
 
     pub fn push_log_line(&self, line: String) {
@@ -210,7 +227,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Min(6),
             Constraint::Length(8),
@@ -249,6 +266,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
     ])];
     header_lines.push(Line::from(format!("server {}", state.server_endpoint)));
     header_lines.push(Line::from(format!(
+        "health {}",
+        state.health_endpoint.read().clone()
+    )));
+    header_lines.push(Line::from(format!(
         "port {}  interfaces {}",
         state.port,
         state.interfaces.join(", ")
@@ -257,6 +278,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         "last ingest from {}",
         state.last_ingest_from.read().clone()
     )));
+    let last_health = state
+        .last_health_received
+        .read()
+        .map(|at| format!("{:.1}s ago", now.duration_since(at).as_secs_f64()))
+        .unwrap_or_else(|| "-".to_string());
+    header_lines.push(Line::from(format!("last health {}", last_health)));
 
     let header = Paragraph::new(header_lines)
         .block(Block::default().borders(Borders::ALL).title("Overview"))

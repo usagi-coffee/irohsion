@@ -1,4 +1,5 @@
 mod context;
+mod health;
 mod runtime;
 mod tui;
 
@@ -9,8 +10,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{InterfaceSpec, parse_interface_configs};
+use cli::{InterfaceSpec, SecretArg, parse_interface_configs};
 use context::ClientCtx;
+use health::spawn_health_receiver;
 use iroh::{EndpointId, RelayUrl};
 use parking_lot::RwLock;
 use protocol::{PacketHeader, encode_packet};
@@ -24,6 +26,8 @@ const MAX_UDP_PACKET_SIZE: usize = 65_507;
 struct Cli {
     #[arg(long)]
     port: Option<u16>,
+    #[arg(long, default_value = "", hide_default_value = true)]
+    secret: SecretArg,
     #[arg(long)]
     endpoint: EndpointId,
     #[arg(long = "addr")]
@@ -52,13 +56,14 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("failed to bind local UDP ingest socket on {listen_udp}"))?,
     );
-    let listen_udp = listen_socket
-        .local_addr()
-        .context("failed to read local UDP ingest socket address")?;
     let ui = cli.tui.then(|| {
         tui::ClientUi::spawn(tui::ClientUiState::new(
-            listen_udp.port(),
+            listen_socket
+                .local_addr()
+                .expect("listen socket has local addr")
+                .port(),
             cli.endpoint.to_string(),
+            "-".to_string(),
             interface_configs
                 .iter()
                 .map(|config| config.binding.name.clone())
@@ -66,6 +71,13 @@ async fn main() -> Result<()> {
         ))
     });
     let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
+    let health = spawn_health_receiver(&cli.secret, ctx.ui_state()).await?;
+    let health_endpoint_id = health.endpoint_id.clone();
+    ctx.set_health_endpoint(health_endpoint_id.clone());
+    let listen_udp = listen_socket
+        .local_addr()
+        .context("failed to read local UDP ingest socket address")?;
+    let _health = health;
     // Replies from the server are sent back to whichever local UDP peer most recently fed us data.
     let last_ingest_peer = Arc::new(RwLock::new(None::<SocketAddr>));
 
@@ -122,7 +134,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    ctx.client_ready(session_id, listen_udp, paths.len());
+    ctx.client_ready(session_id, listen_udp, paths.len(), &health_endpoint_id);
 
     let mut seq = 0_u64;
     let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];

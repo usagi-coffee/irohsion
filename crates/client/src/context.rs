@@ -34,6 +34,12 @@ impl ClientCtx {
         }
     }
 
+    pub fn set_health_endpoint(&self, endpoint: String) {
+        if let Some(ui) = &self.ui {
+            ui.set_health_endpoint(endpoint);
+        }
+    }
+
     pub fn connected_path(&self, interface: &str, endpoint_id: &str, local_addr: SocketAddr) {
         if let Some(ui) = &self.ui {
             ui.push_log_line(format!(
@@ -46,14 +52,20 @@ impl ClientCtx {
         }
     }
 
-    pub fn client_ready(&self, session_id: u32, udp_listen: SocketAddr, paths: usize) {
+    pub fn client_ready(
+        &self,
+        session_id: u32,
+        udp_listen: SocketAddr,
+        paths: usize,
+        health_endpoint: &str,
+    ) {
         if let Some(ui) = &self.ui {
             ui.push_log_line(format!(
-                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths}"
+                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths} health_endpoint={health_endpoint}"
             ));
         } else {
             println!(
-                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths}"
+                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths} health_endpoint={health_endpoint}"
             );
         }
     }

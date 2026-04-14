@@ -32,6 +32,14 @@ impl ServerCtx {
         }
     }
 
+    pub fn set_health_endpoint(&self, endpoint: Option<String>) {
+        if let Some(ui) = &self.ui {
+            ui.set_health_endpoint(endpoint.clone());
+        } else if let Some(endpoint) = endpoint {
+            println!("INFO health endpoint endpoint={endpoint}");
+        }
+    }
+
     pub fn record_connection(&self, remote: String, rows: Vec<tui::PathRow>) {
         if let Some(ui) = &self.ui {
             ui.record_connection(remote.clone(), rows.clone());

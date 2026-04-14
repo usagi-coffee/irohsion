@@ -15,6 +15,8 @@ use iroh::{
 };
 
 pub const ALPN: &[u8] = b"irohsion/v1";
+pub const HEALTH_ALPN: &[u8] = b"irohsion/health/v1";
+pub const HEALTH_BEACON: &[u8] = b"irohsion-health/v1";
 const DEFAULT_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link";
 
 #[derive(Debug)]
