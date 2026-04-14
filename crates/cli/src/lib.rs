@@ -1,7 +1,10 @@
-use std::str::FromStr;
+use std::{
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    str::FromStr,
+};
 
 use anyhow::Result;
-use iroh::SecretKey;
+use iroh::{RelayMode, RelayUrl, SecretKey};
 use transport::{InterfaceBinding, resolve_interface_ipv4};
 
 #[derive(Clone, Debug)]
@@ -83,6 +86,18 @@ impl SecretArg {
         self.provided()
             .cloned()
             .unwrap_or_else(|| SecretKey::generate(&mut rand::rng()))
+    }
+}
+
+pub fn local_udp_dest(port: u16) -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+}
+
+pub fn relay_mode(relays: Vec<RelayUrl>) -> RelayMode {
+    if relays.is_empty() {
+        RelayMode::Default
+    } else {
+        RelayMode::custom(relays)
     }
 }
 

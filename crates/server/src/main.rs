@@ -4,16 +4,16 @@ mod tui;
 
 use std::{
     collections::{BTreeMap, HashSet},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::SocketAddr,
     sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{ArgAction, Parser};
-use cli::SecretArg;
+use cli::{SecretArg, local_udp_dest, relay_mode};
 use context::ServerCtx;
-use iroh::{Endpoint, RelayMode, RelayUrl, endpoint::presets};
+use iroh::{Endpoint, RelayUrl, endpoint::presets};
 use parking_lot::RwLock;
 use protocol::{DecodedPacket, PacketHeader, decode_packet};
 use runtime::wait_for_shutdown;
@@ -48,7 +48,7 @@ type ReplyRoutes = Arc<RwLock<Vec<String>>>;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let secret_key = cli.secret.resolve();
-    let udp_dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, cli.port));
+    let udp_dest = local_udp_dest(cli.port);
 
     let ui = cli
         .tui
@@ -59,11 +59,7 @@ async fn main() -> Result<()> {
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
-        .relay_mode(if cli.relays.is_empty() {
-            RelayMode::Default
-        } else {
-            RelayMode::custom(cli.relays)
-        })
+        .relay_mode(relay_mode(cli.relays))
         .bind()
         .await
         .context("failed to bind server iroh endpoint")?;
