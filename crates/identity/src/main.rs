@@ -12,7 +12,7 @@ fn main() {
     let cli = Cli::parse();
 
     for index in 0..cli.count {
-        let secret = SecretKey::generate(&mut rand::rng());
+        let secret = SecretKey::generate();
         let endpoint_id = secret.public();
         let secret_hex = HEXLOWER.encode(&secret.to_bytes());
 

@@ -7,11 +7,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
-    endpoint::presets,
+    endpoint::presets, Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
+    TransportAddr,
 };
 
 pub const ALPN: &[u8] = b"irohsion/v1";
@@ -58,7 +58,7 @@ pub async fn connect_path(
     binding: InterfaceBinding,
     server_addr: EndpointAddr,
 ) -> Result<PathConnection> {
-    connect_path_with_secret(binding, server_addr, SecretKey::generate(&mut rand::rng())).await
+    connect_path_with_secret(binding, server_addr, SecretKey::generate()).await
 }
 
 pub async fn connect_path_with_secret(

@@ -92,7 +92,7 @@ impl SecretArg {
     pub fn resolve(&self) -> SecretKey {
         self.provided()
             .cloned()
-            .unwrap_or_else(|| SecretKey::generate(&mut rand::rng()))
+            .unwrap_or_else(|| SecretKey::generate())
     }
 }
 
@@ -143,10 +143,7 @@ pub fn parse_interface_configs(specs: &[InterfaceSpec]) -> Result<Vec<InterfaceC
 }
 
 fn build_interface_config(spec: &InterfaceSpec) -> Result<InterfaceConfig> {
-    let secret_key = spec
-        .secret
-        .clone()
-        .unwrap_or_else(|| SecretKey::generate(&mut rand::rng()));
+    let secret_key = spec.secret.clone().unwrap_or_else(|| SecretKey::generate());
     let binding = resolve_interface_ipv4(&spec.name)?;
     let endpoint_id = secret_key.public().to_string();
     Ok(InterfaceConfig {
