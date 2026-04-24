@@ -90,6 +90,7 @@ pub async fn spawn_remote_server(
     let status_write_preview = preview.clone();
     let write_strategy = strategy.clone();
     let write_ctx = ctx.clone();
+    let write_preview_control = preview.clone();
     let preview_read = preview.clone();
     let preview_offset = Arc::new(AtomicUsize::new(0));
     let preview_offset_read = preview_offset.clone();
@@ -165,9 +166,15 @@ pub async fn spawn_remote_server(
                         method: CharacteristicWriteMethod::Fun(Box::new(move |value, _| {
                             let strategy = write_strategy.clone();
                             let ctx = write_ctx.clone();
+                            let preview = write_preview_control.clone();
                             Box::pin(async move {
                                 let patch = serde_json::from_slice::<ControlPatch>(&value)
                                     .map_err(|_| ReqError::InvalidValueLength)?;
+                                if let Some(enabled) = patch.preview_enabled {
+                                    if let Some(preview) = &preview {
+                                        preview.set_enabled(enabled);
+                                    }
+                                }
                                 strategy.apply_patch(patch, &ctx);
                                 Ok(())
                             }) as WriteFuture
@@ -278,6 +285,7 @@ struct StatusPayload {
 #[derive(serde::Serialize)]
 struct PreviewStatus {
     enabled: bool,
+    decoding: bool,
     jpeg_bytes: usize,
     characteristic: String,
     offset_characteristic: String,
@@ -297,6 +305,7 @@ fn status_payload(
         control: strategy.status(),
         preview: PreviewStatus {
             enabled: preview.is_some(),
+            decoding: preview.is_some_and(PreviewState::enabled),
             jpeg_bytes: preview.map_or(0, PreviewState::latest_jpeg_len),
             characteristic: PREVIEW_UUID.to_string(),
             offset_characteristic: PREVIEW_OFFSET_UUID.to_string(),

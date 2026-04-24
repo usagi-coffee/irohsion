@@ -14,9 +14,9 @@
 	/** @typedef {{ requestDevice: (options: object) => Promise<BluetoothDevice> }} BluetoothApi */
 	/** @typedef {{ name: string, target_mbps?: number | null, split_percentage?: number | null, tx_packets?: number, tx_bytes?: number, tx_mbps?: number }} InterfaceStatus */
 	/** @typedef {{ mode: string, effective_strategy: string, packets: number, payload_bytes: number, interfaces: InterfaceStatus[] }} ControlStatus */
-	/** @typedef {{ enabled: boolean, jpeg_bytes: number, characteristic: string, offset_characteristic: string, chunk_bytes: number }} PreviewStatus */
+	/** @typedef {{ enabled: boolean, decoding: boolean, jpeg_bytes: number, characteristic: string, offset_characteristic: string, chunk_bytes: number }} PreviewStatus */
 	/** @typedef {{ control: ControlStatus, preview?: PreviewStatus }} RemoteStatus */
-	/** @typedef {{ mode?: string, targets_mbps?: Record<string, number>, split_percentages?: Record<string, number> }} ControlPatch */
+	/** @typedef {{ mode?: string, targets_mbps?: Record<string, number>, split_percentages?: Record<string, number>, preview_enabled?: boolean }} ControlPatch */
 
 	/** @type {BluetoothDevice | null} */
 	let device = $state(null);
@@ -107,7 +107,7 @@
 	}
 
 	async function readPreview() {
-		if (!server || loadingPreview) return;
+		if (!server || loadingPreview || !status?.preview?.decoding) return;
 		loadingPreview = true;
 		error = '';
 
@@ -294,6 +294,16 @@
 		void writePatch({ split_percentages: { [interfaceName]: Number(value) } });
 	}
 
+	/** @param {boolean} enabled */
+	function setPreviewEnabled(enabled) {
+		if (!enabled) {
+			autoPreview = false;
+			clearPreview();
+			lastPreviewBytes = 0;
+		}
+		void writePatch({ preview_enabled: enabled });
+	}
+
 	/** @param {InterfaceStatus} iface */
 	function displayPercentage(iface) {
 		return iface.split_percentage ?? evenPercentage();
@@ -333,7 +343,7 @@
 		}, 1000);
 
 		const previewInterval = setInterval(() => {
-			if (!polling || !autoPreview) return;
+			if (!polling || !autoPreview || !status?.preview?.decoding) return;
 			const now = Date.now();
 			if (now - lastPreviewAt < Math.max(1, previewIntervalSeconds) * 1000) return;
 			const bytes = status?.preview?.jpeg_bytes ?? 0;
@@ -354,7 +364,7 @@
 	<title>Irohsion Remote</title>
 </svelte:head>
 
-<main class="min-h-svh bg-black px-3 py-2 text-neutral-100">
+<main class="min-h-svh bg-black px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-[max(0.5rem,env(safe-area-inset-bottom))] text-neutral-100">
 	<div class="mx-auto grid max-w-xl gap-3">
 		<header class="flex items-center justify-between gap-3">
 			<div class="flex items-center gap-2">
@@ -496,7 +506,7 @@
 					<button
 						class="rounded-full bg-white px-4 py-2 text-sm font-black text-black disabled:opacity-50"
 						onclick={readPreview}
-						disabled={loadingPreview || !status.preview?.jpeg_bytes}
+						disabled={loadingPreview || !status.preview?.decoding || !status.preview?.jpeg_bytes}
 					>
 						{loadingPreview ? 'Loading...' : 'Load'}
 					</button>
@@ -504,8 +514,17 @@
 
 				<div class="mt-4 grid gap-3 rounded-2xl bg-black p-3">
 					<label class="flex items-center justify-between gap-4 text-sm font-bold text-neutral-300">
+						<span>Decoder</span>
+						<input
+							class="h-5 w-5 accent-emerald-400"
+							type="checkbox"
+							checked={status.preview?.decoding ?? false}
+							onchange={(event) => setPreviewEnabled(event.currentTarget.checked)}
+						/>
+					</label>
+					<label class="flex items-center justify-between gap-4 text-sm font-bold text-neutral-300">
 						<span>Auto preview</span>
-						<input class="h-5 w-5 accent-emerald-400" type="checkbox" bind:checked={autoPreview} />
+						<input class="h-5 w-5 accent-emerald-400" type="checkbox" bind:checked={autoPreview} disabled={!status.preview?.decoding} />
 					</label>
 					<label class="grid gap-2">
 						<div class="flex justify-between text-xs font-bold text-neutral-500">

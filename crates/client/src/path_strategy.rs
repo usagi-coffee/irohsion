@@ -64,6 +64,7 @@ pub struct ControlPatch {
     pub monitor_packets: Option<bool>,
     pub targets_mbps: Option<BTreeMap<String, Option<f64>>>,
     pub split_percentages: Option<BTreeMap<String, Option<f64>>>,
+    pub preview_enabled: Option<bool>,
 }
 
 #[derive(Clone)]

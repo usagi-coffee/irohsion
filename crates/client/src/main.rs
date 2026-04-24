@@ -59,7 +59,7 @@ struct Cli {
     remote_name: String,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     remote_preview: bool,
-    #[arg(long, default_value_t = 200_000)]
+    #[arg(long, default_value_t = 500_000)]
     remote_preview_max_jpeg_bytes: usize,
     #[arg(long, default_value_t = 10)]
     remote_preview_decode_interval_secs: u64,
