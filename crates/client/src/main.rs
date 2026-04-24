@@ -1,6 +1,7 @@
 mod context;
 mod health;
 mod path_strategy;
+mod preview;
 mod remote;
 mod runtime;
 mod tui;
@@ -12,13 +13,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use cli::{InterfaceSpec, SecretArg, parse_interface_configs};
 use context::ClientCtx;
 use health::spawn_health_receiver;
 use iroh::{EndpointId, RelayUrl};
 use parking_lot::RwLock;
 use path_strategy::{PathStrategy, spawn_strategy_loop};
+use preview::spawn_preview;
 use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_packet};
 use remote::{RemoteConfig, spawn_remote_server};
 use runtime::wait_for_shutdown;
@@ -55,6 +57,12 @@ struct Cli {
     remote: bool,
     #[arg(long, default_value = "irohsion")]
     remote_name: String,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    remote_preview: bool,
+    #[arg(long, default_value_t = 200_000)]
+    remote_preview_max_jpeg_bytes: usize,
+    #[arg(long, default_value_t = 10)]
+    remote_preview_decode_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -137,6 +145,12 @@ async fn main() -> Result<()> {
         .iter()
         .map(|path| path.interface_name.clone())
         .collect::<Vec<_>>();
+    let preview = (cli.remote && cli.remote_preview).then(|| {
+        spawn_preview(
+            cli.remote_preview_max_jpeg_bytes,
+            cli.remote_preview_decode_interval_secs,
+        )
+    });
     if cli.remote {
         spawn_remote_server(
             RemoteConfig {
@@ -146,6 +160,7 @@ async fn main() -> Result<()> {
                 relays: cli.relays.clone(),
             },
             strategy.clone(),
+            preview.clone(),
             ctx.clone(),
         )
         .await?;
@@ -206,6 +221,9 @@ async fn main() -> Result<()> {
         *last_ingest_peer.write() = Some(src);
         ctx.record_ingest(len as u64, src.to_string());
         strategy.record_packet(len as u64);
+        if let Some(preview) = &preview {
+            preview.submit_packet(&buf[..len]);
+        }
 
         ctx.ingested_packet(seq, len, src);
 
@@ -227,8 +245,10 @@ async fn main() -> Result<()> {
                     },
                     &buf[start..end],
                 ));
+                let packet_len = packet.len() as u64;
                 match path.send(packet) {
                     Ok(()) => {
+                        strategy.record_interface_send(&path.interface_name, packet_len);
                         ctx.record_send(path.interface_name.clone(), (end - start) as u64);
                     }
                     Err(err) => {
@@ -253,11 +273,13 @@ async fn main() -> Result<()> {
                 },
                 &buf[..len],
             ));
+            let packet_len = packet.len() as u64;
 
             // Duplicate each ingested packet over every active interface-bound iroh path.
             for path in &paths {
                 match path.send(packet.clone()) {
                     Ok(()) => {
+                        strategy.record_interface_send(&path.interface_name, packet_len);
                         ctx.record_send(path.interface_name.clone(), len as u64);
                     }
                     Err(err) => {

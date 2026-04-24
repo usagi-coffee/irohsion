@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use parking_lot::RwLock;
@@ -43,6 +43,9 @@ pub struct InterfaceControlStatus {
     pub name: String,
     pub target_mbps: Option<f64>,
     pub split_percentage: Option<f64>,
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
+    pub tx_mbps: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +75,7 @@ pub struct StrategyState {
     payload_bytes: Arc<AtomicU64>,
     targets_mbps: Arc<RwLock<BTreeMap<String, Option<f64>>>>,
     split_percentages: Arc<RwLock<BTreeMap<String, Option<f64>>>>,
+    interface_traffic: Arc<RwLock<BTreeMap<String, InterfaceTraffic>>>,
 }
 
 impl StrategyState {
@@ -95,6 +99,10 @@ impl StrategyState {
     pub fn status(&self) -> ControlStatus {
         let targets = self.targets_mbps.read();
         let percentages = self.split_percentages.read();
+        let mut traffic = self.interface_traffic.write();
+        for counters in traffic.values_mut() {
+            counters.update_rate();
+        }
         ControlStatus {
             mode: self.mode(),
             effective_strategy: self.current(),
@@ -103,10 +111,16 @@ impl StrategyState {
             payload_bytes: self.payload_bytes.load(Ordering::Relaxed),
             interfaces: targets
                 .iter()
-                .map(|(name, target_mbps)| InterfaceControlStatus {
-                    name: name.clone(),
-                    target_mbps: *target_mbps,
-                    split_percentage: percentages.get(name).copied().flatten(),
+                .map(|(name, target_mbps)| {
+                    let counters = traffic.get(name).copied().unwrap_or_default();
+                    InterfaceControlStatus {
+                        name: name.clone(),
+                        target_mbps: *target_mbps,
+                        split_percentage: percentages.get(name).copied().flatten(),
+                        tx_packets: counters.tx_packets,
+                        tx_bytes: counters.tx_bytes,
+                        tx_mbps: counters.tx_mbps,
+                    }
                 })
                 .collect(),
         }
@@ -150,6 +164,17 @@ impl StrategyState {
         self.packets.fetch_add(1, Ordering::Relaxed);
         self.payload_bytes
             .fetch_add(payload_bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_interface_send(&self, interface: &str, bytes: u64) {
+        if !self.monitor_packets.load(Ordering::Relaxed) {
+            return;
+        }
+
+        if let Some(counters) = self.interface_traffic.write().get_mut(interface) {
+            counters.tx_packets = counters.tx_packets.saturating_add(1);
+            counters.tx_bytes = counters.tx_bytes.saturating_add(bytes);
+        }
     }
 
     pub fn split_weights(&self, interfaces: &[String]) -> Vec<f64> {
@@ -211,6 +236,10 @@ pub fn spawn_strategy_loop(
         .iter()
         .map(|interface| (interface.clone(), None))
         .collect();
+    let interface_traffic = interfaces
+        .iter()
+        .map(|interface| (interface.clone(), InterfaceTraffic::default()))
+        .collect();
     let state = StrategyState {
         mode: Arc::new(AtomicU8::new(StrategyMode::Auto as u8)),
         strategy: Arc::new(AtomicU8::new(PathStrategy::Split as u8)),
@@ -219,6 +248,7 @@ pub fn spawn_strategy_loop(
         payload_bytes: Arc::new(AtomicU64::new(0)),
         targets_mbps: Arc::new(RwLock::new(targets_mbps)),
         split_percentages: Arc::new(RwLock::new(split_percentages)),
+        interface_traffic: Arc::new(RwLock::new(interface_traffic)),
     };
     let loop_state = state.clone();
     tokio::spawn(async move {
@@ -233,6 +263,42 @@ pub fn spawn_strategy_loop(
         .await;
     });
     state
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InterfaceTraffic {
+    tx_packets: u64,
+    tx_bytes: u64,
+    last_tx_bytes: u64,
+    last_sample: Instant,
+    tx_mbps: f64,
+}
+
+impl Default for InterfaceTraffic {
+    fn default() -> Self {
+        Self {
+            tx_packets: 0,
+            tx_bytes: 0,
+            last_tx_bytes: 0,
+            last_sample: Instant::now(),
+            tx_mbps: 0.0,
+        }
+    }
+}
+
+impl InterfaceTraffic {
+    fn update_rate(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_sample).as_secs_f64();
+        if elapsed <= f64::EPSILON {
+            return;
+        }
+
+        let byte_delta = self.tx_bytes.saturating_sub(self.last_tx_bytes);
+        self.tx_mbps = byte_delta as f64 * 8.0 / elapsed / 1_000_000.0;
+        self.last_tx_bytes = self.tx_bytes;
+        self.last_sample = now;
+    }
 }
 
 async fn strategy_loop(
