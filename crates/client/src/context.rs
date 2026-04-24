@@ -67,20 +67,14 @@ impl ClientCtx {
         }
     }
 
-    pub fn client_ready(
-        &self,
-        session_id: u32,
-        udp_listen: SocketAddr,
-        paths: usize,
-        health_endpoint: &str,
-    ) {
+    pub fn client_ready(&self, udp_listen: SocketAddr, paths: usize, health_endpoint: &str) {
         if let Some(ui) = &self.ui {
             ui.push_log_line(format!(
-                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths} health_endpoint={health_endpoint}"
+                "INFO client ready udp_listen={udp_listen} paths={paths} health_endpoint={health_endpoint}"
             ));
         } else {
             println!(
-                "INFO client ready session_id={session_id} udp_listen={udp_listen} paths={paths} health_endpoint={health_endpoint}"
+                "INFO client ready udp_listen={udp_listen} paths={paths} health_endpoint={health_endpoint}"
             );
         }
     }
@@ -144,6 +138,34 @@ impl ClientCtx {
             eprintln!(
                 "ERROR failed to send duplicated packet interface={interface} seq={seq} error={error}"
             );
+        }
+    }
+
+    pub fn record_strategy_change(&self, strategy: &str, reason: &str) {
+        if let Some(ui) = &self.ui {
+            ui.push_log_line(format!(
+                "INFO path strategy changed strategy={strategy} reason=\"{reason}\""
+            ));
+        } else {
+            println!("INFO path strategy changed strategy={strategy} reason=\"{reason}\"");
+        }
+    }
+
+    pub fn record_remote_ready(
+        &self,
+        adapter: &str,
+        name: &str,
+        service_uuid: &str,
+        status_uuid: &str,
+        control_uuid: &str,
+    ) {
+        let line = format!(
+            "INFO remote BLE control ready adapter={adapter} name={name} service={service_uuid} status={status_uuid} control={control_uuid}"
+        );
+        if let Some(ui) = &self.ui {
+            ui.push_log_line(line);
+        } else {
+            println!("{line}");
         }
     }
 

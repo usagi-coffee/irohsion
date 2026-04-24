@@ -85,6 +85,14 @@ impl ServerCtx {
         }
     }
 
+    pub fn record_reorder_skip(&self, skipped_seq: u64, buffered: u64, next_seq: u64) {
+        if let Some(ui) = &self.ui {
+            ui.record_reorder_skip(buffered, next_seq);
+        } else {
+            eprintln!("WARN skipped missing packet sequence={skipped_seq} next_seq={next_seq}");
+        }
+    }
+
     pub fn record_invalid(&self) {
         if let Some(ui) = &self.ui {
             ui.record_invalid();
@@ -99,17 +107,9 @@ impl ServerCtx {
         }
     }
 
-    pub fn set_session(&self, session_id: u32, next_seq: u64) {
+    pub fn set_flow_start(&self, next_seq: u64) {
         if let Some(ui) = &self.ui {
-            ui.set_session(session_id, next_seq);
-        }
-    }
-
-    pub fn record_session_switch(&self, session_id: u32, next_seq: u64) {
-        if let Some(ui) = &self.ui {
-            ui.record_session_switch(session_id, next_seq);
-        } else {
-            println!("INFO session switch session_id={session_id} next_seq={next_seq}");
+            ui.set_flow_start(next_seq);
         }
     }
 }

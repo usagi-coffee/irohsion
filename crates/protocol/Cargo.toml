@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 bytes.workspace = true
+modular-bitfield.workspace = true

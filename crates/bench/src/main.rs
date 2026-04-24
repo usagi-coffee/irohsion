@@ -3,12 +3,10 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use anyhow::{Result, bail};
 use clap::Parser;
 use iroh::{EndpointId, RelayUrl};
-use protocol::{PacketHeader, encode_packet};
+use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_packet};
 use tokio::time::{Instant, sleep_until};
 use tracing::{error, info};
-use transport::{
-    build_server_addr, connect_path, current_session_id, resolve_interface_ipv4, transport_kind,
-};
+use transport::{build_server_addr, connect_path, resolve_interface_ipv4, transport_kind};
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -26,6 +24,8 @@ struct Cli {
     packet_size: usize,
     #[arg(long)]
     duration_secs: Option<u64>,
+    #[arg(long)]
+    split_threshold_bytes: Option<usize>,
 }
 
 #[tokio::main]
@@ -52,8 +52,10 @@ async fn main() -> Result<()> {
         );
         paths.push(path);
     }
+    if paths.len() > MAX_FRAGMENTS {
+        bail!("at most {MAX_FRAGMENTS} interfaces are supported by the packed packet header");
+    }
 
-    let session_id = current_session_id()?;
     let payload = vec![0x42_u8; cli.packet_size];
     let bytes_per_second = cli.throughput_mbps * 1_000_000.0 / 8.0;
     let packets_per_second = bytes_per_second / cli.packet_size as f64;
@@ -65,7 +67,6 @@ async fn main() -> Result<()> {
         .map(|secs| start + Duration::from_secs(secs));
 
     info!(
-        session_id,
         throughput_mbps = cli.throughput_mbps,
         packet_size = cli.packet_size,
         packets_per_second,
@@ -83,14 +84,41 @@ async fn main() -> Result<()> {
             break;
         }
 
-        let packet = Arc::new(encode_packet(PacketHeader { session_id, seq }, &payload));
-        for path in &paths {
-            if let Err(err) = path.send(packet.clone()) {
-                error!(interface = %path.interface_name, seq, error = %err, "failed to send bench packet");
+        if should_split(payload.len(), cli.split_threshold_bytes, paths.len()) {
+            let fragments = u8::try_from(paths.len()).expect("path count fits in u8");
+            let chunk_size = payload.len().div_ceil(paths.len());
+            for (fragment, path) in paths.iter().enumerate() {
+                let start = fragment * chunk_size;
+                let end = (start + chunk_size).min(payload.len());
+                let packet = Arc::new(encode_packet(
+                    PacketHeader {
+                        sequence: seq,
+                        fragment: u8::try_from(fragment).expect("fragment fits in u8"),
+                        fragments,
+                    },
+                    &payload[start..end],
+                ));
+                if let Err(err) = path.send(packet) {
+                    error!(interface = %path.interface_name, seq, error = %err, "failed to send bench packet fragment");
+                }
+            }
+        } else {
+            let packet = Arc::new(encode_packet(
+                PacketHeader {
+                    sequence: seq,
+                    fragment: 0,
+                    fragments: 1,
+                },
+                &payload,
+            ));
+            for path in &paths {
+                if let Err(err) = path.send(packet.clone()) {
+                    error!(interface = %path.interface_name, seq, error = %err, "failed to send bench packet");
+                }
             }
         }
 
-        seq = seq.wrapping_add(1);
+        seq = next_sequence(seq);
         sent_packets += 1;
         sent_payload_bytes += cli.packet_size as u64;
 
@@ -129,6 +157,18 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         bail!("--throughput-mbps must be a finite positive number");
     }
     Ok(())
+}
+
+fn should_split(packet_len: usize, threshold: Option<usize>, path_count: usize) -> bool {
+    matches!(threshold, Some(threshold) if packet_len > threshold && path_count > 1)
+}
+
+fn next_sequence(sequence: u64) -> u64 {
+    if sequence == MAX_SEQUENCE {
+        0
+    } else {
+        sequence + 1
+    }
 }
 
 fn log_connection_paths(interface_name: &str, connection: &iroh::endpoint::Connection) {

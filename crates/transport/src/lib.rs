@@ -7,11 +7,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use iroh::{
-    endpoint::presets, Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
-    TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    endpoint::presets,
 };
 
 pub const ALPN: &[u8] = b"irohsion/v1";

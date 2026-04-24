@@ -3,7 +3,7 @@ use std::{
     io::{self, Stdout},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -38,11 +38,10 @@ pub struct ServerUiState {
     forwarded_packets: Arc<AtomicU64>,
     forwarded_bytes: Arc<AtomicU64>,
     duplicate_packets: Arc<AtomicU64>,
+    skipped_packets: Arc<AtomicU64>,
     invalid_packets: Arc<AtomicU64>,
-    session_switches: Arc<AtomicU64>,
     buffered_packets: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
-    current_session: Arc<AtomicU32>,
     connection_activity_counter: Arc<AtomicU64>,
     connections: Arc<RwLock<BTreeMap<String, ConnectionView>>>,
 }
@@ -109,11 +108,10 @@ impl ServerUiState {
             forwarded_packets: Arc::new(AtomicU64::new(0)),
             forwarded_bytes: Arc::new(AtomicU64::new(0)),
             duplicate_packets: Arc::new(AtomicU64::new(0)),
+            skipped_packets: Arc::new(AtomicU64::new(0)),
             invalid_packets: Arc::new(AtomicU64::new(0)),
-            session_switches: Arc::new(AtomicU64::new(0)),
             buffered_packets: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
-            current_session: Arc::new(AtomicU32::new(0)),
             connection_activity_counter: Arc::new(AtomicU64::new(0)),
             connections: Arc::new(RwLock::new(BTreeMap::new())),
         }
@@ -194,6 +192,12 @@ impl ServerUiState {
         self.next_seq.store(next_seq, Ordering::Relaxed);
     }
 
+    pub fn record_reorder_skip(&self, buffered: u64, next_seq: u64) {
+        self.skipped_packets.fetch_add(1, Ordering::Relaxed);
+        self.buffered_packets.store(buffered, Ordering::Relaxed);
+        self.next_seq.store(next_seq, Ordering::Relaxed);
+    }
+
     pub fn record_invalid(&self) {
         self.invalid_packets.fetch_add(1, Ordering::Relaxed);
     }
@@ -203,14 +207,7 @@ impl ServerUiState {
         self.next_seq.store(next_seq, Ordering::Relaxed);
     }
 
-    pub fn set_session(&self, session_id: u32, next_seq: u64) {
-        self.current_session.store(session_id, Ordering::Relaxed);
-        self.next_seq.store(next_seq, Ordering::Relaxed);
-    }
-
-    pub fn record_session_switch(&self, session_id: u32, next_seq: u64) {
-        self.session_switches.fetch_add(1, Ordering::Relaxed);
-        self.current_session.store(session_id, Ordering::Relaxed);
+    pub fn set_flow_start(&self, next_seq: u64) {
         self.next_seq.store(next_seq, Ordering::Relaxed);
     }
 }
@@ -362,16 +359,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
             fwd_bytes as f64 / 1_000_000.0
         )),
         Line::from(format!(
-            "dupes {:>9}   invalid {:>8}   buffered {:>7}",
+            "dupes {:>9}   skipped {:>7}   invalid {:>8}   buffered {:>7}",
             state.duplicate_packets.load(Ordering::Relaxed),
+            state.skipped_packets.load(Ordering::Relaxed),
             state.invalid_packets.load(Ordering::Relaxed),
             state.buffered_packets.load(Ordering::Relaxed)
         )),
         Line::from(format!(
-            "session {:>10}   next_seq {:>10}   switches {:>6}   avg fwd {:>6.2} Mbps",
-            state.current_session.load(Ordering::Relaxed),
+            "next_seq {:>10}   avg fwd {:>6.2} Mbps",
             state.next_seq.load(Ordering::Relaxed),
-            state.session_switches.load(Ordering::Relaxed),
             fwd_bytes as f64 * 8.0 / elapsed / 1_000_000.0
         )),
     ])

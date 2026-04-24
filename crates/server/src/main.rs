@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{ArgAction, Parser};
 use cli::{EndpointTarget, SecretArg, endpoint_targets, local_udp_dest, relay_mode};
@@ -20,9 +20,9 @@ use health::{
 };
 use iroh::{Endpoint, EndpointId, RelayUrl, endpoint::presets};
 use parking_lot::RwLock;
-use protocol::{DecodedPacket, PacketHeader, decode_packet};
+use protocol::{DecodedPacket, MAX_SEQUENCE, PacketHeader, decode_packet};
 use runtime::wait_for_shutdown;
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
+use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::timeout};
 use transport::{ALPN, build_server_addr};
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
@@ -43,6 +43,10 @@ struct Cli {
     secret: SecretArg,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     tui: bool,
+    #[arg(long, default_value_t = 30)]
+    flow_idle_reset_secs: u64,
+    #[arg(long, default_value_t = 100)]
+    max_reorder_delay_ms: u64,
 }
 
 #[derive(Debug)]
@@ -52,12 +56,74 @@ struct ReceivedPacket {
     payload: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct FragmentAssembly {
+    fragments: Vec<Option<Vec<u8>>>,
+    received: usize,
+    first_seen: tokio::time::Instant,
+}
+
+impl FragmentAssembly {
+    fn new(fragments: u8, first_seen: tokio::time::Instant) -> Self {
+        Self {
+            fragments: vec![None; fragments as usize],
+            received: 0,
+            first_seen,
+        }
+    }
+
+    fn fragments(&self) -> u8 {
+        u8::try_from(self.fragments.len()).expect("fragment count fits in u8")
+    }
+
+    fn insert(&mut self, fragment: u8, payload: Vec<u8>) -> bool {
+        let slot = &mut self.fragments[fragment as usize];
+        if slot.is_some() {
+            return false;
+        }
+
+        *slot = Some(payload);
+        self.received += 1;
+        true
+    }
+
+    fn is_complete(&self) -> bool {
+        self.received == self.fragments.len()
+    }
+
+    fn into_payload(self) -> Vec<u8> {
+        let total_len = self
+            .fragments
+            .iter()
+            .map(|fragment| fragment.as_ref().map_or(0, Vec::len))
+            .sum();
+        let mut payload = Vec::with_capacity(total_len);
+        for fragment in self.fragments {
+            payload.extend(fragment.expect("complete assembly has every fragment"));
+        }
+        payload
+    }
+}
+
+#[derive(Debug)]
+struct BufferedPacket {
+    payload: Vec<u8>,
+    received_at: tokio::time::Instant,
+}
+
 type ConnectionRegistry = Arc<RwLock<BTreeMap<String, iroh::endpoint::Connection>>>;
 type ReplyRoutes = Arc<RwLock<Vec<String>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.flow_idle_reset_secs == 0 {
+        bail!("--flow-idle-reset-secs must be greater than zero");
+    }
+    if cli.max_reorder_delay_ms == 0 {
+        bail!("--max-reorder-delay-ms must be greater than zero");
+    }
+
     let secret_key = cli.secret.resolve();
     let udp_dest = local_udp_dest(cli.port);
     let relays = cli.relays.clone();
@@ -100,8 +166,19 @@ async fn main() -> Result<()> {
         let out_socket = out_socket.clone();
         let reply_routes = reply_routes.clone();
         let ctx = ctx.clone();
+        let flow_idle_reset = Duration::from_secs(cli.flow_idle_reset_secs);
+        let max_reorder_delay = Duration::from_millis(cli.max_reorder_delay_ms);
         tasks.push(tokio::spawn(async move {
-            let _ = reorder_loop(rx, out_socket, udp_dest, reply_routes, ctx).await;
+            let _ = reorder_loop(
+                rx,
+                out_socket,
+                udp_dest,
+                reply_routes,
+                ctx,
+                flow_idle_reset,
+                max_reorder_delay,
+            )
+            .await;
         }));
     }
 
@@ -219,85 +296,240 @@ async fn reorder_loop(
     out_udp: SocketAddr,
     reply_routes: ReplyRoutes,
     ctx: ServerCtx,
+    flow_idle_reset: Duration,
+    max_reorder_delay: Duration,
 ) -> Result<()> {
-    let mut current_session_id: Option<u32> = None;
+    let mut initialized = false;
     let mut next_seq = 0_u64;
-    let mut buffered = BTreeMap::<u64, Vec<u8>>::new();
+    let mut buffered = BTreeMap::<u64, BufferedPacket>::new();
+    let mut fragments = BTreeMap::<u64, FragmentAssembly>::new();
     let mut seen = HashSet::<u64>::new();
 
-    while let Some(packet) = rx.recv().await {
+    loop {
+        let timeout_duration = if has_pending_state(&buffered, &fragments, &seen) {
+            max_reorder_delay
+        } else {
+            flow_idle_reset
+        };
+        let packet = match timeout(timeout_duration, rx.recv()).await {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(_) => {
+                if !initialized {
+                    continue;
+                }
+
+                if has_pending_state(&buffered, &fragments, &seen) {
+                    expire_reorder_gap(
+                        &mut next_seq,
+                        &mut buffered,
+                        &mut fragments,
+                        &mut seen,
+                        max_reorder_delay,
+                        &ctx,
+                    );
+                    drain_ready(
+                        &mut next_seq,
+                        &mut buffered,
+                        &mut seen,
+                        &out_socket,
+                        out_udp,
+                        &ctx,
+                    )
+                    .await?;
+                } else {
+                    initialized = false;
+                    next_seq = 0;
+                }
+                continue;
+            }
+        };
+
         ctx.record_received(packet.payload.len() as u64);
 
-        match current_session_id {
-            None => {
-                current_session_id = Some(packet.header.session_id);
-                set_reply_routes(&reply_routes, &packet.remote, true);
-                ctx.set_session(packet.header.session_id, packet.header.seq);
-                next_seq = packet.header.seq;
-            }
-            Some(active) if packet.header.session_id < active => {
+        if initialized {
+            set_reply_routes(&reply_routes, &packet.remote, false);
+        } else {
+            initialized = true;
+            next_seq = packet.header.sequence;
+            set_reply_routes(&reply_routes, &packet.remote, true);
+            ctx.set_flow_start(next_seq);
+        }
+
+        if packet.header.sequence < next_seq {
+            ctx.record_duplicate(buffered.len() as u64, next_seq);
+            continue;
+        }
+
+        if seen.contains(&packet.header.sequence) {
+            ctx.record_duplicate(buffered.len() as u64, next_seq);
+            continue;
+        }
+
+        let payload = if packet.header.fragments == 1 {
+            seen.insert(packet.header.sequence);
+            packet.payload
+        } else {
+            let now = tokio::time::Instant::now();
+            let entry = fragments
+                .entry(packet.header.sequence)
+                .or_insert_with(|| FragmentAssembly::new(packet.header.fragments, now));
+            if entry.fragments() != packet.header.fragments {
                 ctx.record_duplicate(buffered.len() as u64, next_seq);
                 continue;
             }
-            Some(active) if packet.header.session_id > active => {
-                set_reply_routes(&reply_routes, &packet.remote, true);
-                ctx.record_session_switch(packet.header.session_id, packet.header.seq);
-                current_session_id = Some(packet.header.session_id);
-                next_seq = packet.header.seq;
-                buffered.clear();
-                seen.clear();
+
+            if !entry.insert(packet.header.fragment, packet.payload) {
+                ctx.record_duplicate(buffered.len() as u64, next_seq);
+                continue;
             }
-            Some(_) => {
-                set_reply_routes(&reply_routes, &packet.remote, false);
+
+            if !entry.is_complete() {
+                ctx.record_buffered((buffered.len() + fragments.len()) as u64, next_seq);
+                continue;
             }
-        }
 
-        if packet.header.seq < next_seq {
-            ctx.record_duplicate(buffered.len() as u64, next_seq);
-            continue;
-        }
+            let assembly = fragments
+                .remove(&packet.header.sequence)
+                .expect("complete assembly exists");
+            seen.insert(packet.header.sequence);
+            assembly.into_payload()
+        };
 
-        if !seen.insert(packet.header.seq) {
-            ctx.record_duplicate(buffered.len() as u64, next_seq);
-            continue;
-        }
-
-        if packet.header.seq == next_seq {
-            forward_payload(&out_socket, out_udp, &packet.payload, packet.header).await?;
+        if packet.header.sequence == next_seq {
+            forward_payload(&out_socket, out_udp, &payload, packet.header).await?;
             ctx.record_forwarded(
-                packet.payload.len() as u64,
+                payload.len() as u64,
                 buffered.len() as u64,
-                next_seq.wrapping_add(1),
+                next_sequence(next_seq),
             );
-            next_seq = next_seq.wrapping_add(1);
-            seen.remove(&packet.header.seq);
-
-            while let Some(payload) = buffered.remove(&next_seq) {
-                forward_payload(
-                    &out_socket,
-                    out_udp,
-                    &payload,
-                    PacketHeader {
-                        session_id: current_session_id.expect("session is set"),
-                        seq: next_seq,
-                    },
-                )
-                .await?;
-                ctx.record_forwarded(
-                    payload.len() as u64,
-                    buffered.len() as u64,
-                    next_seq.wrapping_add(1),
-                );
-                seen.remove(&next_seq);
-                next_seq = next_seq.wrapping_add(1);
-            }
+            next_seq = next_sequence(next_seq);
+            seen.remove(&packet.header.sequence);
+            drain_ready(
+                &mut next_seq,
+                &mut buffered,
+                &mut seen,
+                &out_socket,
+                out_udp,
+                &ctx,
+            )
+            .await?;
         } else {
-            buffered.insert(packet.header.seq, packet.payload);
+            buffered.insert(
+                packet.header.sequence,
+                BufferedPacket {
+                    payload,
+                    received_at: tokio::time::Instant::now(),
+                },
+            );
             ctx.record_buffered(buffered.len() as u64, next_seq);
         }
     }
 
     Ok(())
+}
+
+fn has_pending_state(
+    buffered: &BTreeMap<u64, BufferedPacket>,
+    fragments: &BTreeMap<u64, FragmentAssembly>,
+    seen: &HashSet<u64>,
+) -> bool {
+    !(buffered.is_empty() && fragments.is_empty() && seen.is_empty())
+}
+
+fn expire_reorder_gap(
+    next_seq: &mut u64,
+    buffered: &mut BTreeMap<u64, BufferedPacket>,
+    fragments: &mut BTreeMap<u64, FragmentAssembly>,
+    seen: &mut HashSet<u64>,
+    max_reorder_delay: Duration,
+    ctx: &ServerCtx,
+) {
+    loop {
+        if buffered.contains_key(next_seq) {
+            break;
+        }
+
+        if let Some(assembly) = fragments.get(next_seq) {
+            if assembly.first_seen.elapsed() < max_reorder_delay {
+                break;
+            }
+
+            fragments.remove(next_seq);
+            seen.remove(next_seq);
+            skip_sequence(next_seq, buffered, fragments, ctx);
+            continue;
+        }
+
+        let oldest_pending = buffered
+            .values()
+            .map(|packet| packet.received_at)
+            .chain(fragments.values().map(|assembly| assembly.first_seen))
+            .min();
+        let Some(oldest_pending) = oldest_pending else {
+            break;
+        };
+        if oldest_pending.elapsed() < max_reorder_delay {
+            break;
+        }
+
+        skip_sequence(next_seq, buffered, fragments, ctx);
+    }
+}
+
+fn skip_sequence(
+    next_seq: &mut u64,
+    buffered: &BTreeMap<u64, BufferedPacket>,
+    fragments: &BTreeMap<u64, FragmentAssembly>,
+    ctx: &ServerCtx,
+) {
+    let skipped = *next_seq;
+    *next_seq = next_sequence(*next_seq);
+    ctx.record_reorder_skip(
+        skipped,
+        (buffered.len() + fragments.len()) as u64,
+        *next_seq,
+    );
+}
+
+async fn drain_ready(
+    next_seq: &mut u64,
+    buffered: &mut BTreeMap<u64, BufferedPacket>,
+    seen: &mut HashSet<u64>,
+    out_socket: &UdpSocket,
+    out_udp: SocketAddr,
+    ctx: &ServerCtx,
+) -> Result<()> {
+    while let Some(packet) = buffered.remove(next_seq) {
+        forward_payload(
+            out_socket,
+            out_udp,
+            &packet.payload,
+            PacketHeader {
+                sequence: *next_seq,
+                fragment: 0,
+                fragments: 1,
+            },
+        )
+        .await?;
+        ctx.record_forwarded(
+            packet.payload.len() as u64,
+            buffered.len() as u64,
+            next_sequence(*next_seq),
+        );
+        seen.remove(next_seq);
+        *next_seq = next_sequence(*next_seq);
+    }
+
+    Ok(())
+}
+
+fn next_sequence(sequence: u64) -> u64 {
+    if sequence == MAX_SEQUENCE {
+        0
+    } else {
+        sequence + 1
+    }
 }
 
 async fn forward_payload(
@@ -309,7 +541,7 @@ async fn forward_payload(
     socket
         .send_to(payload, out_udp)
         .await
-        .with_context(|| format!("failed forwarding seq {} to {}", header.seq, out_udp))?;
+        .with_context(|| format!("failed forwarding seq {} to {}", header.sequence, out_udp))?;
     Ok(())
 }
 
