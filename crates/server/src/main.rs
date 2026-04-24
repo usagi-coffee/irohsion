@@ -22,7 +22,7 @@ use iroh::{Endpoint, EndpointId, RelayUrl, endpoint::presets};
 use parking_lot::RwLock;
 use protocol::{DecodedPacket, PacketHeader, decode_packet};
 use runtime::wait_for_shutdown;
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
 use transport::{ALPN, build_server_addr};
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
@@ -93,15 +93,16 @@ async fn main() -> Result<()> {
     let reply_routes: ReplyRoutes = Arc::new(RwLock::new(Vec::new()));
     let health_connection: HealthConnection = Arc::new(RwLock::new(None));
     let health_stats: HealthStats = Arc::new(RwLock::new(BTreeMap::new()));
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
     {
         // Client-to-server packets are deduped/reordered centrally before hitting the UDP target.
         let out_socket = out_socket.clone();
         let reply_routes = reply_routes.clone();
         let ctx = ctx.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let _ = reorder_loop(rx, out_socket, udp_dest, reply_routes, ctx).await;
-        });
+        }));
     }
 
     {
@@ -109,9 +110,9 @@ async fn main() -> Result<()> {
         let out_socket = out_socket.clone();
         let connections = connections.clone();
         let reply_routes = reply_routes.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let _ = response_loop(out_socket, udp_dest, connections, reply_routes).await;
-        });
+        }));
     }
 
     {
@@ -119,25 +120,25 @@ async fn main() -> Result<()> {
         let health_stats = health_stats.clone();
         let endpoint_targets = endpoint_targets.clone();
         let interval = Duration::from_millis(cli.health_interval_ms);
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let _ = health_loop(health_connection, health_stats, endpoint_targets, interval).await;
-        });
+        }));
     }
 
     if let Some(health_endpoint) = cli.health_endpoint {
         let endpoint = endpoint.clone();
         let health_connection = health_connection.clone();
         let health_addr = build_server_addr(health_endpoint, &[], &relays)?;
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let _ = maintain_health_connection(endpoint, health_addr, health_connection).await;
-        });
+        }));
     }
 
     loop {
-        let shutdown = wait_for_shutdown(ctx.ui_state());
+        let shutdown_signal = wait_for_shutdown(ctx.ui_state());
         let incoming = tokio::select! {
             incoming = endpoint.accept() => incoming,
-            _ = shutdown => break,
+            _ = shutdown_signal => break,
         };
         let Some(incoming) = incoming else {
             break;
@@ -147,7 +148,7 @@ async fn main() -> Result<()> {
         let connections = connections.clone();
         let health_stats = health_stats.clone();
         let ctx = ctx.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             // Each accepted iroh connection represents one client path; all paths feed the same
             // reorder loop, and we remember the live connection so UDP responses can travel back.
             let accepting = match incoming.accept() {
@@ -193,9 +194,12 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-        });
+        }));
     }
 
+    for task in tasks {
+        task.abort();
+    }
     endpoint.close().await;
     Ok(())
 }
