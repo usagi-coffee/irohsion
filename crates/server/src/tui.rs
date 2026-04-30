@@ -420,11 +420,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         .iter()
         .map(|(remote, connection)| (remote.clone(), connection.clone()))
         .collect::<Vec<_>>();
-    ordered.sort_by(|a, b| {
-        b.1.last_activity
-            .cmp(&a.1.last_activity)
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    ordered.sort_by(|a, b| a.0.cmp(&b.0));
 
     let all_rows = ordered
         .iter()
