@@ -291,7 +291,7 @@
 
 	/** @param {string} interfaceName @param {string | number} value */
 	function setPercentage(interfaceName, value) {
-		void writePatch({ split_percentages: { [interfaceName]: Number(value) } });
+		void writePatch({ split_percentages: rebalanceSplitPercentages(interfaceName, Number(value)) });
 	}
 
 	/** @param {boolean} enabled */
@@ -307,6 +307,47 @@
 	/** @param {InterfaceStatus} iface */
 	function displayPercentage(iface) {
 		return iface.split_percentage ?? evenPercentage();
+	}
+
+	/**
+	 * @param {string} interfaceName
+	 * @param {number} nextValue
+	 * @returns {Record<string, number>}
+	 */
+	function rebalanceSplitPercentages(interfaceName, nextValue) {
+		if (interfaces.length === 0) return {};
+		if (interfaces.length === 1) {
+			return { [interfaces[0].name]: 100 };
+		}
+
+		const clamped = Math.max(0, Math.min(100, Number.isFinite(nextValue) ? nextValue : 0));
+		const otherInterfaces = interfaces.filter((iface) => iface.name !== interfaceName);
+		const remaining = Math.max(0, 100 - clamped);
+		const totalOtherWeight = otherInterfaces.reduce(
+			(total, iface) => total + displayPercentage(iface),
+			0,
+		);
+		const baseWeight = totalOtherWeight > 0 ? totalOtherWeight : otherInterfaces.length;
+		const rebalanced = { [interfaceName]: clamped };
+		const allocations = otherInterfaces.map((iface) => {
+			const weight = totalOtherWeight > 0 ? displayPercentage(iface) : 1;
+			const exact = remaining * (weight / baseWeight);
+			const whole = Math.floor(exact);
+			return {
+				name: iface.name,
+				whole,
+				fraction: exact - whole,
+			};
+		});
+		let assigned = clamped + allocations.reduce((total, item) => total + item.whole, 0);
+		allocations
+			.sort((a, b) => b.fraction - a.fraction || a.name.localeCompare(b.name))
+			.forEach((item) => {
+				const bonus = assigned < 100 ? 1 : 0;
+				rebalanced[item.name] = item.whole + bonus;
+				assigned += bonus;
+			});
+		return rebalanced;
 	}
 
 	function evenPercentage() {

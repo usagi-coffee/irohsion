@@ -155,6 +155,7 @@ impl StrategyState {
                 }
             }
         }
+        ctx.record_split_percentages(&self.effective_split_percentages());
     }
 
     pub fn record_packet(&self, payload_bytes: u64) {
@@ -205,6 +206,21 @@ impl StrategyState {
         weights
     }
 
+    pub fn effective_split_percentages(&self) -> BTreeMap<String, f64> {
+        let interfaces = self
+            .targets_mbps
+            .read()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let weights = self.split_weights(&interfaces);
+        interfaces
+            .into_iter()
+            .zip(weights)
+            .map(|(interface, weight)| (interface, weight * 100.0))
+            .collect()
+    }
+
     pub fn degrade_to_redundant(&self, ctx: &ClientCtx, reason: String) {
         if self.mode() != StrategyMode::Auto {
             return;
@@ -251,6 +267,7 @@ pub fn spawn_strategy_loop(
         split_percentages: Arc::new(RwLock::new(split_percentages)),
         interface_traffic: Arc::new(RwLock::new(interface_traffic)),
     };
+    ctx.record_split_percentages(&state.effective_split_percentages());
     let loop_state = state.clone();
     tokio::spawn(async move {
         strategy_loop(

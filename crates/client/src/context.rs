@@ -1,5 +1,6 @@
 use crate::tui;
 use std::net::SocketAddr;
+use std::collections::BTreeMap;
 use transport::{HealthReport, transport_kind};
 
 #[derive(Clone, Default)]
@@ -148,6 +149,12 @@ impl ClientCtx {
             ));
         } else {
             println!("INFO path strategy changed strategy={strategy} reason=\"{reason}\"");
+        }
+    }
+
+    pub fn record_split_percentages(&self, percentages: &BTreeMap<String, f64>) {
+        if let Some(ui) = &self.ui {
+            ui.record_split_percentages(percentages);
         }
     }
 

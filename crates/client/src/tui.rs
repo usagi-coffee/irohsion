@@ -53,6 +53,7 @@ pub struct ClientUiState {
 pub struct PathRow {
     pub endpoint_id: String,
     pub target_mbps: Option<f32>,
+    pub split_percentage: Option<f64>,
     pub server_mbps: String,
     pub degradation: String,
     pub remote_addr: String,
@@ -73,6 +74,7 @@ pub fn describe_paths(connection: &iroh::endpoint::Connection, endpoint_id: &str
         .map(|path| PathRow {
             endpoint_id: endpoint_id.to_string(),
             target_mbps: None,
+            split_percentage: None,
             server_mbps: "-".to_string(),
             degradation: "-".to_string(),
             remote_addr: path.remote_addr().to_string(),
@@ -142,6 +144,7 @@ impl ClientUiState {
             .push(PathRow {
                 endpoint_id: "-".to_string(),
                 target_mbps: None,
+                split_percentage: None,
                 server_mbps: "-".to_string(),
                 degradation: "-".to_string(),
                 remote_addr: error,
@@ -153,6 +156,15 @@ impl ClientUiState {
 
     pub fn record_path(&self, interface: String, rows: Vec<PathRow>) {
         self.paths.write().insert(interface, rows);
+    }
+
+    pub fn record_split_percentages(&self, percentages: &BTreeMap<String, f64>) {
+        for (interface, rows) in self.paths.write().iter_mut() {
+            let percentage = percentages.get(interface).copied();
+            for row in rows {
+                row.split_percentage = percentage;
+            }
+        }
     }
 
     pub fn set_health_endpoint(&self, endpoint: String) {
@@ -427,6 +439,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
                 Cell::from(interface.clone()),
                 Cell::from(short_endpoint(&row.endpoint_id)),
                 Cell::from(client_mbps.clone()),
+                Cell::from(
+                    row.split_percentage
+                        .map(|percentage| format!("{percentage:.0}%"))
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
                 Cell::from(row.server_mbps.clone()),
                 Cell::from(row.degradation.clone()),
                 Cell::from(row.transport.clone()),
@@ -442,6 +459,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(10),
@@ -455,6 +473,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
             "Interface",
             "Endpoint",
             "Client Mbps",
+            "Split %",
             "Server Mbps",
             "Health",
             "Transport",
