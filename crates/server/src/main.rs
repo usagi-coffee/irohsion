@@ -16,14 +16,15 @@ use clap::{ArgAction, Parser};
 use cli::{EndpointTarget, SecretArg, endpoint_targets, local_udp_dest, relay_mode};
 use context::ServerCtx;
 use health::{
-    HealthConnection, HealthStats, health_loop, maintain_health_connection, record_health_bytes,
+    HealthConnections, HealthStats, HealthTargets, health_loop, maintain_health_connection,
+    record_health_bytes,
 };
-use iroh::{Endpoint, EndpointId, RelayUrl, endpoint::presets};
+use iroh::{Endpoint, RelayUrl, endpoint::presets};
 use parking_lot::RwLock;
 use protocol::{DecodedPacket, MAX_SEQUENCE, PacketHeader, decode_packet};
 use runtime::wait_for_shutdown;
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::timeout};
-use transport::{ALPN, build_server_addr};
+use transport::ALPN;
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
 
@@ -31,8 +32,6 @@ const MAX_UDP_PACKET_SIZE: usize = 65_507;
 struct Cli {
     #[arg(long)]
     port: u16,
-    #[arg(long)]
-    health_endpoint: Option<EndpointId>,
     #[arg(long = "endpoint-target")]
     endpoint_targets: Vec<EndpointTarget>,
     #[arg(long, default_value_t = 1000)]
@@ -146,7 +145,7 @@ async fn main() -> Result<()> {
     endpoint.online().await;
     let server_addrs = tui::server_addrs(&endpoint);
     ctx.set_endpoint(endpoint.id().to_string());
-    ctx.set_health_endpoint(cli.health_endpoint.map(|id| id.to_string()));
+    ctx.set_health_endpoint(Some("auto".to_string()));
     ctx.set_server_addrs(server_addrs);
 
     let out_socket = Arc::new(
@@ -157,7 +156,8 @@ async fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel::<ReceivedPacket>(1024);
     let connections: ConnectionRegistry = Arc::new(RwLock::new(BTreeMap::new()));
     let reply_routes: ReplyRoutes = Arc::new(RwLock::new(Vec::new()));
-    let health_connection: HealthConnection = Arc::new(RwLock::new(None));
+    let health_connections: HealthConnections = Arc::new(RwLock::new(BTreeMap::new()));
+    let health_targets: HealthTargets = Arc::new(RwLock::new(std::collections::HashSet::new()));
     let health_stats: HealthStats = Arc::new(RwLock::new(BTreeMap::new()));
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
@@ -193,21 +193,12 @@ async fn main() -> Result<()> {
     }
 
     {
-        let health_connection = health_connection.clone();
+        let health_connections = health_connections.clone();
         let health_stats = health_stats.clone();
         let endpoint_targets = endpoint_targets.clone();
         let interval = Duration::from_millis(cli.health_interval_ms);
         tasks.push(tokio::spawn(async move {
-            let _ = health_loop(health_connection, health_stats, endpoint_targets, interval).await;
-        }));
-    }
-
-    if let Some(health_endpoint) = cli.health_endpoint {
-        let endpoint = endpoint.clone();
-        let health_connection = health_connection.clone();
-        let health_addr = build_server_addr(health_endpoint, &[], &relays)?;
-        tasks.push(tokio::spawn(async move {
-            let _ = maintain_health_connection(endpoint, health_addr, health_connection).await;
+            let _ = health_loop(health_connections, health_stats, endpoint_targets, interval).await;
         }));
     }
 
@@ -223,8 +214,11 @@ async fn main() -> Result<()> {
 
         let tx = tx.clone();
         let connections = connections.clone();
+        let health_targets = health_targets.clone();
+        let health_connections = health_connections.clone();
         let health_stats = health_stats.clone();
         let ctx = ctx.clone();
+        let endpoint = endpoint.clone();
         tasks.push(tokio::spawn(async move {
             // Each accepted iroh connection represents one client path; all paths feed the same
             // reorder loop, and we remember the live connection so UDP responses can travel back.
@@ -243,6 +237,26 @@ async fn main() -> Result<()> {
             connections
                 .write()
                 .insert(remote_key.clone(), connection.clone());
+            let should_spawn_health = {
+                let mut targets = health_targets.write();
+                targets.insert(remote_key.clone())
+            };
+            if should_spawn_health {
+                let endpoint = endpoint.clone();
+                let health_targets = health_targets.clone();
+                let health_connections = health_connections.clone();
+                let endpoint_key = remote_key.clone();
+                tokio::spawn(async move {
+                    let _ = maintain_health_connection(
+                        endpoint,
+                        remote,
+                        endpoint_key,
+                        health_targets,
+                        health_connections,
+                    )
+                    .await;
+                });
+            }
 
             ctx.record_connection(remote_key.clone(), tui::describe_paths(&connection));
 

@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
 use cli::{InterfaceSpec, SecretArg, parse_interface_configs};
 use context::ClientCtx;
-use health::spawn_health_receiver;
+use health::spawn_health_receivers;
 use iroh::{EndpointId, RelayUrl};
 use parking_lot::RwLock;
 use path_strategy::{PathStrategy, StrategyMode, spawn_strategy_loop};
@@ -103,13 +103,13 @@ async fn main() -> Result<()> {
         ))
     });
     let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
-    let health = spawn_health_receiver(&cli.secret, &cli.relays, ctx.clone()).await?;
-    let health_endpoint_id = health.endpoint_id.clone();
-    ctx.set_health_endpoint(health_endpoint_id.clone());
+    let health_endpoint_ids = interface_configs
+        .iter()
+        .map(|config| config.endpoint_id.clone())
+        .collect::<Vec<_>>();
     let listen_udp = listen_socket
         .local_addr()
         .context("failed to read local UDP ingest socket address")?;
-    let _health = health;
     // Replies from the server are sent back to whichever local UDP peer most recently fed us data.
     let last_ingest_peer = Arc::new(RwLock::new(None::<SocketAddr>));
 
@@ -135,6 +135,9 @@ async fn main() -> Result<()> {
     if paths.len() > MAX_FRAGMENTS {
         bail!("at most {MAX_FRAGMENTS} interfaces are supported by the packed packet header");
     }
+    let health = spawn_health_receivers(&paths, ctx.clone());
+    let health_endpoint_summary = health_endpoint_ids.join(", ");
+    ctx.set_health_endpoint(health_endpoint_summary.clone());
     if cli.tc_backlog_poll_ms == 0 {
         bail!("--tc-backlog-poll-ms must be greater than zero");
     }
@@ -188,6 +191,7 @@ async fn main() -> Result<()> {
         .iter()
         .map(|path| path.interface_name.clone())
         .collect::<Vec<_>>();
+    let _health = health;
     let preview = (cli.remote && cli.remote_preview).then(|| {
         spawn_preview(
             cli.remote_preview_max_jpeg_bytes,
@@ -244,7 +248,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    ctx.client_ready(listen_udp, paths.len(), &health_endpoint_id);
+    ctx.client_ready(listen_udp, paths.len(), &health_endpoint_summary);
 
     let mut seq = 0_u64;
     let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];

@@ -33,7 +33,7 @@ pub struct HealthReport {
     pub endpoints: Vec<EndpointHealth>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct InterfaceBinding {
     pub name: String,
     pub bind_addr: SocketAddrV4,
@@ -43,7 +43,7 @@ pub struct PathConnection {
     pub interface_name: String,
     pub bound_addr: SocketAddrV4,
     pub connection: iroh::endpoint::Connection,
-    _endpoint: Endpoint,
+    endpoint: Endpoint,
 }
 
 impl PathConnection {
@@ -51,6 +51,10 @@ impl PathConnection {
         self.connection
             .send_datagram((*packet).clone())
             .map_err(|err| anyhow!("send_datagram failed on {}: {err}", self.interface_name))
+    }
+
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
     }
 }
 
@@ -70,7 +74,7 @@ pub async fn connect_path_with_secret(
 ) -> Result<PathConnection> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), HEALTH_ALPN.to_vec()])
         .relay_mode(relay_mode(relays))
         .clear_ip_transports();
 
@@ -93,7 +97,7 @@ pub async fn connect_path_with_secret(
         interface_name: binding.name,
         bound_addr: binding.bind_addr,
         connection,
-        _endpoint: endpoint,
+        endpoint,
     })
 }
 

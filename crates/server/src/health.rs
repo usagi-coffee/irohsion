@@ -1,19 +1,20 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
-use iroh::Endpoint;
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use parking_lot::RwLock;
 use transport::{EndpointHealth, HEALTH_ALPN, HealthReport, encode_health_report};
 
-pub type HealthConnection = Arc<RwLock<Option<iroh::endpoint::Connection>>>;
+pub type HealthConnections = Arc<RwLock<BTreeMap<String, iroh::endpoint::Connection>>>;
+pub type HealthTargets = Arc<RwLock<HashSet<String>>>;
 pub type HealthStats = Arc<RwLock<BTreeMap<String, u64>>>;
 
 pub async fn health_loop(
-    health_connection: HealthConnection,
+    health_connections: HealthConnections,
     health_stats: HealthStats,
     endpoint_targets: Arc<BTreeMap<String, f32>>,
     interval: Duration,
@@ -22,36 +23,61 @@ pub async fn health_loop(
     let mut seq = 0_u64;
     loop {
         ticker.tick().await;
-        let connection = health_connection.read().clone();
-        let Some(connection) = connection else {
+        let connections = health_connections.read().clone();
+        if connections.is_empty() {
             continue;
-        };
+        }
 
         let report = build_health_report(seq, &health_stats, &endpoint_targets, interval)?;
         seq = seq.wrapping_add(1);
-        if connection
-            .send_datagram(encode_health_report(&report))
-            .is_err()
-        {
-            *health_connection.write() = None;
+        let payload = encode_health_report(&report);
+        let mut failed = Vec::new();
+        for (endpoint_id, connection) in &connections {
+            if connection.send_datagram(payload.clone()).is_err() {
+                failed.push(endpoint_id.clone());
+            }
+        }
+        if !failed.is_empty() {
+            let mut live = health_connections.write();
+            for endpoint_id in failed {
+                live.remove(&endpoint_id);
+            }
         }
     }
 }
 
 pub async fn maintain_health_connection(
     endpoint: Endpoint,
-    health_addr: iroh::EndpointAddr,
-    health_connection: HealthConnection,
+    endpoint_id: EndpointId,
+    endpoint_key: String,
+    health_targets: HealthTargets,
+    health_connections: HealthConnections,
 ) -> Result<()> {
     loop {
-        if health_connection.read().is_some() {
+        if !health_targets.read().contains(&endpoint_key) {
+            return Ok(());
+        }
+
+        if health_connections.read().contains_key(&endpoint_key) {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
 
-        match endpoint.connect(health_addr.clone(), HEALTH_ALPN).await {
+        let Some(remote_info) = endpoint.remote_info(endpoint_id).await else {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        };
+
+        let health_addr = EndpointAddr::from_parts(
+            remote_info.id(),
+            remote_info.into_addrs().map(|addr| addr.into_addr()),
+        );
+
+        match endpoint.connect(health_addr, HEALTH_ALPN).await {
             Ok(connection) => {
-                *health_connection.write() = Some(connection);
+                health_connections
+                    .write()
+                    .insert(endpoint_key.clone(), connection);
             }
             Err(_) => {
                 tokio::time::sleep(Duration::from_secs(1)).await;

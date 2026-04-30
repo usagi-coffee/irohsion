@@ -18,6 +18,7 @@ cargo run -p server -- \
 ### Notes
 - `--flow-idle-reset-secs` resets the expected sequence after an idle period so a new sender burst can start cleanly.
 - `--max-reorder-delay-ms` is the live-stream gap tolerance. If a missing packet or fragment blocks newer complete packets longer than this, the server skips the missing sequence and forwards the buffered data behind it.
+- The server automatically opens one health connection per connected client interface endpoint, all from the same server endpoint, using the separate health ALPN on those existing per-interface client endpoints.
 
 ## Client
 

@@ -1,16 +1,31 @@
 use crate::tui;
-use std::net::SocketAddr;
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use transport::{HealthReport, transport_kind};
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ClientCtx {
     ui: Option<tui::ClientUiState>,
+    last_health_unix_ms: Arc<RwLock<Option<u64>>>,
+}
+
+impl Default for ClientCtx {
+    fn default() -> Self {
+        Self {
+            ui: None,
+            last_health_unix_ms: Arc::new(RwLock::new(None)),
+        }
+    }
 }
 
 impl ClientCtx {
     pub fn new(ui: Option<tui::ClientUiState>) -> Self {
-        Self { ui }
+        Self {
+            ui,
+            last_health_unix_ms: Arc::new(RwLock::new(None)),
+        }
     }
 
     pub fn ui_state(&self) -> Option<tui::ClientUiState> {
@@ -42,6 +57,25 @@ impl ClientCtx {
     }
 
     pub fn record_health_report(&self, report: &HealthReport) {
+        let mut last = self.last_health_unix_ms.write();
+        let previous = *last;
+        if previous.is_some_and(|current| report.unix_ms < current) {
+            if let Some(ui) = &self.ui {
+                ui.push_log_line(format!(
+                    "WARN dropped stale health report unix_ms={} last_unix_ms={}",
+                    report.unix_ms,
+                    previous.expect("previous health unix_ms exists")
+                ));
+            } else {
+                eprintln!(
+                    "WARN dropped stale health report unix_ms={} last_unix_ms={}",
+                    report.unix_ms,
+                    previous.expect("previous health unix_ms exists")
+                );
+            }
+            return;
+        }
+        *last = Some(report.unix_ms);
         if let Some(ui) = &self.ui {
             ui.record_health_received();
             ui.record_endpoint_health(&report.endpoints);
