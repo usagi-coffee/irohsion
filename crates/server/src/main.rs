@@ -20,7 +20,7 @@ use health::{
 };
 use iroh::{Endpoint, EndpointId, RelayUrl, endpoint::presets};
 use parking_lot::RwLock;
-use protocol::{DecodedPacket, MAX_SEQUENCE, PacketHeader, decode_packet};
+use protocol::{DecodedPacket, MAX_SEQUENCE, PacketHeader, decode_bundle, decode_packet};
 use runtime::wait_for_shutdown;
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::timeout};
 use transport::{ALPN, build_server_addr};
@@ -249,20 +249,22 @@ async fn main() -> Result<()> {
             loop {
                 match connection.read_datagram().await {
                     Ok(data) => {
-                        match parse_packet(&data, remote_key.clone()) {
-                            Ok(packet) => {
-                                ctx.record_connection_receive(
-                                    &remote_key,
-                                    data.len() as u64,
-                                    packet.header.sequence,
-                                );
-                                record_health_bytes(
-                                    &health_stats,
-                                    &remote_key,
-                                    packet.payload.len() as u64,
-                                );
-                                if tx.send(packet).await.is_err() {
-                                    break;
+                        match parse_packets(&data, remote_key.clone()) {
+                            Ok(packets) => {
+                                for packet in packets {
+                                    ctx.record_connection_receive(
+                                        &remote_key,
+                                        data.len() as u64,
+                                        packet.header.sequence,
+                                    );
+                                    record_health_bytes(
+                                        &health_stats,
+                                        &remote_key,
+                                        packet.payload.len() as u64,
+                                    );
+                                    if tx.send(packet).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
                             Err(_) => ctx.record_invalid(),
@@ -285,13 +287,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_packet(data: &[u8], remote: String) -> Result<ReceivedPacket> {
-    let DecodedPacket { header, payload } = decode_packet(data)?;
-    Ok(ReceivedPacket {
-        remote,
-        header,
-        payload: payload.to_vec(),
-    })
+fn parse_packets(data: &[u8], remote: String) -> Result<Vec<ReceivedPacket>> {
+    let frames = decode_bundle(data)?
+        .unwrap_or_else(|| vec![Bytes::copy_from_slice(data)]);
+    frames
+        .into_iter()
+        .map(|frame| {
+            let DecodedPacket { header, payload } = decode_packet(&frame)?;
+            Ok(ReceivedPacket {
+                remote: remote.clone(),
+                header,
+                payload: payload.to_vec(),
+            })
+        })
+        .collect()
 }
 
 async fn reorder_loop(
@@ -349,7 +358,7 @@ async fn reorder_loop(
             }
         };
 
-        ctx.record_received(packet.payload.len() as u64);
+                ctx.record_received(packet.payload.len() as u64);
 
         if initialized {
             set_reply_routes(&reply_routes, &packet.remote, false);
@@ -401,9 +410,9 @@ async fn reorder_loop(
         };
 
         if packet.header.sequence == next_seq {
-            forward_payload(&out_socket, out_udp, &payload, packet.header).await?;
+            let forwarded_bytes = forward_payload(&out_socket, out_udp, &payload, packet.header).await?;
             ctx.record_forwarded(
-                payload.len() as u64,
+                forwarded_bytes,
                 buffered.len() as u64,
                 next_sequence(next_seq),
             );
@@ -505,7 +514,7 @@ async fn drain_ready(
     ctx: &ServerCtx,
 ) -> Result<()> {
     while let Some(packet) = buffered.remove(next_seq) {
-        forward_payload(
+        let forwarded_bytes = forward_payload(
             out_socket,
             out_udp,
             &packet.payload,
@@ -517,7 +526,7 @@ async fn drain_ready(
         )
         .await?;
         ctx.record_forwarded(
-            packet.payload.len() as u64,
+            forwarded_bytes,
             buffered.len() as u64,
             next_sequence(*next_seq),
         );
@@ -541,12 +550,12 @@ async fn forward_payload(
     out_udp: SocketAddr,
     payload: &[u8],
     header: PacketHeader,
-) -> Result<()> {
+) -> Result<u64> {
     socket
         .send_to(payload, out_udp)
         .await
         .with_context(|| format!("failed forwarding seq {} to {}", header.sequence, out_udp))?;
-    Ok(())
+    Ok(payload.len() as u64)
 }
 
 async fn response_loop(
