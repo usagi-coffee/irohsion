@@ -249,9 +249,13 @@ async fn main() -> Result<()> {
             loop {
                 match connection.read_datagram().await {
                     Ok(data) => {
-                        ctx.record_connection_receive(&remote_key, data.len() as u64);
                         match parse_packet(&data, remote_key.clone()) {
                             Ok(packet) => {
+                                ctx.record_connection_receive(
+                                    &remote_key,
+                                    data.len() as u64,
+                                    packet.header.sequence,
+                                );
                                 record_health_bytes(
                                     &health_stats,
                                     &remote_key,

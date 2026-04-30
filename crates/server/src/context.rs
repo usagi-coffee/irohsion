@@ -61,9 +61,9 @@ impl ServerCtx {
         }
     }
 
-    pub fn record_connection_receive(&self, remote: &str, bytes: u64) {
+    pub fn record_connection_receive(&self, remote: &str, bytes: u64, sequence: u64) {
         if let Some(ui) = &self.ui {
-            ui.record_connection_receive(remote, bytes);
+            ui.record_connection_receive(remote, bytes, sequence);
         }
     }
 

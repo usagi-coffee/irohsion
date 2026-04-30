@@ -25,6 +25,8 @@ use ratatui::{
 };
 use transport::transport_kind;
 
+const CONNECTION_MBPS_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Clone)]
 pub struct ServerUiState {
     started_at: Instant,
@@ -58,6 +60,8 @@ pub struct PathRow {
 pub struct ConnectionView {
     pub received_packets: u64,
     pub received_bytes: u64,
+    pub max_seq: Option<u64>,
+    pub last_seq: Option<u64>,
     pub last_error: Option<String>,
     pub paths: Vec<PathRow>,
     pub last_activity: u64,
@@ -162,7 +166,7 @@ impl ServerUiState {
         });
     }
 
-    pub fn record_connection_receive(&self, remote: &str, bytes: u64) {
+    pub fn record_connection_receive(&self, remote: &str, bytes: u64, sequence: u64) {
         let mut connections = self.connections.write();
         let activity = self
             .connection_activity_counter
@@ -171,6 +175,8 @@ impl ServerUiState {
         let entry = connections.entry(remote.to_string()).or_default();
         entry.received_packets += 1;
         entry.received_bytes += bytes;
+        entry.last_seq = Some(sequence);
+        entry.max_seq = Some(entry.max_seq.map_or(sequence, |current| current.max(sequence)));
         entry.last_activity = activity;
     }
 
@@ -280,6 +286,8 @@ struct Snapshot {
     last_received_bytes: u64,
     last_forwarded_bytes: u64,
     connection_last_bytes: BTreeMap<String, u64>,
+    last_connection_rate_at: Option<Instant>,
+    connection_mbps: BTreeMap<String, f64>,
     connection_scroll: usize,
 }
 
@@ -311,6 +319,38 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
     snapshot.last_at = Some(now);
     snapshot.last_received_bytes = recv_bytes;
     snapshot.last_forwarded_bytes = fwd_bytes;
+
+    if snapshot
+        .last_connection_rate_at
+        .map(|last| now.duration_since(last) >= CONNECTION_MBPS_INTERVAL)
+        .unwrap_or(true)
+    {
+        let rate_delta = snapshot
+            .last_connection_rate_at
+            .map(|last| now.duration_since(last).as_secs_f64().max(0.001))
+            .unwrap_or(CONNECTION_MBPS_INTERVAL.as_secs_f64());
+        let connections = state.connections.read();
+        let mut connection_mbps = BTreeMap::new();
+        for (remote, connection) in connections.iter() {
+            let previous = snapshot
+                .connection_last_bytes
+                .get(remote)
+                .copied()
+                .unwrap_or(0);
+            connection_mbps.insert(
+                remote.clone(),
+                (connection.received_bytes.saturating_sub(previous)) as f64 * 8.0
+                    / rate_delta
+                    / 1_000_000.0,
+            );
+        }
+        snapshot.last_connection_rate_at = Some(now);
+        snapshot.connection_last_bytes = connections
+            .iter()
+            .map(|(remote, connection)| (remote.clone(), connection.received_bytes))
+            .collect();
+        snapshot.connection_mbps = connection_mbps;
+    }
 
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -389,18 +429,21 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
     let all_rows = ordered
         .iter()
         .flat_map(|(remote, connection)| {
-            let previous_bytes = snapshot
-                .connection_last_bytes
-                .get(remote)
-                .copied()
-                .unwrap_or(0);
-            let conn_mbps = (connection.received_bytes.saturating_sub(previous_bytes)) as f64 * 8.0
-                / delta
-                / 1_000_000.0;
+            let conn_mbps = snapshot.connection_mbps.get(remote).copied().unwrap_or(0.0);
             connection.paths.iter().map(move |row| {
                 Row::new(vec![
                     Cell::from(remote.clone()),
                     Cell::from(connection.received_packets.to_string()),
+                    Cell::from(
+                        connection
+                            .max_seq
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                    Cell::from(
+                        connection
+                            .last_seq
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
                     Cell::from(format!(
                         "{:.2} MB",
                         connection.received_bytes as f64 / 1_000_000.0
@@ -428,6 +471,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         [
             Constraint::Length(18),
             Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(10),
@@ -440,6 +485,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         Row::new(vec![
             "Remote",
             "Recv Pkts",
+            "Max",
+            "Last",
             "Recv MB",
             "Mbps",
             "Transport",
@@ -462,11 +509,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
             .min(max_scroll.saturating_add(visible_rows))
     )));
     frame.render_widget(table, layout[2]);
-
-    snapshot.connection_last_bytes = ordered
-        .iter()
-        .map(|(remote, connection)| (remote.clone(), connection.received_bytes))
-        .collect();
 }
 
 fn fmt_uptime(elapsed: Duration) -> String {

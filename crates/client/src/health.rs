@@ -1,9 +1,9 @@
 use crate::context::ClientCtx;
 use anyhow::{Context, Result};
 use cli::SecretArg;
-use iroh::{Endpoint, RelayMode, endpoint::presets};
+use iroh::{Endpoint, RelayUrl, endpoint::presets};
 use tokio::task::JoinHandle;
-use transport::{HEALTH_ALPN, decode_health_report};
+use transport::{HEALTH_ALPN, decode_health_report, relay_mode};
 
 pub struct HealthReceiver {
     pub endpoint_id: String,
@@ -11,12 +11,16 @@ pub struct HealthReceiver {
     _task: JoinHandle<()>,
 }
 
-pub async fn spawn_health_receiver(secret: &SecretArg, ctx: ClientCtx) -> Result<HealthReceiver> {
+pub async fn spawn_health_receiver(
+    secret: &SecretArg,
+    relays: &[RelayUrl],
+    ctx: ClientCtx,
+) -> Result<HealthReceiver> {
     let secret_key = secret.resolve();
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![HEALTH_ALPN.to_vec()])
-        .relay_mode(RelayMode::Default)
+        .relay_mode(relay_mode(relays))
         .bind()
         .await
         .context("failed to bind client health endpoint")?;

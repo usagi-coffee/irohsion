@@ -57,19 +57,21 @@ impl PathConnection {
 pub async fn connect_path(
     binding: InterfaceBinding,
     server_addr: EndpointAddr,
+    relays: &[RelayUrl],
 ) -> Result<PathConnection> {
-    connect_path_with_secret(binding, server_addr, SecretKey::generate()).await
+    connect_path_with_secret(binding, server_addr, SecretKey::generate(), relays).await
 }
 
 pub async fn connect_path_with_secret(
     binding: InterfaceBinding,
     server_addr: EndpointAddr,
     secret_key: SecretKey,
+    relays: &[RelayUrl],
 ) -> Result<PathConnection> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
-        .relay_mode(RelayMode::Default)
+        .relay_mode(relay_mode(relays))
         .clear_ip_transports();
 
     builder = builder.relay_bind_device(binding.name.clone());
@@ -113,6 +115,14 @@ pub fn build_server_addr(
         .chain(effective_relays.into_iter().map(TransportAddr::Relay));
 
     Ok(EndpointAddr::from_parts(endpoint, transports))
+}
+
+pub fn relay_mode(relays: &[RelayUrl]) -> RelayMode {
+    if relays.is_empty() {
+        RelayMode::Default
+    } else {
+        RelayMode::custom(relays.to_vec())
+    }
 }
 
 pub fn resolve_interface_ipv4(name: &str) -> Result<InterfaceBinding> {

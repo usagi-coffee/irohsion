@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
         ))
     });
     let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
-    let health = spawn_health_receiver(&cli.secret, ctx.clone()).await?;
+    let health = spawn_health_receiver(&cli.secret, &cli.relays, ctx.clone()).await?;
     let health_endpoint_id = health.endpoint_id.clone();
     ctx.set_health_endpoint(health_endpoint_id.clone());
     let listen_udp = listen_socket
@@ -113,7 +113,9 @@ async fn main() -> Result<()> {
             endpoint_id,
             secret_key,
         } = config;
-        let path = connect_path_with_secret(binding, server_addr.clone(), secret_key).await?;
+        let path =
+            connect_path_with_secret(binding, server_addr.clone(), secret_key, &cli.relays)
+                .await?;
         ctx.record_connection_paths(path.interface_name.clone(), &endpoint_id, &path.connection);
         ctx.connected_path(
             &path.interface_name,
