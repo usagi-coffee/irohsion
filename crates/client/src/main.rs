@@ -21,7 +21,7 @@ use iroh::{EndpointId, RelayUrl};
 use parking_lot::RwLock;
 use path_strategy::{PathStrategy, spawn_strategy_loop};
 use preview::spawn_preview;
-use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_bundle, encode_packet};
+use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_packet};
 use remote::{RemoteConfig, spawn_remote_server};
 use runtime::wait_for_shutdown;
 use tokio::net::UdpSocket;
@@ -45,10 +45,6 @@ struct Cli {
     interfaces: Vec<InterfaceSpec>,
     #[arg(long)]
     tui: bool,
-    #[arg(long)]
-    mtu: Option<usize>,
-    #[arg(long)]
-    bundle_threshold: Option<usize>,
     #[arg(long)]
     split_threshold_bytes: Option<usize>,
     #[arg(long, default_value_t = 500)]
@@ -134,15 +130,6 @@ async fn main() -> Result<()> {
     if cli.tc_backlog_poll_ms == 0 {
         bail!("--tc-backlog-poll-ms must be greater than zero");
     }
-    if matches!(cli.mtu, Some(0)) {
-        bail!("--mtu must be greater than zero");
-    }
-    if matches!(cli.bundle_threshold, Some(0)) {
-        bail!("--bundle-threshold must be greater than zero");
-    }
-    if cli.bundle_threshold.is_some() && cli.mtu.is_none() {
-        bail!("--bundle-threshold requires --mtu");
-    }
     if cli.tc_backlog_recover_bytes > cli.tc_backlog_degrade_bytes {
         bail!("--tc-backlog-recover-bytes must be <= --tc-backlog-degrade-bytes");
     }
@@ -220,10 +207,6 @@ async fn main() -> Result<()> {
 
     let mut seq = 0_u64;
     let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];
-    let mut split_bundles = paths
-        .iter()
-        .map(|path| PendingBundle::new(path.interface_name.clone()))
-        .collect::<Vec<_>>();
     loop {
         let shutdown = wait_for_shutdown(ctx.ui_state());
         let (len, src) = tokio::select! {
@@ -232,7 +215,6 @@ async fn main() -> Result<()> {
                 res.context("failed reading from local UDP ingest socket")?
             }
             _ = shutdown => {
-                flush_all_split_bundles(&paths, &strategy, &ctx, &mut split_bundles);
                 break;
             }
         };
@@ -247,203 +229,80 @@ async fn main() -> Result<()> {
 
         ctx.ingested_packet(seq, len, src);
 
-        send_ingest_payload(
-            &paths,
-            &path_names,
-            &strategy,
-            &ctx,
-            seq,
-            &buf[..len],
-            cli.mtu,
-            cli.bundle_threshold,
+        if should_split(
+            len,
             cli.split_threshold_bytes,
-            &mut split_bundles,
-        )?;
+            paths.len(),
+            strategy.current(),
+        ) {
+            let fragments = u8::try_from(paths.len()).expect("path count fits in u8");
+            let split_ranges = weighted_split_ranges(len, &strategy.split_weights(&path_names));
+            for (fragment, path) in paths.iter().enumerate() {
+                let (start, end) = split_ranges[fragment];
+                let packet = Arc::new(encode_packet(
+                    PacketHeader {
+                        sequence: seq,
+                        fragment: u8::try_from(fragment).expect("fragment fits in u8"),
+                        fragments,
+                    },
+                    &buf[start..end],
+                ));
+                let packet_len = packet.len() as u64;
+                match path.send(packet) {
+                    Ok(()) => {
+                        strategy.record_interface_send(&path.interface_name, packet_len);
+                        ctx.record_send(path.interface_name.clone(), (end - start) as u64);
+                    }
+                    Err(err) => {
+                        ctx.record_send_error(path.interface_name.clone(), err.to_string());
+                        ctx.send_failure(&path.interface_name, seq, &err.to_string());
+                        strategy.degrade_to_redundant(
+                            &ctx,
+                            format!(
+                                "send error interface={} sequence={} error={err}",
+                                path.interface_name, seq
+                            ),
+                        );
+                    }
+                }
+            }
+        } else {
+            let packet = Arc::new(encode_packet(
+                PacketHeader {
+                    sequence: seq,
+                    fragment: 0,
+                    fragments: 1,
+                },
+                &buf[..len],
+            ));
+            let packet_len = packet.len() as u64;
+
+            // Duplicate each ingested packet over every active interface-bound iroh path.
+            for path in &paths {
+                match path.send(packet.clone()) {
+                    Ok(()) => {
+                        strategy.record_interface_send(&path.interface_name, packet_len);
+                        ctx.record_send(path.interface_name.clone(), len as u64);
+                    }
+                    Err(err) => {
+                        ctx.record_send_error(path.interface_name.clone(), err.to_string());
+                        ctx.send_failure(&path.interface_name, seq, &err.to_string());
+                        strategy.degrade_to_redundant(
+                            &ctx,
+                            format!(
+                                "send error interface={} sequence={} error={err}",
+                                path.interface_name, seq
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
         seq = next_sequence(seq);
     }
 
     Ok(())
-}
-
-fn send_ingest_payload(
-    paths: &[transport::PathConnection],
-    path_names: &[String],
-    strategy: &path_strategy::StrategyState,
-    ctx: &ClientCtx,
-    seq: u64,
-    payload: &[u8],
-    mtu: Option<usize>,
-    bundle_threshold: Option<usize>,
-    split_threshold_bytes: Option<usize>,
-    split_bundles: &mut [PendingBundle],
-) -> Result<()> {
-    if should_split(
-        payload.len(),
-        split_threshold_bytes,
-        paths.len(),
-        strategy.current(),
-    ) {
-        let fragments = u8::try_from(paths.len()).expect("path count fits in u8");
-        let split_ranges = weighted_split_ranges(payload.len(), &strategy.split_weights(path_names));
-        for (fragment, path) in paths.iter().enumerate() {
-            let (start, end) = split_ranges[fragment];
-            let packet = encode_packet(
-                PacketHeader {
-                    sequence: seq,
-                    fragment: u8::try_from(fragment).expect("fragment fits in u8"),
-                    fragments,
-                },
-                &payload[start..end],
-            );
-            let bundle = &mut split_bundles[fragment];
-            let can_bundle = mtu
-                .zip(bundle_threshold)
-                .is_some_and(|(mtu, threshold)| packet.len() <= threshold && bundle.can_fit(packet.len(), mtu));
-
-            if can_bundle {
-                bundle.push(packet.to_vec(), (end - start) as u64, seq);
-                continue;
-            }
-
-            if !bundle.is_empty() {
-                flush_split_bundle(path, strategy, ctx, bundle)?;
-            }
-
-            send_packet(
-                path,
-                strategy,
-                ctx,
-                seq,
-                Arc::new(packet),
-                (end - start) as u64,
-            );
-        }
-    } else {
-        flush_all_split_bundles(paths, strategy, ctx, split_bundles);
-        let packet = Arc::new(encode_packet(
-            PacketHeader {
-                sequence: seq,
-                fragment: 0,
-                fragments: 1,
-            },
-            payload,
-        ));
-
-        for path in paths {
-            send_packet(
-                path,
-                strategy,
-                ctx,
-                seq,
-                packet.clone(),
-                payload.len() as u64,
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn send_packet(
-    path: &transport::PathConnection,
-    strategy: &path_strategy::StrategyState,
-    ctx: &ClientCtx,
-    seq: u64,
-    packet: Arc<bytes::Bytes>,
-    payload_bytes: u64,
-) {
-    let packet_len = packet.len() as u64;
-    match path.send(packet) {
-        Ok(()) => {
-            strategy.record_interface_send(&path.interface_name, packet_len);
-            ctx.record_send(path.interface_name.clone(), payload_bytes);
-        }
-        Err(err) => {
-            ctx.record_send_error(path.interface_name.clone(), err.to_string());
-            ctx.send_failure(&path.interface_name, seq, &err.to_string());
-            strategy.degrade_to_redundant(
-                ctx,
-                format!(
-                    "send error interface={} sequence={} error={err}",
-                    path.interface_name, seq
-                ),
-            );
-        }
-    }
-}
-
-fn flush_all_split_bundles(
-    paths: &[transport::PathConnection],
-    strategy: &path_strategy::StrategyState,
-    ctx: &ClientCtx,
-    split_bundles: &mut [PendingBundle],
-) {
-    for (path, bundle) in paths.iter().zip(split_bundles.iter_mut()) {
-        if !bundle.is_empty() {
-            let _ = flush_split_bundle(path, strategy, ctx, bundle);
-        }
-    }
-}
-
-fn flush_split_bundle(
-    path: &transport::PathConnection,
-    strategy: &path_strategy::StrategyState,
-    ctx: &ClientCtx,
-    bundle: &mut PendingBundle,
-) -> Result<()> {
-    let payload = encode_bundle(bundle.frames.iter().map(Vec::as_slice))?;
-    let payload_bytes = bundle.payload_bytes;
-    let seq = bundle.first_seq.unwrap_or(0);
-    bundle.clear();
-    send_packet(path, strategy, ctx, seq, Arc::new(payload), payload_bytes);
-    Ok(())
-}
-
-struct PendingBundle {
-    frames: Vec<Vec<u8>>,
-    bytes: usize,
-    payload_bytes: u64,
-    first_seq: Option<u64>,
-}
-
-impl PendingBundle {
-    fn new(_interface_name: String) -> Self {
-        Self {
-            frames: Vec::new(),
-            bytes: 0,
-            payload_bytes: 0,
-            first_seq: None,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.frames.is_empty()
-    }
-
-    fn can_fit(&self, next_len: usize, mtu: usize) -> bool {
-        if self.frames.len() >= u8::MAX as usize {
-            return false;
-        }
-        let frame_count = self.frames.len() + 1;
-        let table_len = 5 + (frame_count * 2);
-        table_len + self.bytes + next_len <= mtu
-    }
-
-    fn push(&mut self, frame: Vec<u8>, payload_bytes: u64, seq: u64) {
-        if self.first_seq.is_none() {
-            self.first_seq = Some(seq);
-        }
-        self.bytes += frame.len();
-        self.payload_bytes += payload_bytes;
-        self.frames.push(frame);
-    }
-
-    fn clear(&mut self) {
-        self.frames.clear();
-        self.bytes = 0;
-        self.payload_bytes = 0;
-        self.first_seq = None;
-    }
 }
 
 fn should_split(
