@@ -1,50 +1,66 @@
-import { build, files, prerendered, version } from '$service-worker';
+import { build, files, prerendered, version } from "$service-worker";
 
 const CACHE_NAME = `irohsion-remote-${version}`;
-const APP_SHELL = [...new Set([...build, ...files, ...prerendered, '/', '/index.html'])];
+const APP_SHELL = [
+  ...new Set([...build, ...files, ...prerendered, "/", "/index.html"]),
+];
 
-self.addEventListener('install', (event) => {
-	event.waitUntil(
-		caches
-			.open(CACHE_NAME)
-			.then((cache) => cache.addAll(APP_SHELL))
-			.then(() => self.skipWaiting())
-	);
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches
+      .open(CACHE_NAME)
+      .then((cache) => cache.addAll(APP_SHELL))
+      .then(() => self.skipWaiting()),
+  );
 });
 
-self.addEventListener('activate', (event) => {
-	event.waitUntil(
-		caches
-			.keys()
-			.then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
-			.then(() => self.clients.claim())
-	);
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key !== CACHE_NAME)
+            .map((key) => caches.delete(key)),
+        ),
+      )
+      .then(() => self.clients.claim()),
+  );
 });
 
-self.addEventListener('fetch', (event) => {
-	if (event.request.method !== 'GET') return;
+self.addEventListener("fetch", (event) => {
+  if (event.request.method !== "GET") return;
 
-	if (event.request.mode === 'navigate') {
-		event.respondWith(
-			fetch(event.request)
-				.then((response) => {
-					const copy = response.clone();
-					caches.open(CACHE_NAME).then((cache) => cache.put('/', copy));
-					return response;
-				})
-				.catch(() => caches.match('/') || caches.match('/index.html'))
-		);
-		return;
-	}
+  event.respondWith(
+    (async () => {
+      const url = new URL(event.request.url);
+      const cache = await caches.open(CACHE_NAME);
 
-	event.respondWith(
-		caches.match(event.request).then((cached) => {
-			if (cached) return cached;
-			return fetch(event.request).then((response) => {
-				const copy = response.clone();
-				caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
-				return response;
-			});
-		})
-	);
+      if (APP_SHELL.includes(url.pathname)) {
+        const cached = await cache.match(url.pathname);
+        if (cached) return cached;
+      }
+
+      try {
+        const response = await fetch(event.request);
+        if (!(response instanceof Response)) {
+          throw new Error("invalid response from fetch");
+        }
+
+        return response;
+      } catch (error) {
+        const cached = await cache.match(event.request);
+        if (cached) {
+          return cached;
+        }
+
+        if (event.request.mode === "navigate") {
+          return (await cache.match("/")) || cache.match("/index.html");
+        }
+
+        throw error;
+      }
+    })(),
+  );
 });
