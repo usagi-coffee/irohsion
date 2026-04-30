@@ -41,8 +41,10 @@ cargo run -p client -- \
 
 ### Notes
 - If `--port` is omitted, the client binds a random local UDP port. Each interface may optionally carry its own inline secret as `iface:<secret_hex>`.
-- When `--split-threshold-bytes` is set, UDP packets larger than the threshold are split across interfaces; packets at or below the threshold are duplicated across all interfaces.
-- When `--mtu` is set, UDP packets larger than that size are always split across interfaces before send, even if the current strategy would otherwise be redundant.
+- In `split` mode, packets are always fragmented across interfaces when more than one path is active.
+- In `redundant` mode, packets are always duplicated across all active interfaces.
+- In `roundrobin` mode, each whole packet is sent on one active interface at a time in rotation.
+- In `auto` mode, `--split-threshold-bytes` and `--mtu` decide when packets split; otherwise packets are duplicated.
 - When `--burst-max-delay-ms` is greater than zero, the client batches outgoing UDP packets for up to that many milliseconds before flushing them. `--burst-max-bytes` optionally forces an earlier flush once the queued burst reaches that many bytes.
 - The `tc` backlog options control a Linux qdisc heuristic for split mode: if any interface backlog reaches `--tc-backlog-degrade-bytes`, the client falls back to redundant full-packet sends for future packets; it returns to split mode when the worst observed backlog is at or below `--tc-backlog-recover-bytes`.
 - Send errors also force future packets into redundant mode.
@@ -68,7 +70,7 @@ Write a JSON patch to the control characteristic:
 {"mode":"split","monitor_packets":true,"targets_mbps":{"eth0":4.0,"wwan0":2.5}}
 ```
 
-Modes are `auto`, `split`, `redundant`, and `roundrobin`. `roundrobin` sends each whole packet on one path at a time in rotation, while packets above `--mtu` still split when needed. `targets_mbps` are currently stored and reported for future dynamic split weighting.
+Modes are `auto`, `split`, `redundant`, and `roundrobin`. In manual modes, the selected mode directly controls send behavior. `targets_mbps` are currently stored and reported for future dynamic split weighting.
 
 ## Bench
 

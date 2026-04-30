@@ -19,7 +19,7 @@ use context::ClientCtx;
 use health::spawn_health_receiver;
 use iroh::{EndpointId, RelayUrl};
 use parking_lot::RwLock;
-use path_strategy::{PathStrategy, spawn_strategy_loop};
+use path_strategy::{PathStrategy, StrategyMode, spawn_strategy_loop};
 use preview::spawn_preview;
 use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_packet};
 use remote::{RemoteConfig, spawn_remote_server};
@@ -329,12 +329,15 @@ fn send_packet(
     strategy: &path_strategy::StrategyState,
     ctx: &ClientCtx,
 ) {
+    let mode = strategy.mode();
+    let effective = strategy.current();
     if should_split(
         payload.len(),
         cli.split_threshold_bytes,
         cli.mtu,
         paths.len(),
-        strategy.current(),
+        mode,
+        effective,
     ) {
         let fragments = u8::try_from(paths.len()).expect("path count fits in u8");
         let split_ranges = weighted_split_ranges(payload.len(), &strategy.split_weights(path_names));
@@ -379,7 +382,7 @@ fn send_packet(
         payload,
     ));
     let packet_len = packet.len() as u64;
-    if matches!(strategy.current(), PathStrategy::RoundRobin) {
+    if matches!(effective, PathStrategy::RoundRobin) {
         let index = strategy.next_round_robin_index(paths.len());
         let path = &paths[index];
         match path.send(packet) {
@@ -439,13 +442,20 @@ fn should_split(
     threshold: Option<usize>,
     mtu: Option<usize>,
     path_count: usize,
+    mode: StrategyMode,
     strategy: PathStrategy,
 ) -> bool {
     if path_count <= 1 {
         return false;
     }
 
-    if matches!(mtu, Some(mtu) if packet_len > mtu) {
+    match mode {
+        StrategyMode::Split => return true,
+        StrategyMode::Redundant | StrategyMode::RoundRobin => return false,
+        StrategyMode::Auto => {}
+    }
+
+    if matches!(mtu, Some(mtu) if packet_len >= mtu) {
         return true;
     }
 
@@ -481,7 +491,7 @@ fn weighted_split_ranges(packet_len: usize, weights: &[f64]) -> Vec<(usize, usiz
 #[cfg(test)]
 mod tests {
     use super::{burst_delay, should_split, weighted_split_ranges};
-    use crate::path_strategy::PathStrategy;
+    use crate::path_strategy::{PathStrategy, StrategyMode};
     use std::time::Duration;
 
     #[test]
@@ -500,19 +510,54 @@ mod tests {
 
     #[test]
     fn packets_above_threshold_split_when_strategy_is_split() {
-        assert!(should_split(1200, Some(1000), None, 2, PathStrategy::Split));
+        assert!(should_split(
+            1200,
+            Some(1000),
+            None,
+            2,
+            StrategyMode::Auto,
+            PathStrategy::Split,
+        ));
     }
 
     #[test]
     fn packets_at_or_below_threshold_stay_redundant() {
-        assert!(!should_split(1000, Some(1000), None, 2, PathStrategy::Split));
-        assert!(!should_split(999, Some(1000), None, 2, PathStrategy::Split));
+        assert!(!should_split(
+            1000,
+            Some(1000),
+            None,
+            2,
+            StrategyMode::Auto,
+            PathStrategy::Split,
+        ));
+        assert!(!should_split(
+            999,
+            Some(1000),
+            None,
+            2,
+            StrategyMode::Auto,
+            PathStrategy::Split,
+        ));
     }
 
     #[test]
     fn packets_do_not_split_without_multiple_paths() {
-        assert!(!should_split(1200, Some(1000), None, 1, PathStrategy::Split));
-        assert!(!should_split(1200, None, Some(1000), 1, PathStrategy::Split));
+        assert!(!should_split(
+            1200,
+            Some(1000),
+            None,
+            1,
+            StrategyMode::Split,
+            PathStrategy::Split,
+        ));
+        assert!(!should_split(
+            1200,
+            None,
+            Some(1000),
+            1,
+            StrategyMode::Auto,
+            PathStrategy::Split,
+        ));
     }
 
     #[test]
@@ -522,7 +567,56 @@ mod tests {
             Some(10_000),
             Some(1200),
             2,
+            StrategyMode::Auto,
             PathStrategy::Redundant,
+        ));
+    }
+
+    #[test]
+    fn packets_at_mtu_split_even_when_strategy_is_redundant() {
+        assert!(should_split(
+            1128,
+            Some(10_000),
+            Some(1128),
+            2,
+            StrategyMode::Auto,
+            PathStrategy::Redundant,
+        ));
+    }
+
+    #[test]
+    fn explicit_split_mode_always_splits_with_multiple_paths() {
+        assert!(should_split(
+            1128,
+            None,
+            Some(9_999),
+            2,
+            StrategyMode::Split,
+            PathStrategy::Split,
+        ));
+    }
+
+    #[test]
+    fn explicit_redundant_mode_ignores_mtu_and_threshold() {
+        assert!(!should_split(
+            1128,
+            Some(100),
+            Some(1128),
+            2,
+            StrategyMode::Redundant,
+            PathStrategy::Redundant,
+        ));
+    }
+
+    #[test]
+    fn explicit_round_robin_mode_ignores_mtu_and_threshold() {
+        assert!(!should_split(
+            1128,
+            Some(100),
+            Some(1128),
+            2,
+            StrategyMode::RoundRobin,
+            PathStrategy::RoundRobin,
         ));
     }
 
