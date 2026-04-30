@@ -152,6 +152,12 @@ impl ClientCtx {
         }
     }
 
+    pub fn record_strategy_state(&self, mode: &str, effective: &str) {
+        if let Some(ui) = &self.ui {
+            ui.record_strategy_state(mode.to_string(), effective.to_string());
+        }
+    }
+
     pub fn record_split_percentages(&self, percentages: &BTreeMap<String, f64>) {
         if let Some(ui) = &self.ui {
             ui.record_split_percentages(percentages);

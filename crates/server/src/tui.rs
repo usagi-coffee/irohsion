@@ -43,6 +43,7 @@ pub struct ServerUiState {
     skipped_packets: Arc<AtomicU64>,
     invalid_packets: Arc<AtomicU64>,
     buffered_packets: Arc<AtomicU64>,
+    last_forwarded_seq: Arc<AtomicU64>,
     next_seq: Arc<AtomicU64>,
     connection_activity_counter: Arc<AtomicU64>,
     connections: Arc<RwLock<BTreeMap<String, ConnectionView>>>,
@@ -115,6 +116,7 @@ impl ServerUiState {
             skipped_packets: Arc::new(AtomicU64::new(0)),
             invalid_packets: Arc::new(AtomicU64::new(0)),
             buffered_packets: Arc::new(AtomicU64::new(0)),
+            last_forwarded_seq: Arc::new(AtomicU64::new(0)),
             next_seq: Arc::new(AtomicU64::new(0)),
             connection_activity_counter: Arc::new(AtomicU64::new(0)),
             connections: Arc::new(RwLock::new(BTreeMap::new())),
@@ -185,10 +187,12 @@ impl ServerUiState {
         self.received_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn record_forwarded(&self, bytes: u64, buffered: u64, next_seq: u64) {
+    pub fn record_forwarded(&self, bytes: u64, buffered: u64, forwarded_seq: u64, next_seq: u64) {
         self.forwarded_packets.fetch_add(1, Ordering::Relaxed);
         self.forwarded_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.buffered_packets.store(buffered, Ordering::Relaxed);
+        self.last_forwarded_seq
+            .store(forwarded_seq, Ordering::Relaxed);
         self.next_seq.store(next_seq, Ordering::Relaxed);
     }
 
@@ -406,7 +410,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
             state.buffered_packets.load(Ordering::Relaxed)
         )),
         Line::from(format!(
-            "next_seq {:>10}   avg fwd {:>6.2} Mbps",
+            "last_fwd {:>10}   next_seq {:>10}   avg fwd {:>6.2} Mbps",
+            state.last_forwarded_seq.load(Ordering::Relaxed),
             state.next_seq.load(Ordering::Relaxed),
             fwd_bytes as f64 * 8.0 / elapsed / 1_000_000.0
         )),

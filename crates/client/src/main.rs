@@ -24,7 +24,7 @@ use preview::spawn_preview;
 use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_packet};
 use remote::{RemoteConfig, spawn_remote_server};
 use runtime::wait_for_shutdown;
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, sync::mpsc};
 use transport::{build_server_addr, connect_path_with_secret};
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
@@ -47,6 +47,12 @@ struct Cli {
     tui: bool,
     #[arg(long)]
     split_threshold_bytes: Option<usize>,
+    #[arg(long)]
+    mtu: Option<usize>,
+    #[arg(long, default_value_t = 0)]
+    burst_max_delay_ms: u64,
+    #[arg(long)]
+    burst_max_bytes: Option<usize>,
     #[arg(long, default_value_t = 500)]
     tc_backlog_poll_ms: u64,
     #[arg(long, default_value_t = 65_536)]
@@ -80,6 +86,7 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("failed to bind local UDP ingest socket on {listen_udp}"))?,
     );
+    let (ui_command_tx, mut ui_command_rx) = mpsc::unbounded_channel();
     let ui = cli.tui.then(|| {
         tui::ClientUi::spawn(tui::ClientUiState::new(
             listen_socket
@@ -92,6 +99,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .map(|config| config.binding.name.clone())
                 .collect(),
+            Some(ui_command_tx),
         ))
     });
     let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
@@ -130,6 +138,9 @@ async fn main() -> Result<()> {
     if cli.tc_backlog_poll_ms == 0 {
         bail!("--tc-backlog-poll-ms must be greater than zero");
     }
+    if cli.burst_max_bytes == Some(0) {
+        bail!("--burst-max-bytes must be greater than zero when set");
+    }
     if cli.tc_backlog_recover_bytes > cli.tc_backlog_degrade_bytes {
         bail!("--tc-backlog-recover-bytes must be <= --tc-backlog-degrade-bytes");
     }
@@ -143,6 +154,36 @@ async fn main() -> Result<()> {
         cli.tc_backlog_recover_bytes,
         ctx.clone(),
     );
+    {
+        let strategy = strategy.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            while let Some(command) = ui_command_rx.recv().await {
+                match command {
+                    tui::UiCommand::SetAuto => {
+                        strategy.set_mode(path_strategy::StrategyMode::Auto, &ctx, "tui hotkey");
+                    }
+                    tui::UiCommand::SetRedundant => {
+                        strategy.set_mode(
+                            path_strategy::StrategyMode::Redundant,
+                            &ctx,
+                            "tui hotkey",
+                        );
+                    }
+                    tui::UiCommand::SetSplit => {
+                        strategy.set_mode(path_strategy::StrategyMode::Split, &ctx, "tui hotkey");
+                    }
+                    tui::UiCommand::SetRoundRobin => {
+                        strategy.set_mode(
+                            path_strategy::StrategyMode::RoundRobin,
+                            &ctx,
+                            "tui hotkey",
+                        );
+                    }
+                }
+            }
+        });
+    }
     let path_names = paths
         .iter()
         .map(|path| path.interface_name.clone())
@@ -207,7 +248,10 @@ async fn main() -> Result<()> {
 
     let mut seq = 0_u64;
     let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];
+    let burst_delay = burst_delay(cli.burst_max_delay_ms);
+    let mut pending = Vec::new();
     loop {
+        pending.clear();
         let shutdown = wait_for_shutdown(ctx.ui_state());
         let (len, src) = tokio::select! {
             biased;
@@ -219,100 +263,194 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Remember the active local UDP peer so reverse traffic has somewhere to go.
-        *last_ingest_peer.write() = Some(src);
-        ctx.record_ingest(len as u64, src.to_string());
-        strategy.record_packet(len as u64);
-        if let Some(preview) = &preview {
-            preview.submit_packet(&buf[..len]);
-        }
+        pending.push(PendingPacket::new(src, &buf[..len]));
+        let mut pending_bytes = len;
 
-        ctx.ingested_packet(seq, len, src);
-
-        if should_split(
-            len,
-            cli.split_threshold_bytes,
-            paths.len(),
-            strategy.current(),
-        ) {
-            let fragments = u8::try_from(paths.len()).expect("path count fits in u8");
-            let split_ranges = weighted_split_ranges(len, &strategy.split_weights(&path_names));
-            for (fragment, path) in paths.iter().enumerate() {
-                let (start, end) = split_ranges[fragment];
-                let packet = Arc::new(encode_packet(
-                    PacketHeader {
-                        sequence: seq,
-                        fragment: u8::try_from(fragment).expect("fragment fits in u8"),
-                        fragments,
-                    },
-                    &buf[start..end],
-                ));
-                let packet_len = packet.len() as u64;
-                match path.send(packet) {
-                    Ok(()) => {
-                        strategy.record_interface_send(&path.interface_name, packet_len);
-                        ctx.record_send(path.interface_name.clone(), (end - start) as u64);
-                    }
-                    Err(err) => {
-                        ctx.record_send_error(path.interface_name.clone(), err.to_string());
-                        ctx.send_failure(&path.interface_name, seq, &err.to_string());
-                        strategy.degrade_to_redundant(
-                            &ctx,
-                            format!(
-                                "send error interface={} sequence={} error={err}",
-                                path.interface_name, seq
-                            ),
-                        );
-                    }
+        if let Some(delay) = burst_delay {
+            loop {
+                if matches!(cli.burst_max_bytes, Some(limit) if pending_bytes >= limit) {
+                    break;
                 }
-            }
-        } else {
-            let packet = Arc::new(encode_packet(
-                PacketHeader {
-                    sequence: seq,
-                    fragment: 0,
-                    fragments: 1,
-                },
-                &buf[..len],
-            ));
-            let packet_len = packet.len() as u64;
 
-            // Duplicate each ingested packet over every active interface-bound iroh path.
-            for path in &paths {
-                match path.send(packet.clone()) {
-                    Ok(()) => {
-                        strategy.record_interface_send(&path.interface_name, packet_len);
-                        ctx.record_send(path.interface_name.clone(), len as u64);
-                    }
-                    Err(err) => {
-                        ctx.record_send_error(path.interface_name.clone(), err.to_string());
-                        ctx.send_failure(&path.interface_name, seq, &err.to_string());
-                        strategy.degrade_to_redundant(
-                            &ctx,
-                            format!(
-                                "send error interface={} sequence={} error={err}",
-                                path.interface_name, seq
-                            ),
-                        );
-                    }
-                }
+                let Ok(Ok((len, src))) = tokio::time::timeout(delay, listen_socket.recv_from(&mut buf)).await else {
+                    break;
+                };
+                pending.push(PendingPacket::new(src, &buf[..len]));
+                pending_bytes = pending_bytes.saturating_add(len);
             }
         }
 
-        seq = next_sequence(seq);
+        for packet in &pending {
+            // Remember the active local UDP peer so reverse traffic has somewhere to go.
+            *last_ingest_peer.write() = Some(packet.src);
+            ctx.record_ingest(packet.payload.len() as u64, packet.src.to_string());
+            strategy.record_packet(packet.payload.len() as u64);
+            if let Some(preview) = &preview {
+                preview.submit_packet(&packet.payload);
+            }
+
+            ctx.ingested_packet(seq, packet.payload.len(), packet.src);
+            send_packet(
+                &packet.payload,
+                seq,
+                &cli,
+                &paths,
+                &path_names,
+                &strategy,
+                &ctx,
+            );
+            seq = next_sequence(seq);
+        }
     }
 
     Ok(())
 }
 
+struct PendingPacket {
+    src: SocketAddr,
+    payload: Vec<u8>,
+}
+
+impl PendingPacket {
+    fn new(src: SocketAddr, payload: &[u8]) -> Self {
+        Self {
+            src,
+            payload: payload.to_vec(),
+        }
+    }
+}
+
+fn send_packet(
+    payload: &[u8],
+    seq: u64,
+    cli: &Cli,
+    paths: &[transport::PathConnection],
+    path_names: &[String],
+    strategy: &path_strategy::StrategyState,
+    ctx: &ClientCtx,
+) {
+    if should_split(
+        payload.len(),
+        cli.split_threshold_bytes,
+        cli.mtu,
+        paths.len(),
+        strategy.current(),
+    ) {
+        let fragments = u8::try_from(paths.len()).expect("path count fits in u8");
+        let split_ranges = weighted_split_ranges(payload.len(), &strategy.split_weights(path_names));
+        for (fragment, path) in paths.iter().enumerate() {
+            let (start, end) = split_ranges[fragment];
+            let packet = Arc::new(encode_packet(
+                PacketHeader {
+                    sequence: seq,
+                    fragment: u8::try_from(fragment).expect("fragment fits in u8"),
+                    fragments,
+                },
+                &payload[start..end],
+            ));
+            let packet_len = packet.len() as u64;
+            match path.send(packet) {
+                Ok(()) => {
+                    strategy.record_interface_send(&path.interface_name, packet_len);
+                    ctx.record_send(path.interface_name.clone(), (end - start) as u64);
+                }
+                Err(err) => {
+                    ctx.record_send_error(path.interface_name.clone(), err.to_string());
+                    ctx.send_failure(&path.interface_name, seq, &err.to_string());
+                    strategy.degrade_to_redundant(
+                        ctx,
+                        format!(
+                            "send error interface={} sequence={} error={err}",
+                            path.interface_name, seq
+                        ),
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    let packet = Arc::new(encode_packet(
+        PacketHeader {
+            sequence: seq,
+            fragment: 0,
+            fragments: 1,
+        },
+        payload,
+    ));
+    let packet_len = packet.len() as u64;
+    if matches!(strategy.current(), PathStrategy::RoundRobin) {
+        let index = strategy.next_round_robin_index(paths.len());
+        let path = &paths[index];
+        match path.send(packet) {
+            Ok(()) => {
+                strategy.record_interface_send(&path.interface_name, packet_len);
+                ctx.record_send(path.interface_name.clone(), payload.len() as u64);
+            }
+            Err(err) => {
+                ctx.record_send_error(path.interface_name.clone(), err.to_string());
+                ctx.send_failure(&path.interface_name, seq, &err.to_string());
+                if strategy.mode() == path_strategy::StrategyMode::Auto {
+                    strategy.degrade_to_redundant(
+                        ctx,
+                        format!(
+                            "send error interface={} sequence={} error={err}",
+                            path.interface_name, seq
+                        ),
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    // Duplicate each ingested packet over every active interface-bound iroh path.
+    for path in paths {
+        match path.send(packet.clone()) {
+            Ok(()) => {
+                strategy.record_interface_send(&path.interface_name, packet_len);
+                ctx.record_send(path.interface_name.clone(), payload.len() as u64);
+            }
+            Err(err) => {
+                ctx.record_send_error(path.interface_name.clone(), err.to_string());
+                ctx.send_failure(&path.interface_name, seq, &err.to_string());
+                strategy.degrade_to_redundant(
+                    ctx,
+                    format!(
+                        "send error interface={} sequence={} error={err}",
+                        path.interface_name, seq
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn burst_delay(delay_ms: u64) -> Option<Duration> {
+    if delay_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(delay_ms))
+    }
+}
+
 fn should_split(
     packet_len: usize,
     threshold: Option<usize>,
+    mtu: Option<usize>,
     path_count: usize,
     strategy: PathStrategy,
 ) -> bool {
-    strategy == PathStrategy::Split
-        && matches!(threshold, Some(threshold) if packet_len > threshold && path_count > 1)
+    if path_count <= 1 {
+        return false;
+    }
+
+    if matches!(mtu, Some(mtu) if packet_len > mtu) {
+        return true;
+    }
+
+    matches!(strategy, PathStrategy::Split)
+        && matches!(threshold, Some(threshold) if packet_len > threshold)
 }
 
 fn next_sequence(sequence: u64) -> u64 {
@@ -342,7 +480,9 @@ fn weighted_split_ranges(packet_len: usize, weights: &[f64]) -> Vec<(usize, usiz
 
 #[cfg(test)]
 mod tests {
-    use super::weighted_split_ranges;
+    use super::{burst_delay, should_split, weighted_split_ranges};
+    use crate::path_strategy::PathStrategy;
+    use std::time::Duration;
 
     #[test]
     fn weighted_ranges_cover_packet_once() {
@@ -356,5 +496,43 @@ mod tests {
         let ranges = weighted_split_ranges(1001, &[0.5, 0.5]);
 
         assert_eq!(ranges, vec![(0, 501), (501, 1001)]);
+    }
+
+    #[test]
+    fn packets_above_threshold_split_when_strategy_is_split() {
+        assert!(should_split(1200, Some(1000), None, 2, PathStrategy::Split));
+    }
+
+    #[test]
+    fn packets_at_or_below_threshold_stay_redundant() {
+        assert!(!should_split(1000, Some(1000), None, 2, PathStrategy::Split));
+        assert!(!should_split(999, Some(1000), None, 2, PathStrategy::Split));
+    }
+
+    #[test]
+    fn packets_do_not_split_without_multiple_paths() {
+        assert!(!should_split(1200, Some(1000), None, 1, PathStrategy::Split));
+        assert!(!should_split(1200, None, Some(1000), 1, PathStrategy::Split));
+    }
+
+    #[test]
+    fn packets_above_mtu_split_even_when_strategy_is_redundant() {
+        assert!(should_split(
+            1400,
+            Some(10_000),
+            Some(1200),
+            2,
+            PathStrategy::Redundant,
+        ));
+    }
+
+    #[test]
+    fn zero_burst_delay_disables_batching() {
+        assert_eq!(burst_delay(0), None);
+    }
+
+    #[test]
+    fn burst_delay_uses_requested_milliseconds() {
+        assert_eq!(burst_delay(4), Some(Duration::from_millis(4)));
     }
 }

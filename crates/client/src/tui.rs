@@ -23,10 +23,19 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
+use tokio::sync::mpsc::UnboundedSender;
 use transport::{EndpointHealth, transport_kind};
 
 const ENDPOINT_PREFIX_LEN: usize = 8;
 const CLIENT_PATH_MBPS_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+pub enum UiCommand {
+    SetAuto,
+    SetRedundant,
+    SetSplit,
+    SetRoundRobin,
+}
 
 #[derive(Clone)]
 pub struct ClientUiState {
@@ -34,6 +43,8 @@ pub struct ClientUiState {
     port: u16,
     server_endpoint: String,
     health_endpoint: Arc<RwLock<String>>,
+    strategy_mode: Arc<RwLock<String>>,
+    effective_strategy: Arc<RwLock<String>>,
     interfaces: Vec<String>,
     ingested_packets: Arc<AtomicU64>,
     ingested_bytes: Arc<AtomicU64>,
@@ -46,6 +57,7 @@ pub struct ClientUiState {
     last_health_overall: Arc<RwLock<Option<f32>>>,
     paths: Arc<RwLock<BTreeMap<String, Vec<PathRow>>>>,
     logs: Arc<RwLock<VecDeque<String>>>,
+    command_tx: Option<UnboundedSender<UiCommand>>,
     quit_requested: Arc<AtomicBool>,
 }
 
@@ -91,12 +103,15 @@ impl ClientUiState {
         server_endpoint: String,
         health_endpoint: String,
         interfaces: Vec<String>,
+        command_tx: Option<UnboundedSender<UiCommand>>,
     ) -> Self {
         Self {
             started_at: Instant::now(),
             port,
             server_endpoint,
             health_endpoint: Arc::new(RwLock::new(health_endpoint)),
+            strategy_mode: Arc::new(RwLock::new("-".to_string())),
+            effective_strategy: Arc::new(RwLock::new("-".to_string())),
             interfaces,
             ingested_packets: Arc::new(AtomicU64::new(0)),
             ingested_bytes: Arc::new(AtomicU64::new(0)),
@@ -109,6 +124,7 @@ impl ClientUiState {
             last_health_overall: Arc::new(RwLock::new(None)),
             paths: Arc::new(RwLock::new(BTreeMap::new())),
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(128))),
+            command_tx,
             quit_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -137,11 +153,10 @@ impl ClientUiState {
 
     pub fn record_send_error(&self, interface: String, error: String) {
         self.send_errors.fetch_add(1, Ordering::Relaxed);
-        self.paths
-            .write()
-            .entry(interface)
-            .or_default()
-            .push(PathRow {
+        let mut paths = self.paths.write();
+        let rows = paths.entry(interface).or_default();
+        if rows.is_empty() {
+            rows.push(PathRow {
                 endpoint_id: "-".to_string(),
                 target_mbps: None,
                 split_percentage: None,
@@ -152,6 +167,15 @@ impl ClientUiState {
                 selected: false,
                 status: "failed".to_string(),
             });
+            return;
+        }
+
+        for row in rows.iter_mut() {
+            row.transport = "error".to_string();
+            row.status = "failed".to_string();
+            row.remote_addr = error.clone();
+            row.selected = false;
+        }
     }
 
     pub fn record_path(&self, interface: String, rows: Vec<PathRow>) {
@@ -169,6 +193,11 @@ impl ClientUiState {
 
     pub fn set_health_endpoint(&self, endpoint: String) {
         *self.health_endpoint.write() = endpoint;
+    }
+
+    pub fn record_strategy_state(&self, mode: String, effective: String) {
+        *self.strategy_mode.write() = mode;
+        *self.effective_strategy.write() = effective;
     }
 
     pub fn record_health_received(&self) {
@@ -282,6 +311,33 @@ fn run(state: ClientUiState) -> io::Result<()> {
                     state.request_quit();
                     break;
                 }
+                match key.code {
+                    KeyCode::Char('r')
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        if let Some(tx) = &state.command_tx {
+                            let _ = tx.send(UiCommand::SetRoundRobin);
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        if let Some(tx) = &state.command_tx {
+                            let _ = tx.send(UiCommand::SetAuto);
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        if let Some(tx) = &state.command_tx {
+                            let _ = tx.send(UiCommand::SetRedundant);
+                        }
+                    }
+                    KeyCode::Char('s') => {
+                        if let Some(tx) = &state.command_tx {
+                            let _ = tx.send(UiCommand::SetSplit);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -382,6 +438,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         state.port,
         state.interfaces.join(", ")
     )));
+    header_lines.push(Line::from(format!(
+        "mode {}  effective {}",
+        state.strategy_mode.read().clone(),
+        state.effective_strategy.read().clone()
+    )));
+    header_lines.push(Line::from(
+        "keys a=auto  r=redundant  s=split  ctrl+r=roundrobin  q=quit",
+    ));
     header_lines.push(Line::from(format!(
         "last ingest from {}",
         state.last_ingest_from.read().clone()

@@ -73,9 +73,9 @@ impl ServerCtx {
         }
     }
 
-    pub fn record_forwarded(&self, bytes: u64, buffered: u64, next_seq: u64) {
+    pub fn record_forwarded(&self, bytes: u64, buffered: u64, forwarded_seq: u64, next_seq: u64) {
         if let Some(ui) = &self.ui {
-            ui.record_forwarded(bytes, buffered, next_seq);
+            ui.record_forwarded(bytes, buffered, forwarded_seq, next_seq);
         }
     }
 

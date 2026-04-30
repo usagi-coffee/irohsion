@@ -324,20 +324,14 @@ async fn reorder_loop(
                 }
 
                 if has_pending_state(&buffered, &fragments, &seen) {
-                    expire_reorder_gap(
+                    advance_reorder_window(
                         &mut next_seq,
                         &mut buffered,
                         &mut fragments,
                         &mut seen,
-                        max_reorder_delay,
-                        &ctx,
-                    );
-                    drain_ready(
-                        &mut next_seq,
-                        &mut buffered,
-                        &mut seen,
                         &out_socket,
                         out_udp,
+                        max_reorder_delay,
                         &ctx,
                     )
                     .await?;
@@ -390,6 +384,17 @@ async fn reorder_loop(
 
             if !entry.is_complete() {
                 ctx.record_buffered((buffered.len() + fragments.len()) as u64, next_seq);
+                advance_reorder_window(
+                    &mut next_seq,
+                    &mut buffered,
+                    &mut fragments,
+                    &mut seen,
+                    &out_socket,
+                    out_udp,
+                    max_reorder_delay,
+                    &ctx,
+                )
+                .await?;
                 continue;
             }
 
@@ -405,6 +410,7 @@ async fn reorder_loop(
             ctx.record_forwarded(
                 payload.len() as u64,
                 buffered.len() as u64,
+                packet.header.sequence,
                 next_sequence(next_seq),
             );
             next_seq = next_sequence(next_seq);
@@ -428,9 +434,35 @@ async fn reorder_loop(
             );
             ctx.record_buffered(buffered.len() as u64, next_seq);
         }
+
+        advance_reorder_window(
+            &mut next_seq,
+            &mut buffered,
+            &mut fragments,
+            &mut seen,
+            &out_socket,
+            out_udp,
+            max_reorder_delay,
+            &ctx,
+        )
+        .await?;
     }
 
     Ok(())
+}
+
+async fn advance_reorder_window(
+    next_seq: &mut u64,
+    buffered: &mut BTreeMap<u64, BufferedPacket>,
+    fragments: &mut BTreeMap<u64, FragmentAssembly>,
+    seen: &mut HashSet<u64>,
+    out_socket: &UdpSocket,
+    out_udp: SocketAddr,
+    max_reorder_delay: Duration,
+    ctx: &ServerCtx,
+) -> Result<()> {
+    expire_reorder_gap(next_seq, buffered, fragments, seen, max_reorder_delay, ctx);
+    drain_ready(next_seq, buffered, seen, out_socket, out_udp, ctx).await
 }
 
 fn has_pending_state(
@@ -519,6 +551,7 @@ async fn drain_ready(
         ctx.record_forwarded(
             packet.payload.len() as u64,
             buffered.len() as u64,
+            *next_seq,
             next_sequence(*next_seq),
         );
         seen.remove(next_seq);
@@ -592,5 +625,69 @@ fn set_reply_routes(reply_routes: &ReplyRoutes, remote: &str, reset: bool) {
     }
     if !routes.iter().any(|existing| existing == remote) {
         routes.push(remote.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReceivedPacket, reorder_loop};
+    use crate::context::ServerCtx;
+    use parking_lot::RwLock;
+    use protocol::PacketHeader;
+    use std::{sync::Arc, time::Duration};
+    use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
+
+    #[tokio::test]
+    async fn skips_stale_gap_while_packets_keep_arriving() {
+        let out_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let out_udp = recv_socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let reply_routes = Arc::new(RwLock::new(Vec::new()));
+        let ctx = ServerCtx::default();
+
+        let task = tokio::spawn(reorder_loop(
+            rx,
+            out_socket,
+            out_udp,
+            reply_routes,
+            ctx,
+            Duration::from_secs(30),
+            Duration::from_millis(20),
+        ));
+
+        tx.send(packet(10, b"first")).await.unwrap();
+        assert_eq!(recv_payload(&recv_socket).await, b"first");
+
+        tx.send(packet(12, b"third")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tx.send(packet(13, b"fourth")).await.unwrap();
+
+        assert_eq!(recv_payload(&recv_socket).await, b"third");
+        assert_eq!(recv_payload(&recv_socket).await, b"fourth");
+
+        drop(tx);
+        task.await.unwrap().unwrap();
+    }
+
+    fn packet(sequence: u64, payload: &[u8]) -> ReceivedPacket {
+        ReceivedPacket {
+            remote: "test".to_string(),
+            header: PacketHeader {
+                sequence,
+                fragment: 0,
+                fragments: 1,
+            },
+            payload: payload.to_vec(),
+        }
+    }
+
+    async fn recv_payload(socket: &UdpSocket) -> Vec<u8> {
+        let mut buf = [0_u8; 64];
+        let (len, _) = timeout(Duration::from_millis(200), socket.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        buf[..len].to_vec()
     }
 }

@@ -18,6 +18,7 @@ use crate::context::ClientCtx;
 pub enum PathStrategy {
     Redundant = 0,
     Split = 1,
+    RoundRobin = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +27,7 @@ pub enum StrategyMode {
     Auto = 0,
     Redundant = 1,
     Split = 2,
+    RoundRobin = 3,
 }
 
 impl StrategyMode {
@@ -33,6 +35,7 @@ impl StrategyMode {
         match value {
             1 => Self::Redundant,
             2 => Self::Split,
+            3 => Self::RoundRobin,
             _ => Self::Auto,
         }
     }
@@ -74,16 +77,25 @@ pub struct StrategyState {
     monitor_packets: Arc<AtomicBool>,
     packets: Arc<AtomicU64>,
     payload_bytes: Arc<AtomicU64>,
+    round_robin_cursor: Arc<AtomicU64>,
     targets_mbps: Arc<RwLock<BTreeMap<String, Option<f64>>>>,
     split_percentages: Arc<RwLock<BTreeMap<String, Option<f64>>>>,
     interface_traffic: Arc<RwLock<BTreeMap<String, InterfaceTraffic>>>,
 }
 
 impl StrategyState {
+    fn sync_ui(&self, ctx: &ClientCtx) {
+        ctx.record_strategy_state(
+            &format!("{:?}", self.mode()).to_lowercase(),
+            &format!("{:?}", self.current()).to_lowercase(),
+        );
+    }
+
     pub fn current(&self) -> PathStrategy {
         match self.mode() {
             StrategyMode::Redundant => return PathStrategy::Redundant,
             StrategyMode::Split => return PathStrategy::Split,
+            StrategyMode::RoundRobin => return PathStrategy::RoundRobin,
             StrategyMode::Auto => {}
         }
 
@@ -131,6 +143,7 @@ impl StrategyState {
         if let Some(mode) = patch.mode {
             self.mode.store(mode as u8, Ordering::Relaxed);
             ctx.record_strategy_change(&format!("{mode:?}").to_lowercase(), "remote control");
+            self.sync_ui(ctx);
         }
         if let Some(monitor_packets) = patch.monitor_packets {
             self.monitor_packets
@@ -156,6 +169,13 @@ impl StrategyState {
             }
         }
         ctx.record_split_percentages(&self.effective_split_percentages());
+        self.sync_ui(ctx);
+    }
+
+    pub fn set_mode(&self, mode: StrategyMode, ctx: &ClientCtx, reason: &str) {
+        self.mode.store(mode as u8, Ordering::Relaxed);
+        ctx.record_strategy_change(&format!("{mode:?}").to_lowercase(), reason);
+        self.sync_ui(ctx);
     }
 
     pub fn record_packet(&self, payload_bytes: u64) {
@@ -177,6 +197,15 @@ impl StrategyState {
             counters.tx_packets = counters.tx_packets.saturating_add(1);
             counters.tx_bytes = counters.tx_bytes.saturating_add(bytes);
         }
+    }
+
+    pub fn next_round_robin_index(&self, path_count: usize) -> usize {
+        if path_count == 0 {
+            return 0;
+        }
+
+        let cursor = self.round_robin_cursor.fetch_add(1, Ordering::Relaxed);
+        (cursor as usize) % path_count
     }
 
     pub fn split_weights(&self, interfaces: &[String]) -> Vec<f64> {
@@ -231,6 +260,7 @@ impl StrategyState {
 
         self.set(PathStrategy::Redundant);
         ctx.record_strategy_change("redundant", &reason);
+        self.sync_ui(ctx);
     }
 
     fn set(&self, strategy: PathStrategy) {
@@ -263,11 +293,13 @@ pub fn spawn_strategy_loop(
         monitor_packets: Arc::new(AtomicBool::new(true)),
         packets: Arc::new(AtomicU64::new(0)),
         payload_bytes: Arc::new(AtomicU64::new(0)),
+        round_robin_cursor: Arc::new(AtomicU64::new(0)),
         targets_mbps: Arc::new(RwLock::new(targets_mbps)),
         split_percentages: Arc::new(RwLock::new(split_percentages)),
         interface_traffic: Arc::new(RwLock::new(interface_traffic)),
     };
     ctx.record_split_percentages(&state.effective_split_percentages());
+    state.sync_ui(&ctx);
     let loop_state = state.clone();
     tokio::spawn(async move {
         strategy_loop(
@@ -365,10 +397,12 @@ async fn strategy_loop(
                         "tc backlog recovered interface={interface} backlog_bytes={backlog} threshold_bytes={recover_backlog_bytes}"
                     ),
                 );
+                state.sync_ui(&ctx);
             }
             (PathStrategy::Redundant, None) => {
                 state.set(PathStrategy::Split);
                 ctx.record_strategy_change("split", "tc backlog unavailable");
+                state.sync_ui(&ctx);
             }
             _ => {}
         }
