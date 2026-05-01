@@ -3,7 +3,10 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     ptr,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -25,6 +28,7 @@ pub struct EndpointHealth {
     pub target_mbps: f32,
     pub achieved_mbps: f32,
     pub last_seq: Option<u64>,
+    pub max_seq: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,22 +44,139 @@ pub struct InterfaceBinding {
     pub bind_addr: SocketAddrV4,
 }
 
+#[derive(Clone)]
 pub struct PathConnection {
     pub interface_name: String,
     pub bound_addr: SocketAddrV4,
-    pub connection: iroh::endpoint::Connection,
+    server_addr: EndpointAddr,
+    secret_key: SecretKey,
+    relays: Vec<RelayUrl>,
+    live: Arc<RwLock<Option<LivePath>>>,
+    reconnect_requested: Arc<AtomicBool>,
+}
+
+struct LivePath {
+    binding: InterfaceBinding,
+    connection: iroh::endpoint::Connection,
     endpoint: Endpoint,
 }
 
 impl PathConnection {
     pub fn send(&self, packet: Arc<Bytes>) -> Result<()> {
-        self.connection
+        let connection = self
+            .connection()
+            .with_context(|| format!("path {} has no live connection", self.interface_name))?;
+        connection
             .send_datagram((*packet).clone())
             .map_err(|err| anyhow!("send_datagram failed on {}: {err}", self.interface_name))
     }
 
-    pub fn endpoint(&self) -> Endpoint {
-        self.endpoint.clone()
+    pub fn connection(&self) -> Option<iroh::endpoint::Connection> {
+        self.live
+            .read()
+            .expect("path live lock poisoned")
+            .as_ref()
+            .map(|live| live.connection.clone())
+    }
+
+    pub fn connection_id(&self) -> Option<usize> {
+        self.connection().map(|connection| connection.stable_id())
+    }
+
+    pub fn endpoint(&self) -> Option<Endpoint> {
+        self.live
+            .read()
+            .expect("path live lock poisoned")
+            .as_ref()
+            .map(|live| live.endpoint.clone())
+    }
+
+    pub fn current_bound_addr(&self) -> Option<SocketAddrV4> {
+        self.live
+            .read()
+            .expect("path live lock poisoned")
+            .as_ref()
+            .map(|live| live.binding.bind_addr)
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.live.read().expect("path live lock poisoned").is_some()
+    }
+
+    pub fn reconnect_requested(&self) -> bool {
+        self.reconnect_requested.load(Ordering::Relaxed)
+    }
+
+    pub fn request_reconnect(&self) {
+        self.reconnect_requested.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pending(
+        binding: InterfaceBinding,
+        server_addr: EndpointAddr,
+        secret_key: SecretKey,
+        relays: &[RelayUrl],
+    ) -> Self {
+        Self {
+            interface_name: binding.name,
+            bound_addr: binding.bind_addr,
+            server_addr,
+            secret_key,
+            relays: relays.to_vec(),
+            live: Arc::new(RwLock::new(None)),
+            reconnect_requested: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub fn mark_failed(&self, connection_id: Option<usize>) -> Option<Endpoint> {
+        let mut live = self.live.write().expect("path live lock poisoned");
+        let should_clear = match (connection_id, live.as_ref()) {
+            (Some(connection_id), Some(live)) => live.connection.stable_id() == connection_id,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if !should_clear {
+            return None;
+        }
+
+        self.request_reconnect();
+        live.take().map(|live| live.endpoint)
+    }
+
+    pub fn mark_interface_changed(&self, binding: InterfaceBinding) -> Option<Endpoint> {
+        let mut live = self.live.write().expect("path live lock poisoned");
+        let should_clear = live
+            .as_ref()
+            .is_some_and(|live| live.binding.bind_addr.ip() != binding.bind_addr.ip());
+        if !should_clear {
+            return None;
+        }
+
+        self.request_reconnect();
+        live.take().map(|live| live.endpoint)
+    }
+
+    pub async fn reconnect(&self) -> Result<iroh::endpoint::Connection> {
+        let binding = resolve_interface_ipv4(&self.interface_name)?;
+        let live = connect_live_path(
+            binding,
+            self.server_addr.clone(),
+            self.secret_key.clone(),
+            &self.relays,
+        )
+        .await?;
+        let connection = live.connection.clone();
+        let old = {
+            let mut current = self.live.write().expect("path live lock poisoned");
+            let old = current.replace(live);
+            self.reconnect_requested.store(false, Ordering::Relaxed);
+            old
+        };
+        if let Some(old) = old {
+            old.endpoint.close().await;
+        }
+
+        Ok(connection)
     }
 }
 
@@ -73,13 +194,37 @@ pub async fn connect_path_with_secret(
     secret_key: SecretKey,
     relays: &[RelayUrl],
 ) -> Result<PathConnection> {
+    let interface_name = binding.name.clone();
+    let live = connect_live_path(binding, server_addr.clone(), secret_key.clone(), relays).await?;
+    let bound_addr = live.binding.bind_addr;
+
+    Ok(PathConnection {
+        interface_name,
+        bound_addr,
+        server_addr,
+        secret_key,
+        relays: relays.to_vec(),
+        live: Arc::new(RwLock::new(Some(live))),
+        reconnect_requested: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+async fn connect_live_path(
+    binding: InterfaceBinding,
+    server_addr: EndpointAddr,
+    secret_key: SecretKey,
+    relays: &[RelayUrl],
+) -> Result<LivePath> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec(), HEALTH_ALPN.to_vec()])
         .relay_mode(relay_mode(relays))
         .clear_ip_transports();
 
-    builder = builder.relay_bind_device(binding.name.clone());
+    let bind_device = binding.name.as_bytes().to_vec();
+    builder = builder
+        .direct_bind_device(bind_device.clone())
+        .relay_bind_device(bind_device);
     let endpoint = builder
         .bind_addr(binding.bind_addr)
         .with_context(|| format!("failed to configure bind for {}", binding.bind_addr))?
@@ -94,9 +239,8 @@ pub async fn connect_path_with_secret(
         .await
         .with_context(|| format!("failed to connect path {}", binding.name))?;
 
-    Ok(PathConnection {
-        interface_name: binding.name,
-        bound_addr: binding.bind_addr,
+    Ok(LivePath {
+        binding,
         connection,
         endpoint,
     })
@@ -163,12 +307,16 @@ pub fn encode_health_report(report: &HealthReport) -> Bytes {
     );
     for endpoint in &report.endpoints {
         payload.push_str(&format!(
-            "endpoint\t{}\t{:.4}\t{:.4}\t{}\n",
+            "endpoint\t{}\t{:.4}\t{:.4}\t{}\t{}\n",
             endpoint.endpoint_id,
             endpoint.target_mbps,
             endpoint.achieved_mbps,
             endpoint
                 .last_seq
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            endpoint
+                .max_seq
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string())
         ));
@@ -210,22 +358,32 @@ pub fn decode_health_report(data: &[u8]) -> Result<HealthReport> {
             bail!("unexpected health report row kind");
         }
 
+        let endpoint_id = fields.next().context("missing endpoint id")?.to_string();
+        let target_mbps = fields
+            .next()
+            .context("missing target throughput")?
+            .parse()
+            .context("invalid target throughput")?;
+        let achieved_mbps = fields
+            .next()
+            .context("missing achieved throughput")?
+            .parse()
+            .context("invalid achieved throughput")?;
+        let last_seq = match fields.next() {
+            Some("-") | None => None,
+            Some(value) => Some(value.parse().context("invalid last_seq")?),
+        };
+        let max_seq = match fields.next() {
+            Some("-") | None => last_seq,
+            Some(value) => Some(value.parse().context("invalid max_seq")?),
+        };
+
         endpoints.push(EndpointHealth {
-            endpoint_id: fields.next().context("missing endpoint id")?.to_string(),
-            target_mbps: fields
-                .next()
-                .context("missing target throughput")?
-                .parse()
-                .context("invalid target throughput")?,
-            achieved_mbps: fields
-                .next()
-                .context("missing achieved throughput")?
-                .parse()
-                .context("invalid achieved throughput")?,
-            last_seq: match fields.next() {
-                Some("-") | None => None,
-                Some(value) => Some(value.parse().context("invalid last_seq")?),
-            },
+            endpoint_id,
+            target_mbps,
+            achieved_mbps,
+            last_seq,
+            max_seq,
         });
     }
 

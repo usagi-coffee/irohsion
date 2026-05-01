@@ -26,9 +26,13 @@ use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_packet};
 use remote::{RemoteConfig, spawn_remote_server};
 use runtime::wait_for_shutdown;
 use tokio::{net::UdpSocket, sync::mpsc};
-use transport::{build_server_addr, connect_path_with_secret};
+use transport::{
+    PathConnection, build_server_addr, connect_path_with_secret, resolve_interface_ipv4,
+};
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
+const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const INTERFACE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -122,15 +126,38 @@ async fn main() -> Result<()> {
             endpoint_id,
             secret_key,
         } = config;
-        let path =
-            connect_path_with_secret(binding, server_addr.clone(), secret_key, &cli.relays)
-                .await?;
-        ctx.record_connection_paths(path.interface_name.clone(), &endpoint_id, &path.connection);
-        ctx.connected_path(
-            &path.interface_name,
-            &endpoint_id,
-            SocketAddr::V4(path.bound_addr),
-        );
+        let path = match connect_path_with_secret(
+            binding.clone(),
+            server_addr.clone(),
+            secret_key.clone(),
+            &cli.relays,
+        )
+        .await
+        {
+            Ok(path) => {
+                let connection = path
+                    .connection()
+                    .expect("newly connected path has a live connection");
+                ctx.record_connection_paths(path.interface_name.clone(), &endpoint_id, &connection);
+                ctx.connected_path(
+                    &path.interface_name,
+                    &endpoint_id,
+                    SocketAddr::V4(
+                        path.current_bound_addr()
+                            .expect("newly connected path has a bound address"),
+                    ),
+                );
+                path
+            }
+            Err(err) => {
+                ctx.record_send_error(
+                    binding.name.clone(),
+                    format!("initial connect failed, retrying: {err}"),
+                );
+                ctx.reconnect_failed(&binding.name, &err.to_string());
+                PathConnection::pending(binding, server_addr.clone(), secret_key, &cli.relays)
+            }
+        };
         paths.push(path);
     }
     if paths.len() > MAX_FRAGMENTS {
@@ -159,6 +186,13 @@ async fn main() -> Result<()> {
         ctx.clone(),
     );
     let health = spawn_health_receivers(&paths, ctx.clone(), strategy.clone());
+    for path in &paths {
+        if path.reconnect_requested() {
+            strategy.record_interface_reconnecting(&path.interface_name);
+        }
+    }
+    spawn_interface_watchers(&paths, strategy.clone(), ctx.clone());
+    spawn_reconnect_loops(&paths, &health_endpoint_ids, strategy.clone(), ctx.clone());
     {
         let strategy = strategy.clone();
         let ctx = ctx.clone();
@@ -216,34 +250,54 @@ async fn main() -> Result<()> {
     }
 
     for path in &paths {
+        let path = path.clone();
         let interface_name = path.interface_name.clone();
-        let connection = path.connection.clone();
         let listen_socket = listen_socket.clone();
         let last_ingest_peer = last_ingest_peer.clone();
         let ctx = ctx.clone();
+        let strategy = strategy.clone();
         tokio::spawn(async move {
             // Server-to-client replies arrive over iroh and are bridged back onto the local UDP socket.
             loop {
-                match connection.read_datagram().await {
-                    Ok(payload) => {
-                        let Some(peer) = last_ingest_peer.read().as_ref().copied() else {
-                            ctx.missing_return_peer(&interface_name, payload.len());
-                            continue;
-                        };
+                let Some(connection) = path.connection() else {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                };
+                let connection_id = connection.stable_id();
+                loop {
+                    match connection.read_datagram().await {
+                        Ok(payload) => {
+                            let Some(peer) = last_ingest_peer.read().as_ref().copied() else {
+                                ctx.missing_return_peer(&interface_name, payload.len());
+                                continue;
+                            };
 
-                        if let Err(err) = listen_socket.send_to(&payload, peer).await {
-                            ctx.return_forward_error(&interface_name, peer, &err.to_string());
-                        } else {
-                            ctx.forwarded_return_packet(&interface_name, peer, payload.len());
+                            if let Err(err) = listen_socket.send_to(&payload, peer).await {
+                                ctx.return_forward_error(&interface_name, peer, &err.to_string());
+                            } else {
+                                ctx.forwarded_return_packet(&interface_name, peer, payload.len());
+                            }
                         }
-                    }
-                    Err(err) => {
-                        ctx.record_send_error(
-                            interface_name.clone(),
-                            format!("return path closed: {err}"),
-                        );
-                        ctx.return_path_closed(&interface_name, &err.to_string());
-                        break;
+                        Err(err) => {
+                            ctx.record_send_error(
+                                interface_name.clone(),
+                                format!("return path closed: {err}"),
+                            );
+                            ctx.return_path_closed(&interface_name, &err.to_string());
+                            strategy.record_interface_failure(&interface_name);
+                            if let Some(endpoint) = path.mark_failed(Some(connection_id)) {
+                                tokio::spawn(async move {
+                                    endpoint.close().await;
+                                });
+                            }
+                            strategy.degrade_to_redundant(
+                                &ctx,
+                                format!(
+                                    "return path closed interface={interface_name} error={err}"
+                                ),
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -278,7 +332,9 @@ async fn main() -> Result<()> {
                     break;
                 }
 
-                let Ok(Ok((len, src))) = tokio::time::timeout(delay, listen_socket.recv_from(&mut buf)).await else {
+                let Ok(Ok((len, src))) =
+                    tokio::time::timeout(delay, listen_socket.recv_from(&mut buf)).await
+                else {
                     break;
                 };
                 pending.push(PendingPacket::new(src, &buf[..len]));
@@ -326,6 +382,120 @@ impl PendingPacket {
     }
 }
 
+fn spawn_interface_watchers(
+    paths: &[transport::PathConnection],
+    strategy: path_strategy::StrategyState,
+    ctx: ClientCtx,
+) {
+    for path in paths.iter().cloned() {
+        let strategy = strategy.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(INTERFACE_WATCH_INTERVAL).await;
+
+                match resolve_interface_ipv4(&path.interface_name) {
+                    Ok(binding) => {
+                        if let Some(endpoint) = path.mark_interface_changed(binding.clone()) {
+                            strategy.record_interface_reconnecting(&path.interface_name);
+                            ctx.record_send_error(
+                                path.interface_name.clone(),
+                                format!(
+                                    "interface address changed, reconnecting: {}",
+                                    binding.bind_addr
+                                ),
+                            );
+                            tokio::spawn(async move {
+                                endpoint.close().await;
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(endpoint) = path.mark_failed(None) {
+                            tokio::spawn(async move {
+                                endpoint.close().await;
+                            });
+                        } else {
+                            path.request_reconnect();
+                        }
+                        strategy.record_interface_dead(&path.interface_name);
+                        ctx.record_send_error(
+                            path.interface_name.clone(),
+                            format!("interface unavailable, retrying: {err}"),
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn spawn_reconnect_loops(
+    paths: &[transport::PathConnection],
+    endpoint_ids: &[String],
+    strategy: path_strategy::StrategyState,
+    ctx: ClientCtx,
+) {
+    for (path, endpoint_id) in paths.iter().cloned().zip(endpoint_ids.iter().cloned()) {
+        let strategy = strategy.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let mut retry_delay = Duration::from_millis(250);
+            loop {
+                if !path.reconnect_requested() || path.is_connected() {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+
+                strategy.record_interface_reconnecting(&path.interface_name);
+                match tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, path.reconnect()).await {
+                    Ok(Ok(connection)) => {
+                        retry_delay = Duration::from_millis(250);
+                        strategy.record_interface_success(&path.interface_name);
+                        ctx.record_connection_paths(
+                            path.interface_name.clone(),
+                            &endpoint_id,
+                            &connection,
+                        );
+                        if let Some(bound_addr) = path.current_bound_addr() {
+                            ctx.connected_path(
+                                &path.interface_name,
+                                &endpoint_id,
+                                SocketAddr::V4(bound_addr),
+                            );
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        strategy.record_interface_dead(&path.interface_name);
+                        let error = err.to_string();
+                        ctx.record_send_error(
+                            path.interface_name.clone(),
+                            format!("reconnect failed: {error}"),
+                        );
+                        ctx.reconnect_failed(&path.interface_name, &error);
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                    }
+                    Err(_) => {
+                        strategy.record_interface_dead(&path.interface_name);
+                        let error = format!(
+                            "reconnect timed out after {}s",
+                            RECONNECT_ATTEMPT_TIMEOUT.as_secs()
+                        );
+                        ctx.record_send_error(
+                            path.interface_name.clone(),
+                            format!("reconnect failed: {error}"),
+                        );
+                        ctx.reconnect_failed(&path.interface_name, &error);
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+        });
+    }
+}
+
 fn send_packet(
     payload: &[u8],
     seq: u64,
@@ -335,6 +505,14 @@ fn send_packet(
     strategy: &path_strategy::StrategyState,
     ctx: &ClientCtx,
 ) {
+    let active_paths = paths
+        .iter()
+        .filter(|path| path.is_connected())
+        .collect::<Vec<_>>();
+    if active_paths.is_empty() {
+        return;
+    }
+
     let mode = strategy.mode();
     let effective = strategy.current();
     let (split_interface_names, rescue_interface_names) =
@@ -345,6 +523,7 @@ fn send_packet(
         };
     let split_paths = paths
         .iter()
+        .filter(|path| path.is_connected())
         .filter(|path| {
             split_interface_names
                 .iter()
@@ -354,7 +533,9 @@ fn send_packet(
     let rescue_paths = if rescue_interface_names.is_empty() {
         Vec::new()
     } else {
-        paths.iter()
+        active_paths
+            .iter()
+            .copied()
             .filter(|path| {
                 rescue_interface_names
                     .iter()
@@ -375,7 +556,8 @@ fn send_packet(
             .map(|path| path.interface_name.clone())
             .collect::<Vec<_>>();
         let fragments = u8::try_from(split_paths.len()).expect("path count fits in u8");
-        let split_ranges = weighted_split_ranges(payload.len(), &strategy.split_weights(&split_names));
+        let split_ranges =
+            weighted_split_ranges(payload.len(), &strategy.split_weights(&split_names));
         for (fragment, path) in split_paths.iter().enumerate() {
             let (start, end) = split_ranges[fragment];
             let packet = Arc::new(encode_packet(
@@ -386,14 +568,7 @@ fn send_packet(
                 },
                 &payload[start..end],
             ));
-            send_on_path(
-                path,
-                packet,
-                strategy,
-                ctx,
-                seq,
-                (end - start) as u64,
-            );
+            send_on_path(path, packet, strategy, ctx, seq, (end - start) as u64);
         }
 
         if !rescue_paths.is_empty() {
@@ -406,7 +581,14 @@ fn send_packet(
                 payload,
             ));
             for path in rescue_paths {
-                send_on_path(path, packet.clone(), strategy, ctx, seq, payload.len() as u64);
+                send_on_path(
+                    path,
+                    packet.clone(),
+                    strategy,
+                    ctx,
+                    seq,
+                    payload.len() as u64,
+                );
             }
         }
         return;
@@ -421,15 +603,22 @@ fn send_packet(
         payload,
     ));
     if matches!(effective, PathStrategy::RoundRobin) {
-        let index = strategy.next_round_robin_index(paths.len());
-        let path = &paths[index];
+        let index = strategy.next_round_robin_index(active_paths.len());
+        let path = active_paths[index];
         send_on_path(path, packet, strategy, ctx, seq, payload.len() as u64);
         return;
     }
 
     // Duplicate each ingested packet over every active interface-bound iroh path.
-    for path in paths {
-        send_on_path(path, packet.clone(), strategy, ctx, seq, payload.len() as u64);
+    for path in active_paths {
+        send_on_path(
+            path,
+            packet.clone(),
+            strategy,
+            ctx,
+            seq,
+            payload.len() as u64,
+        );
     }
 }
 
@@ -442,12 +631,20 @@ fn send_on_path(
     payload_len: u64,
 ) {
     let packet_len = packet.len() as u64;
+    let connection_id = path.connection_id();
     match path.send(packet) {
         Ok(()) => {
+            strategy.record_interface_success(&path.interface_name);
             strategy.record_interface_send(&path.interface_name, packet_len);
             ctx.record_send(path.interface_name.clone(), payload_len);
         }
         Err(err) => {
+            strategy.record_interface_failure(&path.interface_name);
+            if let Some(endpoint) = path.mark_failed(connection_id) {
+                tokio::spawn(async move {
+                    endpoint.close().await;
+                });
+            }
             ctx.record_send_error(path.interface_name.clone(), err.to_string());
             ctx.send_failure(&path.interface_name, seq, &err.to_string());
             strategy.degrade_to_redundant(

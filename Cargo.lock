@@ -864,7 +864,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1119,7 +1119,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1935,7 +1935,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "0.98.0"
-source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#243bacf0ba1ebf9be2013598728a68d5fe4eff76"
+source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#98428208a10af86b29dc08d3c1ac79ac1d09a680"
 dependencies = [
  "backon",
  "blake3",
@@ -1988,7 +1988,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "0.98.0"
-source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#243bacf0ba1ebf9be2013598728a68d5fe4eff76"
+source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#98428208a10af86b29dc08d3c1ac79ac1d09a680"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -2009,7 +2009,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "0.98.0"
-source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#243bacf0ba1ebf9be2013598728a68d5fe4eff76"
+source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#98428208a10af86b29dc08d3c1ac79ac1d09a680"
 dependencies = [
  "derive_more",
  "iroh-base",
@@ -2050,7 +2050,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "0.98.0"
-source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#243bacf0ba1ebf9be2013598728a68d5fe4eff76"
+source = "git+https://github.com/usagi-coffee/iroh?branch=bindtodevice#98428208a10af86b29dc08d3c1ac79ac1d09a680"
 dependencies = [
  "blake3",
  "bytes",
@@ -2565,8 +2565,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fc0d4b4134425d9834e591b1a6f807ea365c6d941d738942215564af5f28a97"
+source = "git+https://github.com/usagi-coffee/net-tools#5ee9e5537ab41cff8ea46190baf41778330ff489"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3463,7 +3462,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3521,7 +3520,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3613,7 +3612,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4895,7 +4894,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

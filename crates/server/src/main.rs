@@ -27,6 +27,8 @@ use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::timeout};
 use transport::ALPN;
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
+const RESTART_BACKWARD_GAP: u64 = 4_096;
+const RESTART_CONFIRM_PACKETS: usize = protocol::MAX_FRAGMENTS + 1;
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -51,6 +53,7 @@ struct Cli {
 #[derive(Debug)]
 struct ReceivedPacket {
     remote: String,
+    connection_id: usize,
     header: PacketHeader,
     payload: Vec<u8>,
 }
@@ -110,7 +113,19 @@ struct BufferedPacket {
     received_at: tokio::time::Instant,
 }
 
-type ConnectionRegistry = Arc<RwLock<BTreeMap<String, iroh::endpoint::Connection>>>;
+#[derive(Clone)]
+struct RegisteredConnection {
+    connection: iroh::endpoint::Connection,
+    stable_id: usize,
+}
+
+#[derive(Default)]
+struct RestartDetector {
+    count: usize,
+    highest_seq: u64,
+}
+
+type ConnectionRegistry = Arc<RwLock<BTreeMap<String, RegisteredConnection>>>;
 type ReplyRoutes = Arc<RwLock<Vec<String>>>;
 
 #[tokio::main]
@@ -234,9 +249,14 @@ async fn main() -> Result<()> {
 
             let remote = connection.remote_id();
             let remote_key = remote.to_string();
-            connections
-                .write()
-                .insert(remote_key.clone(), connection.clone());
+            let stable_id = connection.stable_id();
+            connections.write().insert(
+                remote_key.clone(),
+                RegisteredConnection {
+                    connection: connection.clone(),
+                    stable_id,
+                },
+            );
             let should_spawn_health = {
                 let mut targets = health_targets.write();
                 targets.insert(remote_key.clone())
@@ -262,29 +282,27 @@ async fn main() -> Result<()> {
 
             loop {
                 match connection.read_datagram().await {
-                    Ok(data) => {
-                        match parse_packet(&data, remote_key.clone()) {
-                            Ok(packet) => {
-                                ctx.record_connection_receive(
-                                    &remote_key,
-                                    data.len() as u64,
-                                    packet.header.sequence,
-                                );
-                                record_health_sample(
-                                    &health_stats,
-                                    &remote_key,
-                                    packet.payload.len() as u64,
-                                    packet.header.sequence,
-                                );
-                                if tx.send(packet).await.is_err() {
-                                    break;
-                                }
+                    Ok(data) => match parse_packet(&data, remote_key.clone(), stable_id) {
+                        Ok(packet) => {
+                            ctx.record_connection_receive(
+                                &remote_key,
+                                data.len() as u64,
+                                packet.header.sequence,
+                            );
+                            record_health_sample(
+                                &health_stats,
+                                &remote_key,
+                                packet.payload.len() as u64,
+                                packet.header.sequence,
+                            );
+                            if tx.send(packet).await.is_err() {
+                                break;
                             }
-                            Err(_) => ctx.record_invalid(),
                         }
-                    }
+                        Err(_) => ctx.record_invalid(),
+                    },
                     Err(err) => {
-                        connections.write().remove(&remote_key);
+                        remove_connection_if_current(&connections, &remote_key, stable_id);
                         ctx.record_disconnect(remote_key.clone(), err.to_string());
                         break;
                     }
@@ -300,10 +318,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_packet(data: &[u8], remote: String) -> Result<ReceivedPacket> {
+fn parse_packet(data: &[u8], remote: String, connection_id: usize) -> Result<ReceivedPacket> {
     let DecodedPacket { header, payload } = decode_packet(data)?;
     Ok(ReceivedPacket {
         remote,
+        connection_id,
         header,
         payload: payload.to_vec(),
     })
@@ -323,6 +342,8 @@ async fn reorder_loop(
     let mut buffered = BTreeMap::<u64, BufferedPacket>::new();
     let mut fragments = BTreeMap::<u64, FragmentAssembly>::new();
     let mut seen = HashSet::<u64>::new();
+    let mut restart_detector = RestartDetector::default();
+    let mut flow_connections = HashSet::<usize>::new();
 
     loop {
         let timeout_duration = if has_pending_state(&buffered, &fragments, &seen) {
@@ -353,6 +374,8 @@ async fn reorder_loop(
                 } else {
                     initialized = false;
                     next_seq = 0;
+                    restart_detector.clear();
+                    flow_connections.clear();
                 }
                 continue;
             }
@@ -367,6 +390,28 @@ async fn reorder_loop(
             next_seq = packet.header.sequence;
             set_reply_routes(&reply_routes, &packet.remote, true);
             ctx.set_flow_start(next_seq);
+            flow_connections.insert(packet.connection_id);
+        }
+
+        if packet.header.sequence < next_seq {
+            if !flow_connections.contains(&packet.connection_id)
+                && restart_detector.observe(packet.header.sequence, next_seq)
+            {
+                buffered.clear();
+                fragments.clear();
+                seen.clear();
+                flow_connections.clear();
+                flow_connections.insert(packet.connection_id);
+                next_seq = packet.header.sequence;
+                set_reply_routes(&reply_routes, &packet.remote, true);
+                ctx.record_flow_reset(next_seq, "confirmed sequence restart");
+            } else {
+                ctx.record_duplicate(buffered.len() as u64, next_seq);
+                continue;
+            }
+        } else {
+            restart_detector.clear();
+            flow_connections.insert(packet.connection_id);
         }
 
         if packet.header.sequence < next_seq {
@@ -589,6 +634,30 @@ fn next_sequence(sequence: u64) -> u64 {
     }
 }
 
+impl RestartDetector {
+    fn observe(&mut self, sequence: u64, next_seq: u64) -> bool {
+        if next_seq.saturating_sub(sequence) < RESTART_BACKWARD_GAP {
+            self.clear();
+            return false;
+        }
+
+        if self.count == 0 || sequence >= self.highest_seq {
+            self.highest_seq = self.highest_seq.max(sequence);
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.count = 1;
+            self.highest_seq = sequence;
+        }
+
+        self.count >= RESTART_CONFIRM_PACKETS
+    }
+
+    fn clear(&mut self) {
+        self.count = 0;
+        self.highest_seq = 0;
+    }
+}
+
 async fn forward_payload(
     socket: &UdpSocket,
     out_udp: SocketAddr,
@@ -626,7 +695,10 @@ async fn response_loop(
         }
 
         for remote in remotes {
-            let connection = connections.read().get(&remote).cloned();
+            let connection = connections
+                .read()
+                .get(&remote)
+                .map(|registered| registered.connection.clone());
             let Some(connection) = connection else {
                 continue;
             };
@@ -635,6 +707,16 @@ async fn response_loop(
                 break;
             }
         }
+    }
+}
+
+fn remove_connection_if_current(connections: &ConnectionRegistry, remote: &str, stable_id: usize) {
+    let mut connections = connections.write();
+    if connections
+        .get(remote)
+        .is_some_and(|connection| connection.stable_id == stable_id)
+    {
+        connections.remove(remote);
     }
 }
 
@@ -690,9 +772,60 @@ mod tests {
         task.await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn resets_after_confirmed_sequence_restart() {
+        let out_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let out_udp = recv_socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(32);
+        let reply_routes = Arc::new(RwLock::new(Vec::new()));
+        let ctx = ServerCtx::default();
+
+        let task = tokio::spawn(reorder_loop(
+            rx,
+            out_socket,
+            out_udp,
+            reply_routes,
+            ctx,
+            Duration::from_secs(30),
+            Duration::from_millis(20),
+        ));
+
+        tx.send(packet(5000, b"old")).await.unwrap();
+        assert_eq!(recv_payload(&recv_socket).await, b"old");
+
+        for seq in 0..8 {
+            tx.send(packet_with_connection(
+                2,
+                seq,
+                format!("new{seq}").as_bytes(),
+            ))
+            .await
+            .unwrap();
+        }
+        tx.send(packet_with_connection(2, 8, b"new8"))
+            .await
+            .unwrap();
+
+        assert_eq!(recv_payload(&recv_socket).await, b"new7");
+        assert_eq!(recv_payload(&recv_socket).await, b"new8");
+
+        drop(tx);
+        task.await.unwrap().unwrap();
+    }
+
     fn packet(sequence: u64, payload: &[u8]) -> ReceivedPacket {
+        packet_with_connection(1, sequence, payload)
+    }
+
+    fn packet_with_connection(
+        connection_id: usize,
+        sequence: u64,
+        payload: &[u8],
+    ) -> ReceivedPacket {
         ReceivedPacket {
             remote: "test".to_string(),
+            connection_id,
             header: PacketHeader {
                 sequence,
                 fragment: 0,

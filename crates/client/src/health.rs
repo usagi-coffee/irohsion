@@ -1,5 +1,6 @@
 use crate::context::ClientCtx;
 use crate::path_strategy::StrategyState;
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use transport::{PathConnection, decode_health_report};
 
@@ -15,14 +16,20 @@ pub fn spawn_health_receivers(
     let mut tasks = Vec::with_capacity(paths.len());
 
     for path in paths {
-        let endpoint = path.endpoint();
+        let path = path.clone();
         let task = tokio::spawn({
             let ctx = ctx.clone();
             let strategy = strategy.clone();
             async move {
                 loop {
+                    let Some(endpoint) = path.endpoint() else {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    };
+
                     let Some(incoming) = endpoint.accept().await else {
-                        break;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
                     };
 
                     let Ok(accepting) = incoming.accept() else {

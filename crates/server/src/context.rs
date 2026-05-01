@@ -112,4 +112,12 @@ impl ServerCtx {
             ui.set_flow_start(next_seq);
         }
     }
+
+    pub fn record_flow_reset(&self, next_seq: u64, reason: &str) {
+        if let Some(ui) = &self.ui {
+            ui.set_flow_start(next_seq);
+        } else {
+            eprintln!("WARN reset packet reorder flow next_seq={next_seq} reason=\"{reason}\"");
+        }
+    }
 }

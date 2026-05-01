@@ -176,6 +176,16 @@ impl ClientCtx {
         }
     }
 
+    pub fn reconnect_failed(&self, interface: &str, error: &str) {
+        if let Some(ui) = &self.ui {
+            ui.push_log_line(format!(
+                "ERROR failed to reconnect path interface={interface} error={error}"
+            ));
+        } else {
+            eprintln!("ERROR failed to reconnect path interface={interface} error={error}");
+        }
+    }
+
     pub fn record_strategy_change(&self, strategy: &str, reason: &str) {
         if let Some(ui) = &self.ui {
             ui.push_log_line(format!(

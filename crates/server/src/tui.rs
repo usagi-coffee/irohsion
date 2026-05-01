@@ -178,7 +178,11 @@ impl ServerUiState {
         entry.received_packets += 1;
         entry.received_bytes += bytes;
         entry.last_seq = Some(sequence);
-        entry.max_seq = Some(entry.max_seq.map_or(sequence, |current| current.max(sequence)));
+        entry.max_seq = Some(
+            entry
+                .max_seq
+                .map_or(sequence, |current| current.max(sequence)),
+        );
         entry.last_activity = activity;
     }
 

@@ -1,9 +1,6 @@
 <script>
 	const SERVICE_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10001';
 	const STATUS_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10002';
-	const CONTROL_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10003';
-	const PREVIEW_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10004';
-	const PREVIEW_OFFSET_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10005';
 	const STATUS_OFFSET_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10006';
 
 	/** @typedef {{ connect: () => Promise<BluetoothRemoteGATTServer> }} BluetoothRemoteGATT */
@@ -12,11 +9,9 @@
 	/** @typedef {{ getPrimaryService: (uuid: string) => Promise<BluetoothRemoteGATTService> }} BluetoothRemoteGATTServer */
 	/** @typedef {{ name?: string, gatt: BluetoothRemoteGATT, addEventListener: (event: 'gattserverdisconnected', handler: () => void) => void }} BluetoothDevice */
 	/** @typedef {{ requestDevice: (options: object) => Promise<BluetoothDevice> }} BluetoothApi */
-	/** @typedef {{ name: string, target_mbps?: number | null, split_percentage?: number | null, tx_packets?: number, tx_bytes?: number, tx_mbps?: number }} InterfaceStatus */
+	/** @typedef {{ name: string, status?: 'connected' | 'reconnecting' | 'dead', tx_packets?: number, tx_bytes?: number, tx_mbps?: number, server_mbps?: number | null, server_last_seq?: number | null, server_max_seq?: number | null }} InterfaceStatus */
 	/** @typedef {{ mode: string, effective_strategy: string, packets: number, payload_bytes: number, interfaces: InterfaceStatus[] }} ControlStatus */
-	/** @typedef {{ enabled: boolean, decoding: boolean, jpeg_bytes: number, characteristic: string, offset_characteristic: string, chunk_bytes: number }} PreviewStatus */
-	/** @typedef {{ control: ControlStatus, preview?: PreviewStatus }} RemoteStatus */
-	/** @typedef {{ mode?: string, targets_mbps?: Record<string, number>, split_percentages?: Record<string, number>, preview_enabled?: boolean }} ControlPatch */
+	/** @typedef {{ control: ControlStatus }} RemoteStatus */
 
 	/** @type {BluetoothDevice | null} */
 	let device = $state(null);
@@ -26,30 +21,18 @@
 	let status = $state(null);
 	let error = $state('');
 	let connecting = $state(false);
-	let saving = $state(false);
 	let polling = $state(true);
-	let autoPreview = $state(false);
-	let previewIntervalSeconds = $state(10);
 	let readingStatus = false;
-	let previewUrl = $state('');
-	let loadingPreview = $state(false);
-	let lastPreviewBytes = $state(0);
 	/** @type {Promise<unknown>} */
 	let gattQueue = Promise.resolve();
 
 	let connected = $derived(Boolean(server));
 	let interfaces = $derived(getInterfaces(status));
-	let mode = $derived(getMode(status));
 	let effectiveStrategy = $derived(getEffectiveStrategy(status));
 
 	/** @param {RemoteStatus | null} value */
 	function getInterfaces(value) {
 		return value?.control.interfaces ?? [];
-	}
-
-	/** @param {RemoteStatus | null} value */
-	function getMode(value) {
-		return value?.control.mode ?? 'auto';
 	}
 
 	/** @param {RemoteStatus | null} value */
@@ -73,7 +56,6 @@
 			device.addEventListener('gattserverdisconnected', () => {
 				server = null;
 				status = null;
-				clearPreview();
 			});
 
 			server = await selectedDevice.gatt.connect();
@@ -104,44 +86,6 @@
 		const characteristic = await retryGatt(() => service.getCharacteristic(STATUS_UUID));
 		const offsetCharacteristic = await retryGatt(() => service.getCharacteristic(STATUS_OFFSET_UUID));
 		status = await readJsonStatus(characteristic, offsetCharacteristic);
-	}
-
-	async function readPreview() {
-		if (!server || loadingPreview || !status?.preview?.decoding) return;
-		loadingPreview = true;
-		error = '';
-
-		try {
-			await enqueueGatt(readPreviewNow);
-		} catch (err) {
-			error = err instanceof Error ? err.message : String(err);
-		} finally {
-			loadingPreview = false;
-		}
-	}
-
-	async function readPreviewNow() {
-		const activeServer = server;
-		if (!activeServer) return;
-		const service = await retryGatt(() => activeServer.getPrimaryService(SERVICE_UUID));
-		const previewCharacteristic = await retryGatt(() => service.getCharacteristic(PREVIEW_UUID));
-		const offsetCharacteristic = await retryGatt(() => service.getCharacteristic(PREVIEW_OFFSET_UUID));
-		let expectedBytes = status?.preview?.jpeg_bytes ?? 0;
-		if (expectedBytes === 0) {
-			await readStatusNow();
-			expectedBytes = status?.preview?.jpeg_bytes ?? 0;
-		}
-		const bytes = await readChunkedCharacteristic(previewCharacteristic, offsetCharacteristic, expectedBytes);
-		const blob = new Blob([bytes], { type: 'image/jpeg' });
-		clearPreview();
-		previewUrl = URL.createObjectURL(blob);
-		lastPreviewBytes = bytes.byteLength;
-		await readStatusNow();
-	}
-
-	function clearPreview() {
-		if (previewUrl) URL.revokeObjectURL(previewUrl);
-		previewUrl = '';
 	}
 
 	/**
@@ -257,103 +201,6 @@
 		throw new Error('status JSON read failed');
 	}
 
-	/** @param {ControlPatch} patch */
-	async function writePatch(patch) {
-		if (!server) return;
-		saving = true;
-		error = '';
-
-		try {
-			await enqueueGatt(async () => {
-				const activeServer = server;
-				if (!activeServer) return;
-				const service = await retryGatt(() => activeServer.getPrimaryService(SERVICE_UUID));
-				const characteristic = await retryGatt(() => service.getCharacteristic(CONTROL_UUID));
-				await writeCharacteristic(characteristic, new TextEncoder().encode(JSON.stringify(patch)));
-				await readStatusNow();
-			});
-		} catch (err) {
-			error = err instanceof Error ? err.message : String(err);
-		} finally {
-			saving = false;
-		}
-	}
-
-	/** @param {string} nextMode */
-	function setMode(nextMode) {
-		void writePatch({ mode: nextMode });
-	}
-
-	/** @param {string} interfaceName @param {string | number} value */
-	function setTarget(interfaceName, value) {
-		void writePatch({ targets_mbps: { [interfaceName]: Number(value) } });
-	}
-
-	/** @param {string} interfaceName @param {string | number} value */
-	function setPercentage(interfaceName, value) {
-		void writePatch({ split_percentages: rebalanceSplitPercentages(interfaceName, Number(value)) });
-	}
-
-	/** @param {boolean} enabled */
-	function setPreviewEnabled(enabled) {
-		if (!enabled) {
-			autoPreview = false;
-			clearPreview();
-			lastPreviewBytes = 0;
-		}
-		void writePatch({ preview_enabled: enabled });
-	}
-
-	/** @param {InterfaceStatus} iface */
-	function displayPercentage(iface) {
-		return iface.split_percentage ?? evenPercentage();
-	}
-
-	/**
-	 * @param {string} interfaceName
-	 * @param {number} nextValue
-	 * @returns {Record<string, number>}
-	 */
-	function rebalanceSplitPercentages(interfaceName, nextValue) {
-		if (interfaces.length === 0) return {};
-		if (interfaces.length === 1) {
-			return { [interfaces[0].name]: 100 };
-		}
-
-		const clamped = Math.max(0, Math.min(100, Number.isFinite(nextValue) ? nextValue : 0));
-		const otherInterfaces = interfaces.filter((iface) => iface.name !== interfaceName);
-		const remaining = Math.max(0, 100 - clamped);
-		const totalOtherWeight = otherInterfaces.reduce(
-			(total, iface) => total + displayPercentage(iface),
-			0,
-		);
-		const baseWeight = totalOtherWeight > 0 ? totalOtherWeight : otherInterfaces.length;
-		const rebalanced = { [interfaceName]: clamped };
-		const allocations = otherInterfaces.map((iface) => {
-			const weight = totalOtherWeight > 0 ? displayPercentage(iface) : 1;
-			const exact = remaining * (weight / baseWeight);
-			const whole = Math.floor(exact);
-			return {
-				name: iface.name,
-				whole,
-				fraction: exact - whole,
-			};
-		});
-		let assigned = clamped + allocations.reduce((total, item) => total + item.whole, 0);
-		allocations
-			.sort((a, b) => b.fraction - a.fraction || a.name.localeCompare(b.name))
-			.forEach((item) => {
-				const bonus = assigned < 100 ? 1 : 0;
-				rebalanced[item.name] = item.whole + bonus;
-				assigned += bonus;
-			});
-		return rebalanced;
-	}
-
-	function evenPercentage() {
-		return interfaces.length > 0 ? Math.round(100 / interfaces.length) : 0;
-	}
-
 	/** @param {number | null | undefined} value */
 	function formatMbps(value) {
 		return `${(value ?? 0).toFixed(2)} Mbps`;
@@ -376,27 +223,37 @@
 		return interfaces.reduce((total, iface) => total + (iface.tx_bytes ?? 0), 0);
 	}
 
+	function totalServerMbps() {
+		return interfaces.reduce((total, iface) => total + (iface.server_mbps ?? 0), 0);
+	}
+
+	/** @param {number | null | undefined} value */
+	function formatSeq(value) {
+		return value == null ? '-' : String(value);
+	}
+
+	/** @param {InterfaceStatus} iface */
+	function statusLabel(iface) {
+		if (iface.status === 'connected') return 'Connected';
+		if (iface.status === 'reconnecting') return 'Reconnecting';
+		return 'Dead';
+	}
+
+	/** @param {InterfaceStatus} iface */
+	function statusClasses(iface) {
+		if (iface.status === 'connected') return 'bg-emerald-400 shadow-emerald-400/40';
+		if (iface.status === 'reconnecting') return 'bg-amber-400 shadow-amber-400/40';
+		return 'bg-red-500 shadow-red-500/40';
+	}
+
 	/** @param {Element} _node */
 	function pollRemote(_node) {
-		let lastPreviewAt = 0;
 		const statusInterval = setInterval(() => {
-			if (polling && !loadingPreview && !saving) void readStatus();
-		}, 1000);
-
-		const previewInterval = setInterval(() => {
-			if (!polling || !autoPreview || !status?.preview?.decoding) return;
-			const now = Date.now();
-			if (now - lastPreviewAt < Math.max(1, previewIntervalSeconds) * 1000) return;
-			const bytes = status?.preview?.jpeg_bytes ?? 0;
-			if (bytes > 0 && bytes !== lastPreviewBytes && !loadingPreview) {
-				lastPreviewAt = now;
-				void readPreview();
-			}
+			if (polling) void readStatus();
 		}, 1000);
 
 		return () => {
 			clearInterval(statusInterval);
-			clearInterval(previewInterval);
 		};
 	}
 </script>
@@ -438,8 +295,12 @@
 			<div class="flex min-w-0 flex-1 items-center justify-end gap-2 text-right">
 				{#if status}
 					<div class="rounded-2xl bg-neutral-950 px-3 py-2">
-						<p class="text-[0.6rem] font-bold text-neutral-600 uppercase">Mbps</p>
+						<p class="text-[0.6rem] font-bold text-neutral-600 uppercase">TX Mbps</p>
 						<p class="text-sm font-black text-emerald-400">{totalInterfaceMbps().toFixed(2)}</p>
+					</div>
+					<div class="rounded-2xl bg-neutral-950 px-3 py-2">
+						<p class="text-[0.6rem] font-bold text-neutral-600 uppercase">Srv Mbps</p>
+						<p class="text-sm font-black text-sky-300">{totalServerMbps().toFixed(2)}</p>
 					</div>
 					<div class="rounded-2xl bg-neutral-950 px-3 py-2">
 						<p class="text-[0.6rem] font-bold text-neutral-600 uppercase">TX</p>
@@ -463,20 +324,12 @@
 
 		{#if status}
 			<section {@attach pollRemote} class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-3xl border border-white/10 bg-neutral-950 p-3">
-				<p class="min-w-0 truncate text-xl font-black tracking-[-0.04em]">{effectiveStrategy}</p>
-				<div class="grid grid-cols-3 gap-1.5">
-					{#each ['auto', 'split', 'redundant'] as option}
-						<button
-							class={[
-								'rounded-2xl px-2.5 py-2 text-xs font-black capitalize',
-								mode === option ? 'bg-emerald-400 text-black' : 'bg-neutral-900 text-neutral-300'
-							]}
-							onclick={() => setMode(option)}
-							disabled={saving}
-						>
-							{option}
-						</button>
-					{/each}
+				<div class="min-w-0">
+					<p class="text-[0.6rem] font-bold text-neutral-500 uppercase">Auto strategy</p>
+					<p class="truncate text-xl font-black tracking-[-0.04em]">{effectiveStrategy}</p>
+				</div>
+				<div class="rounded-2xl bg-emerald-400 px-3 py-2 text-xs font-black text-black">
+					Auto
 				</div>
 			</section>
 
@@ -484,116 +337,42 @@
 				{#each interfaces as iface}
 					<article class="rounded-3xl border border-white/10 bg-neutral-950 p-3">
 						<div class="mb-3 grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
-							<h2 class="min-w-0 truncate text-xl font-black tracking-[-0.05em]">{iface.name}</h2>
-							<div class="grid grid-cols-3 gap-1.5">
+							<div class="flex min-w-0 items-center gap-2">
+								<span class={['h-3 w-3 shrink-0 rounded-full shadow-[0_0_18px]', statusClasses(iface)]} title={statusLabel(iface)}></span>
+								<h2 class="min-w-0 truncate text-xl font-black tracking-[-0.05em]">{iface.name}</h2>
+							</div>
+							<div class="grid grid-cols-2 gap-1.5">
 								<div class="min-w-16 rounded-2xl bg-black px-2 py-1.5 text-right">
-									<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">Rate</p>
+									<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">TX Mbps</p>
 									<p class="text-xs font-black text-emerald-400">{formatMbps(iface.tx_mbps)}</p>
 								</div>
 								<div class="min-w-16 rounded-2xl bg-black px-2 py-1.5 text-right">
-									<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">TX</p>
-									<p class="text-xs font-black text-neutral-100">{formatBytes(iface.tx_bytes)}</p>
-								</div>
-								<div class="min-w-16 rounded-2xl bg-black px-2 py-1.5 text-right">
-									<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">Pkts</p>
-									<p class="text-xs font-black text-neutral-100">{iface.tx_packets ?? 0}</p>
+									<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">Srv Mbps</p>
+									<p class="text-xs font-black text-sky-300">{formatMbps(iface.server_mbps)}</p>
 								</div>
 							</div>
 						</div>
 
-						<label class="grid gap-1.5">
-							<div class="flex justify-between text-xs font-bold text-neutral-400">
-								<span>Target Mbps</span>
-								<span>{iface.target_mbps ?? 0}</span>
+						<div class="grid grid-cols-3 gap-1.5">
+							<div class="rounded-2xl bg-black px-2 py-1.5">
+								<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">TX</p>
+								<p class="text-xs font-black text-neutral-100">{formatBytes(iface.tx_bytes)}</p>
 							</div>
-							<input
-								class="accent-emerald-400"
-								type="range"
-								min="0"
-								max="50"
-								step="0.5"
-								value={iface.target_mbps ?? 0}
-								onchange={(event) => setTarget(iface.name, event.currentTarget.value)}
-							/>
-						</label>
-
-						{#if mode === 'split'}
-							<label class="mt-3 grid gap-1.5">
-								<div class="flex justify-between text-xs font-bold text-neutral-400">
-									<span>Split percentage</span>
-									<span>{displayPercentage(iface)}%</span>
-								</div>
-								<input
-									class="accent-sky-400"
-									type="range"
-									min="0"
-									max="100"
-									step="1"
-									value={displayPercentage(iface)}
-									onchange={(event) => setPercentage(iface.name, event.currentTarget.value)}
-								/>
-							</label>
-						{/if}
+							<div class="rounded-2xl bg-black px-2 py-1.5">
+								<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">Last</p>
+								<p class="text-xs font-black text-neutral-100">{formatSeq(iface.server_last_seq)}</p>
+							</div>
+							<div class="rounded-2xl bg-black px-2 py-1.5">
+								<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">Max</p>
+								<p class="text-xs font-black text-neutral-100">{formatSeq(iface.server_max_seq)}</p>
+							</div>
+						</div>
 					</article>
 				{/each}
 			</section>
-
-			<section class="rounded-3xl border border-white/10 bg-neutral-950 p-4">
-				<div class="flex items-center justify-between gap-4">
-					<div>
-						<p class="text-xs font-black tracking-[0.18em] text-neutral-500 uppercase">Preview</p>
-						<p class="text-sm text-neutral-400">{status.preview?.jpeg_bytes ?? 0} bytes ready</p>
-					</div>
-					<button
-						class="rounded-full bg-white px-4 py-2 text-sm font-black text-black disabled:opacity-50"
-						onclick={readPreview}
-						disabled={loadingPreview || !status.preview?.decoding || !status.preview?.jpeg_bytes}
-					>
-						{loadingPreview ? 'Loading...' : 'Load'}
-					</button>
-				</div>
-
-				<div class="mt-4 grid gap-3 rounded-2xl bg-black p-3">
-					<label class="flex items-center justify-between gap-4 text-sm font-bold text-neutral-300">
-						<span>Decoder</span>
-						<input
-							class="h-5 w-5 accent-emerald-400"
-							type="checkbox"
-							checked={status.preview?.decoding ?? false}
-							onchange={(event) => setPreviewEnabled(event.currentTarget.checked)}
-						/>
-					</label>
-					<label class="flex items-center justify-between gap-4 text-sm font-bold text-neutral-300">
-						<span>Auto preview</span>
-						<input class="h-5 w-5 accent-emerald-400" type="checkbox" bind:checked={autoPreview} disabled={!status.preview?.decoding} />
-					</label>
-					<label class="grid gap-2">
-						<div class="flex justify-between text-xs font-bold text-neutral-500">
-							<span>Decode interval</span>
-							<span>{previewIntervalSeconds}s</span>
-						</div>
-						<input
-							class="accent-emerald-400"
-							type="range"
-							min="5"
-							max="60"
-							step="5"
-							bind:value={previewIntervalSeconds}
-						/>
-					</label>
-				</div>
-
-				{#if previewUrl}
-					<img class="mt-4 w-full rounded-2xl border border-white/10 bg-black" src={previewUrl} alt="Latest decoded preview frame" />
-				{:else}
-					<div class="mt-4 grid aspect-video place-items-center rounded-2xl border border-dashed border-white/10 text-sm text-neutral-600">
-						No frame loaded
-					</div>
-				{/if}
-			</section>
 		{:else}
 			<section class="rounded-3xl border border-white/10 bg-neutral-950 p-5">
-				<p class="text-neutral-400">Connect to the irohsion BLE remote to tune paths.</p>
+				<p class="text-neutral-400">Connect to the irohsion BLE remote to monitor paths.</p>
 			</section>
 		{/if}
 	</div>

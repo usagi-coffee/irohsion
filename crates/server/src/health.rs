@@ -9,7 +9,13 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use parking_lot::RwLock;
 use transport::{EndpointHealth, HEALTH_ALPN, HealthReport, encode_health_report};
 
-pub type HealthConnections = Arc<RwLock<BTreeMap<String, iroh::endpoint::Connection>>>;
+#[derive(Clone)]
+pub struct HealthConnection {
+    pub connection: iroh::endpoint::Connection,
+    pub stable_id: usize,
+}
+
+pub type HealthConnections = Arc<RwLock<BTreeMap<String, HealthConnection>>>;
 pub type HealthTargets = Arc<RwLock<HashSet<String>>>;
 pub type HealthStats = Arc<RwLock<BTreeMap<String, EndpointSample>>>;
 
@@ -17,6 +23,7 @@ pub type HealthStats = Arc<RwLock<BTreeMap<String, EndpointSample>>>;
 pub struct EndpointSample {
     pub bytes: u64,
     pub last_seq: Option<u64>,
+    pub max_seq: Option<u64>,
 }
 
 pub async fn health_loop(
@@ -39,14 +46,23 @@ pub async fn health_loop(
         let payload = encode_health_report(&report);
         let mut failed = Vec::new();
         for (endpoint_id, connection) in &connections {
-            if connection.send_datagram(payload.clone()).is_err() {
-                failed.push(endpoint_id.clone());
+            if connection
+                .connection
+                .send_datagram(payload.clone())
+                .is_err()
+            {
+                failed.push((endpoint_id.clone(), connection.stable_id));
             }
         }
         if !failed.is_empty() {
             let mut live = health_connections.write();
-            for endpoint_id in failed {
-                live.remove(&endpoint_id);
+            for (endpoint_id, stable_id) in failed {
+                if live
+                    .get(&endpoint_id)
+                    .is_some_and(|connection| connection.stable_id == stable_id)
+                {
+                    live.remove(&endpoint_id);
+                }
             }
         }
     }
@@ -81,9 +97,14 @@ pub async fn maintain_health_connection(
 
         match endpoint.connect(health_addr, HEALTH_ALPN).await {
             Ok(connection) => {
-                health_connections
-                    .write()
-                    .insert(endpoint_key.clone(), connection);
+                let stable_id = connection.stable_id();
+                health_connections.write().insert(
+                    endpoint_key.clone(),
+                    HealthConnection {
+                        connection,
+                        stable_id,
+                    },
+                );
             }
             Err(_) => {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -96,7 +117,8 @@ pub fn record_health_sample(health_stats: &HealthStats, remote: &str, bytes: u64
     let mut stats = health_stats.write();
     let sample = stats.entry(remote.to_string()).or_default();
     sample.bytes = sample.bytes.saturating_add(bytes);
-    sample.last_seq = Some(sample.last_seq.map_or(seq, |current| current.max(seq)));
+    sample.last_seq = Some(seq);
+    sample.max_seq = Some(sample.max_seq.map_or(seq, |current| current.max(seq)));
 }
 
 fn build_health_report(
@@ -123,6 +145,7 @@ fn build_health_report(
             target_mbps,
             achieved_mbps,
             last_seq: sample.last_seq,
+            max_seq: sample.max_seq,
         });
     }
     drained.clear();

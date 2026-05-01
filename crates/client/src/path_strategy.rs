@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -48,11 +48,21 @@ impl StrategyMode {
 #[derive(Debug, Clone, Serialize)]
 pub struct InterfaceControlStatus {
     pub name: String,
-    pub target_mbps: Option<f64>,
-    pub split_percentage: Option<f64>,
+    pub status: InterfaceLinkStatus,
     pub tx_packets: u64,
     pub tx_bytes: u64,
     pub tx_mbps: f64,
+    pub server_mbps: Option<f32>,
+    pub server_last_seq: Option<u64>,
+    pub server_max_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InterfaceLinkStatus {
+    Connected,
+    Reconnecting,
+    Dead,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,10 +77,6 @@ pub struct ControlStatus {
 
 #[derive(Debug, Deserialize)]
 pub struct ControlPatch {
-    pub mode: Option<StrategyMode>,
-    pub monitor_packets: Option<bool>,
-    pub targets_mbps: Option<BTreeMap<String, Option<f64>>>,
-    pub split_percentages: Option<BTreeMap<String, Option<f64>>>,
     pub preview_enabled: Option<bool>,
 }
 
@@ -86,14 +92,21 @@ pub struct StrategyState {
     endpoint_ids_by_interface: Arc<RwLock<BTreeMap<String, String>>>,
     split_percentages: Arc<RwLock<BTreeMap<String, Option<f64>>>>,
     health_by_interface: Arc<RwLock<BTreeMap<String, InterfaceHealth>>>,
+    interface_failures: Arc<RwLock<BTreeMap<String, InterfaceFailure>>>,
+    interface_status: Arc<RwLock<BTreeMap<String, InterfaceLinkStatus>>>,
     interface_traffic: Arc<RwLock<BTreeMap<String, InterfaceTraffic>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct InterfaceHealth {
     last_seq: Option<u64>,
+    max_seq: Option<u64>,
+    server_mbps: f32,
     last_unix_ms: u64,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct InterfaceFailure;
 
 impl StrategyState {
     fn sync_ui(&self, ctx: &ClientCtx) {
@@ -123,7 +136,8 @@ impl StrategyState {
 
     pub fn status(&self) -> ControlStatus {
         let targets = self.targets_mbps.read();
-        let percentages = self.split_percentages.read();
+        let health = self.health_by_interface.read();
+        let statuses = self.interface_status.read();
         let mut traffic = self.interface_traffic.write();
         for counters in traffic.values_mut() {
             counters.update_rate();
@@ -136,53 +150,28 @@ impl StrategyState {
             payload_bytes: self.payload_bytes.load(Ordering::Relaxed),
             interfaces: targets
                 .iter()
-                .map(|(name, target_mbps)| {
+                .map(|(name, _)| {
                     let counters = traffic.get(name).copied().unwrap_or_default();
+                    let health = health.get(name);
                     InterfaceControlStatus {
                         name: name.clone(),
-                        target_mbps: *target_mbps,
-                        split_percentage: percentages.get(name).copied().flatten(),
+                        status: statuses
+                            .get(name)
+                            .copied()
+                            .unwrap_or(InterfaceLinkStatus::Dead),
                         tx_packets: counters.tx_packets,
                         tx_bytes: counters.tx_bytes,
                         tx_mbps: counters.tx_mbps,
+                        server_mbps: health.map(|health| health.server_mbps),
+                        server_last_seq: health.and_then(|health| health.last_seq),
+                        server_max_seq: health.and_then(|health| health.max_seq),
                     }
                 })
                 .collect(),
         }
     }
 
-    pub fn apply_patch(&self, patch: ControlPatch, ctx: &ClientCtx) {
-        if let Some(mode) = patch.mode {
-            self.mode.store(mode as u8, Ordering::Relaxed);
-            ctx.record_strategy_change(&format!("{mode:?}").to_lowercase(), "remote control");
-            self.sync_ui(ctx);
-        }
-        if let Some(monitor_packets) = patch.monitor_packets {
-            self.monitor_packets
-                .store(monitor_packets, Ordering::Relaxed);
-        }
-        if let Some(targets_mbps) = patch.targets_mbps {
-            let mut targets = self.targets_mbps.write();
-            for (interface, target_mbps) in targets_mbps {
-                if targets.contains_key(&interface) {
-                    targets.insert(interface, target_mbps);
-                }
-            }
-        }
-        if let Some(split_percentages) = patch.split_percentages {
-            let mut percentages = self.split_percentages.write();
-            for (interface, split_percentage) in split_percentages {
-                if percentages.contains_key(&interface) {
-                    percentages.insert(
-                        interface,
-                        split_percentage.map(|value| value.clamp(0.0, 100.0)),
-                    );
-                }
-            }
-        }
-        ctx.record_split_percentages(&self.effective_split_percentages());
-        self.sync_ui(ctx);
-    }
+    pub fn apply_patch(&self, _patch: ControlPatch, _ctx: &ClientCtx) {}
 
     pub fn set_mode(&self, mode: StrategyMode, ctx: &ClientCtx, reason: &str) {
         self.mode.store(mode as u8, Ordering::Relaxed);
@@ -209,6 +198,35 @@ impl StrategyState {
             counters.tx_packets = counters.tx_packets.saturating_add(1);
             counters.tx_bytes = counters.tx_bytes.saturating_add(bytes);
         }
+    }
+
+    pub fn record_interface_success(&self, interface: &str) {
+        self.interface_failures.write().remove(interface);
+        self.interface_status
+            .write()
+            .insert(interface.to_string(), InterfaceLinkStatus::Connected);
+    }
+
+    pub fn record_interface_failure(&self, interface: &str) {
+        self.interface_failures
+            .write()
+            .insert(interface.to_string(), InterfaceFailure);
+        self.record_interface_reconnecting(interface);
+    }
+
+    pub fn record_interface_reconnecting(&self, interface: &str) {
+        self.interface_status
+            .write()
+            .insert(interface.to_string(), InterfaceLinkStatus::Reconnecting);
+    }
+
+    pub fn record_interface_dead(&self, interface: &str) {
+        self.interface_failures
+            .write()
+            .insert(interface.to_string(), InterfaceFailure);
+        self.interface_status
+            .write()
+            .insert(interface.to_string(), InterfaceLinkStatus::Dead);
     }
 
     pub fn next_round_robin_index(&self, path_count: usize) -> usize {
@@ -248,12 +266,7 @@ impl StrategyState {
     }
 
     pub fn effective_split_percentages(&self) -> BTreeMap<String, f64> {
-        let interfaces = self
-            .targets_mbps
-            .read()
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let interfaces = self.targets_mbps.read().keys().cloned().collect::<Vec<_>>();
         let weights = self.split_weights(&interfaces);
         interfaces
             .into_iter()
@@ -267,15 +280,22 @@ impl StrategyState {
         let endpoints = report
             .endpoints
             .iter()
-            .map(|endpoint| (endpoint.endpoint_id.as_str(), endpoint.last_seq))
+            .map(|endpoint| {
+                (
+                    endpoint.endpoint_id.as_str(),
+                    (endpoint.last_seq, endpoint.max_seq, endpoint.achieved_mbps),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let mut health = self.health_by_interface.write();
         for (interface, endpoint_id) in endpoint_ids {
-            if let Some(last_seq) = endpoints.get(endpoint_id.as_str()) {
+            if let Some((last_seq, max_seq, server_mbps)) = endpoints.get(endpoint_id.as_str()) {
                 health.insert(
                     interface,
                     InterfaceHealth {
                         last_seq: *last_seq,
+                        max_seq: *max_seq,
+                        server_mbps: *server_mbps,
                         last_unix_ms: report.unix_ms,
                     },
                 );
@@ -284,18 +304,39 @@ impl StrategyState {
     }
 
     pub fn auto_path_groups(&self, interfaces: &[String]) -> (Vec<String>, Vec<String>) {
+        let failed = self.recently_failed_interfaces();
+        let mut degraded = interfaces
+            .iter()
+            .filter(|interface| failed.contains(*interface))
+            .cloned()
+            .collect::<Vec<_>>();
+        let candidates = interfaces
+            .iter()
+            .filter(|interface| !failed.contains(*interface))
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidates.len() < 2 {
+            degraded.extend(candidates.iter().cloned());
+            return (candidates, degraded);
+        }
+
         let health = self.health_by_interface.read();
-        let fresh = interfaces
+        let fresh = candidates
             .iter()
             .filter_map(|interface| {
                 let state = health.get(interface)?;
                 let age_ms = unix_ms_now().saturating_sub(state.last_unix_ms);
-                (age_ms <= AUTO_SPLIT_HEALTH_STALE_MS).then_some((interface.clone(), state.last_seq))
+                (age_ms <= AUTO_SPLIT_HEALTH_STALE_MS)
+                    .then_some((interface.clone(), state.last_seq))
             })
             .collect::<Vec<_>>();
+        if fresh.is_empty() {
+            return (candidates, degraded);
+        }
+
         let best_last_seq = fresh.iter().filter_map(|(_, last_seq)| *last_seq).max();
         let Some(best_last_seq) = best_last_seq else {
-            return (interfaces.to_vec(), Vec::new());
+            return (candidates, degraded);
         };
 
         let healthy = fresh
@@ -307,16 +348,18 @@ impl StrategyState {
             })
             .map(|(interface, _)| interface)
             .collect::<Vec<_>>();
-        if healthy.len() < 2 {
-            return (interfaces.to_vec(), Vec::new());
-        }
-
-        let degraded = interfaces
-            .iter()
-            .filter(|interface| !healthy.iter().any(|healthy_interface| healthy_interface == *interface))
-            .cloned()
-            .collect::<Vec<_>>();
+        let healthy_set = healthy.iter().cloned().collect::<BTreeSet<_>>();
+        degraded.extend(
+            candidates
+                .iter()
+                .filter(|interface| !healthy_set.contains(*interface))
+                .cloned(),
+        );
         (healthy, degraded)
+    }
+
+    pub fn auto_split_ready(&self, interfaces: &[String]) -> bool {
+        self.auto_path_groups(interfaces).0.len() >= 2
     }
 
     pub fn degrade_to_redundant(&self, ctx: &ClientCtx, reason: String) {
@@ -334,6 +377,10 @@ impl StrategyState {
 
     fn set(&self, strategy: PathStrategy) {
         self.strategy.store(strategy as u8, Ordering::Relaxed);
+    }
+
+    fn recently_failed_interfaces(&self) -> BTreeSet<String> {
+        self.interface_failures.read().keys().cloned().collect()
     }
 }
 
@@ -356,6 +403,10 @@ pub fn spawn_strategy_loop(
         .iter()
         .map(|(interface, _)| (interface.clone(), None))
         .collect();
+    let interface_status = interfaces
+        .iter()
+        .map(|(interface, _)| (interface.clone(), InterfaceLinkStatus::Connected))
+        .collect();
     let interface_traffic = interfaces
         .iter()
         .map(|(interface, _)| (interface.clone(), InterfaceTraffic::default()))
@@ -371,6 +422,8 @@ pub fn spawn_strategy_loop(
         endpoint_ids_by_interface: Arc::new(RwLock::new(endpoint_ids_by_interface)),
         split_percentages: Arc::new(RwLock::new(split_percentages)),
         health_by_interface: Arc::new(RwLock::new(BTreeMap::new())),
+        interface_failures: Arc::new(RwLock::new(BTreeMap::new())),
+        interface_status: Arc::new(RwLock::new(interface_status)),
         interface_traffic: Arc::new(RwLock::new(interface_traffic)),
     };
     ctx.record_split_percentages(&state.effective_split_percentages());
@@ -441,6 +494,15 @@ async fn strategy_loop(
             continue;
         }
 
+        let interface_names = interfaces
+            .iter()
+            .map(|(interface, _)| interface.clone())
+            .collect::<Vec<_>>();
+        if state.current() == PathStrategy::Split && !state.auto_split_ready(&interface_names) {
+            state.degrade_to_redundant(&ctx, "not enough healthy paths for split".to_string());
+            continue;
+        }
+
         let mut worst = None::<(&str, u64)>;
         for (interface, _) in &interfaces {
             let Some(backlog) = tc_backlog(interface).await else {
@@ -463,7 +525,7 @@ async fn strategy_loop(
                 );
             }
             (PathStrategy::Redundant, Some((interface, backlog)))
-                if backlog <= recover_backlog_bytes =>
+                if backlog <= recover_backlog_bytes && state.auto_split_ready(&interface_names) =>
             {
                 state.set(PathStrategy::Split);
                 ctx.record_strategy_change(
@@ -474,7 +536,7 @@ async fn strategy_loop(
                 );
                 state.sync_ui(&ctx);
             }
-            (PathStrategy::Redundant, None) => {
+            (PathStrategy::Redundant, None) if state.auto_split_ready(&interface_names) => {
                 state.set(PathStrategy::Split);
                 ctx.record_strategy_change("split", "tc backlog unavailable");
                 state.sync_ui(&ctx);

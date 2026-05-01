@@ -44,7 +44,10 @@ async fn main() -> Result<()> {
     let mut paths = Vec::with_capacity(interface_bindings.len());
     for binding in interface_bindings {
         let path = connect_path(binding, remote_addr.clone(), &cli.relays).await?;
-        log_connection_paths(&path.interface_name, &path.connection);
+        let connection = path
+            .connection()
+            .expect("newly connected path has a live connection");
+        log_connection_paths(&path.interface_name, &connection);
         info!(
             interface = %path.interface_name,
             local_addr = %path.bound_addr,
