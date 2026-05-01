@@ -378,8 +378,13 @@ async fn reorder_loop(
             ctx.record_duplicate(buffered.len() as u64, next_seq);
             continue;
         }
+        if buffered.contains_key(&packet.header.sequence) {
+            ctx.record_duplicate(buffered.len() as u64, next_seq);
+            continue;
+        }
 
         let payload = if packet.header.fragments == 1 {
+            fragments.remove(&packet.header.sequence);
             seen.insert(packet.header.sequence);
             packet.payload
         } else {

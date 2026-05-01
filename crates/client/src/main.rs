@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use clap::{ArgAction, Parser};
 use cli::{InterfaceSpec, SecretArg, parse_interface_configs};
 use context::ClientCtx;
@@ -336,13 +337,30 @@ fn send_packet(
 ) {
     let mode = strategy.mode();
     let effective = strategy.current();
-    let split_paths = if matches!(mode, StrategyMode::Auto) && matches!(effective, PathStrategy::Split) {
-        let healthy = strategy.auto_split_interfaces(path_names);
-        paths.iter()
-            .filter(|path| healthy.iter().any(|name| name == &path.interface_name))
-            .collect::<Vec<_>>()
+    let (split_interface_names, rescue_interface_names) =
+        if matches!(mode, StrategyMode::Auto) && matches!(effective, PathStrategy::Split) {
+            strategy.auto_path_groups(path_names)
+        } else {
+            (path_names.to_vec(), Vec::new())
+        };
+    let split_paths = paths
+        .iter()
+        .filter(|path| {
+            split_interface_names
+                .iter()
+                .any(|name| name == &path.interface_name)
+        })
+        .collect::<Vec<_>>();
+    let rescue_paths = if rescue_interface_names.is_empty() {
+        Vec::new()
     } else {
-        paths.iter().collect::<Vec<_>>()
+        paths.iter()
+            .filter(|path| {
+                rescue_interface_names
+                    .iter()
+                    .any(|name| name == &path.interface_name)
+            })
+            .collect::<Vec<_>>()
     };
     if should_split(
         payload.len(),
@@ -368,23 +386,27 @@ fn send_packet(
                 },
                 &payload[start..end],
             ));
-            let packet_len = packet.len() as u64;
-            match path.send(packet) {
-                Ok(()) => {
-                    strategy.record_interface_send(&path.interface_name, packet_len);
-                    ctx.record_send(path.interface_name.clone(), (end - start) as u64);
-                }
-                Err(err) => {
-                    ctx.record_send_error(path.interface_name.clone(), err.to_string());
-                    ctx.send_failure(&path.interface_name, seq, &err.to_string());
-                    strategy.degrade_to_redundant(
-                        ctx,
-                        format!(
-                            "send error interface={} sequence={} error={err}",
-                            path.interface_name, seq
-                        ),
-                    );
-                }
+            send_on_path(
+                path,
+                packet,
+                strategy,
+                ctx,
+                seq,
+                (end - start) as u64,
+            );
+        }
+
+        if !rescue_paths.is_empty() {
+            let packet = Arc::new(encode_packet(
+                PacketHeader {
+                    sequence: seq,
+                    fragment: 0,
+                    fragments: 1,
+                },
+                payload,
+            ));
+            for path in rescue_paths {
+                send_on_path(path, packet.clone(), strategy, ctx, seq, payload.len() as u64);
             }
         }
         return;
@@ -398,50 +420,43 @@ fn send_packet(
         },
         payload,
     ));
-    let packet_len = packet.len() as u64;
     if matches!(effective, PathStrategy::RoundRobin) {
         let index = strategy.next_round_robin_index(paths.len());
         let path = &paths[index];
-        match path.send(packet) {
-            Ok(()) => {
-                strategy.record_interface_send(&path.interface_name, packet_len);
-                ctx.record_send(path.interface_name.clone(), payload.len() as u64);
-            }
-            Err(err) => {
-                ctx.record_send_error(path.interface_name.clone(), err.to_string());
-                ctx.send_failure(&path.interface_name, seq, &err.to_string());
-                if strategy.mode() == path_strategy::StrategyMode::Auto {
-                    strategy.degrade_to_redundant(
-                        ctx,
-                        format!(
-                            "send error interface={} sequence={} error={err}",
-                            path.interface_name, seq
-                        ),
-                    );
-                }
-            }
-        }
+        send_on_path(path, packet, strategy, ctx, seq, payload.len() as u64);
         return;
     }
 
     // Duplicate each ingested packet over every active interface-bound iroh path.
     for path in paths {
-        match path.send(packet.clone()) {
-            Ok(()) => {
-                strategy.record_interface_send(&path.interface_name, packet_len);
-                ctx.record_send(path.interface_name.clone(), payload.len() as u64);
-            }
-            Err(err) => {
-                ctx.record_send_error(path.interface_name.clone(), err.to_string());
-                ctx.send_failure(&path.interface_name, seq, &err.to_string());
-                strategy.degrade_to_redundant(
-                    ctx,
-                    format!(
-                        "send error interface={} sequence={} error={err}",
-                        path.interface_name, seq
-                    ),
-                );
-            }
+        send_on_path(path, packet.clone(), strategy, ctx, seq, payload.len() as u64);
+    }
+}
+
+fn send_on_path(
+    path: &transport::PathConnection,
+    packet: Arc<Bytes>,
+    strategy: &path_strategy::StrategyState,
+    ctx: &ClientCtx,
+    seq: u64,
+    payload_len: u64,
+) {
+    let packet_len = packet.len() as u64;
+    match path.send(packet) {
+        Ok(()) => {
+            strategy.record_interface_send(&path.interface_name, packet_len);
+            ctx.record_send(path.interface_name.clone(), payload_len);
+        }
+        Err(err) => {
+            ctx.record_send_error(path.interface_name.clone(), err.to_string());
+            ctx.send_failure(&path.interface_name, seq, &err.to_string());
+            strategy.degrade_to_redundant(
+                ctx,
+                format!(
+                    "send error interface={} sequence={} error={err}",
+                    path.interface_name, seq
+                ),
+            );
         }
     }
 }

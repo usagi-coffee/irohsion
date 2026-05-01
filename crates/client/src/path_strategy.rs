@@ -15,7 +15,7 @@ use crate::context::ClientCtx;
 use transport::HealthReport;
 
 const AUTO_SPLIT_HEALTH_STALE_MS: u64 = 2_500;
-const AUTO_SPLIT_DEGRADE_LAG_PACKETS: u64 = 32;
+const AUTO_SPLIT_DEGRADE_LAG_PACKETS: u64 = 800;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -283,7 +283,7 @@ impl StrategyState {
         }
     }
 
-    pub fn auto_split_interfaces(&self, interfaces: &[String]) -> Vec<String> {
+    pub fn auto_path_groups(&self, interfaces: &[String]) -> (Vec<String>, Vec<String>) {
         let health = self.health_by_interface.read();
         let fresh = interfaces
             .iter()
@@ -295,7 +295,7 @@ impl StrategyState {
             .collect::<Vec<_>>();
         let best_last_seq = fresh.iter().filter_map(|(_, last_seq)| *last_seq).max();
         let Some(best_last_seq) = best_last_seq else {
-            return interfaces.to_vec();
+            return (interfaces.to_vec(), Vec::new());
         };
 
         let healthy = fresh
@@ -307,11 +307,16 @@ impl StrategyState {
             })
             .map(|(interface, _)| interface)
             .collect::<Vec<_>>();
-        if healthy.len() >= 2 {
-            healthy
-        } else {
-            interfaces.to_vec()
+        if healthy.len() < 2 {
+            return (interfaces.to_vec(), Vec::new());
         }
+
+        let degraded = interfaces
+            .iter()
+            .filter(|interface| !healthy.iter().any(|healthy_interface| healthy_interface == *interface))
+            .cloned()
+            .collect::<Vec<_>>();
+        (healthy, degraded)
     }
 
     pub fn degrade_to_redundant(&self, ctx: &ClientCtx, reason: String) {
