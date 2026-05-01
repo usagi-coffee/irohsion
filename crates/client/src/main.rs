@@ -19,6 +19,7 @@ use cli::{InterfaceSpec, SecretArg, parse_interface_configs};
 use context::ClientCtx;
 use health::spawn_health_receivers;
 use iroh::{EndpointId, RelayUrl};
+use obs_remote::{ObsConfig, ObsRemote};
 use parking_lot::RwLock;
 use path_strategy::{PathStrategy, StrategyMode, spawn_strategy_loop};
 use preview::spawn_preview;
@@ -74,6 +75,18 @@ struct Cli {
     remote_preview_max_jpeg_bytes: usize,
     #[arg(long, default_value_t = 10)]
     remote_preview_decode_interval_secs: u64,
+    #[arg(long)]
+    obs_remote: bool,
+    #[arg(long, default_value = "127.0.0.1")]
+    obs_websocket_host: String,
+    #[arg(long, default_value_t = 4455)]
+    obs_websocket_port: u16,
+    #[arg(long)]
+    obs_websocket_password: Option<String>,
+    #[arg(long, default_value = "AdvOut")]
+    obs_recording_bitrate_category: String,
+    #[arg(long, default_value = "FFVBitrate")]
+    obs_recording_bitrate_name: String,
 }
 
 #[tokio::main]
@@ -193,6 +206,7 @@ async fn main() -> Result<()> {
     }
     spawn_interface_watchers(&paths, strategy.clone(), ctx.clone());
     spawn_reconnect_loops(&paths, &health_endpoint_ids, strategy.clone(), ctx.clone());
+    spawn_connection_liveness(&paths, &health_endpoint_ids, strategy.clone(), ctx.clone());
     {
         let strategy = strategy.clone();
         let ctx = ctx.clone();
@@ -235,6 +249,15 @@ async fn main() -> Result<()> {
         )
     });
     if cli.remote {
+        let obs = cli.obs_remote.then(|| {
+            ObsRemote::new(ObsConfig {
+                host: cli.obs_websocket_host.clone(),
+                port: cli.obs_websocket_port,
+                password: cli.obs_websocket_password.clone(),
+                recording_bitrate_category: cli.obs_recording_bitrate_category.clone(),
+                recording_bitrate_name: cli.obs_recording_bitrate_name.clone(),
+            })
+        });
         spawn_remote_server(
             RemoteConfig {
                 name: cli.remote_name.clone(),
@@ -244,6 +267,7 @@ async fn main() -> Result<()> {
             },
             strategy.clone(),
             preview.clone(),
+            obs,
             ctx.clone(),
         )
         .await?;
@@ -424,6 +448,44 @@ fn spawn_interface_watchers(
                             format!("interface unavailable, retrying: {err}"),
                         );
                     }
+                }
+            }
+        });
+    }
+}
+
+fn spawn_connection_liveness(
+    paths: &[transport::PathConnection],
+    endpoint_ids: &[String],
+    strategy: path_strategy::StrategyState,
+    ctx: ClientCtx,
+) {
+    for (path, endpoint_id) in paths.iter().cloned().zip(endpoint_ids.iter().cloned()) {
+        let strategy = strategy.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let Some(connection) = path.connection() else {
+                    continue;
+                };
+
+                ctx.record_connection_paths(path.interface_name.clone(), &endpoint_id, &connection);
+                let Some(reason) = connection.close_reason() else {
+                    continue;
+                };
+
+                let connection_id = connection.stable_id();
+                strategy.record_interface_reconnecting(&path.interface_name);
+                ctx.record_send_error(
+                    path.interface_name.clone(),
+                    format!("connection closed: {reason}"),
+                );
+                if let Some(endpoint) = path.mark_failed(Some(connection_id)) {
+                    tokio::spawn(async move {
+                        endpoint.close().await;
+                    });
                 }
             }
         });

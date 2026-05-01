@@ -1,17 +1,23 @@
 <script>
 	const SERVICE_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10001';
 	const STATUS_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10002';
+	const CONTROL_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10003';
 	const STATUS_OFFSET_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10006';
+	const OBS_SERVICE_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10011';
+	const OBS_STATUS_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10012';
+	const OBS_CONTROL_UUID = '8b4f82c8-4f5a-4e26-8f29-d1f0c0d10013';
 
-	/** @typedef {{ connect: () => Promise<BluetoothRemoteGATTServer> }} BluetoothRemoteGATT */
+	/** @typedef {{ connected?: boolean, connect: () => Promise<BluetoothRemoteGATTServer>, disconnect?: () => void }} BluetoothRemoteGATT */
 	/** @typedef {{ getCharacteristic: (uuid: string) => Promise<BluetoothRemoteGATTCharacteristic> }} BluetoothRemoteGATTService */
 	/** @typedef {{ readValue: () => Promise<DataView>, writeValue: (value: BufferSource) => Promise<void>, writeValueWithResponse?: (value: BufferSource) => Promise<void> }} BluetoothRemoteGATTCharacteristic */
-	/** @typedef {{ getPrimaryService: (uuid: string) => Promise<BluetoothRemoteGATTService> }} BluetoothRemoteGATTServer */
+	/** @typedef {{ connected?: boolean, disconnect?: () => void, getPrimaryService: (uuid: string) => Promise<BluetoothRemoteGATTService> }} BluetoothRemoteGATTServer */
 	/** @typedef {{ name?: string, gatt: BluetoothRemoteGATT, addEventListener: (event: 'gattserverdisconnected', handler: () => void) => void }} BluetoothDevice */
 	/** @typedef {{ requestDevice: (options: object) => Promise<BluetoothDevice> }} BluetoothApi */
 	/** @typedef {{ name: string, status?: 'connected' | 'reconnecting' | 'dead', tx_packets?: number, tx_bytes?: number, tx_mbps?: number, server_mbps?: number | null, server_last_seq?: number | null, server_max_seq?: number | null }} InterfaceStatus */
 	/** @typedef {{ mode: string, effective_strategy: string, packets: number, payload_bytes: number, interfaces: InterfaceStatus[] }} ControlStatus */
-	/** @typedef {{ control: ControlStatus }} RemoteStatus */
+	/** @typedef {{ enabled: boolean, decoding: boolean, jpeg_bytes: number, characteristic: string, offset_characteristic: string, chunk_bytes: number }} PreviewStatus */
+	/** @typedef {{ control: ControlStatus, preview?: PreviewStatus }} RemoteStatus */
+	/** @typedef {{ enabled: boolean, connected: boolean, host: string, port: number, last_error?: string | null, recording?: boolean | null, recording_bitrate_kbps?: number | null, recording_bitrate_category: string, recording_bitrate_name: string }} ObsStatus */
 
 	/** @type {BluetoothDevice | null} */
 	let device = $state(null);
@@ -19,16 +25,25 @@
 	let server = $state(null);
 	/** @type {RemoteStatus | null} */
 	let status = $state(null);
+	/** @type {ObsStatus | null} */
+	let obsStatus = $state(null);
 	let error = $state('');
+	let obsError = $state('');
+	let obsBitrate = $state('6000');
+	let editingObsBitrate = $state(false);
+	let previewUrl = $state('');
+	let previewBusy = false;
+	let previewObjectUrl = '';
 	let connecting = $state(false);
-	let polling = $state(true);
 	let readingStatus = false;
+	let obsBusy = $state(false);
 	/** @type {Promise<unknown>} */
 	let gattQueue = Promise.resolve();
 
-	let connected = $derived(Boolean(server));
+	let connected = $derived(isGattConnected(server));
 	let interfaces = $derived(getInterfaces(status));
 	let effectiveStrategy = $derived(getEffectiveStrategy(status));
+	let previewReady = $derived(isPreviewAvailable(status));
 
 	/** @param {RemoteStatus | null} value */
 	function getInterfaces(value) {
@@ -38,6 +53,16 @@
 	/** @param {RemoteStatus | null} value */
 	function getEffectiveStrategy(value) {
 		return value?.control.effective_strategy ?? 'redundant';
+	}
+
+	/** @param {RemoteStatus | null} value */
+	function isPreviewAvailable(value) {
+		return Boolean(value && value.preview?.enabled);
+	}
+
+	/** @param {BluetoothRemoteGATTServer | null} value */
+	function isGattConnected(value) {
+		return Boolean(value && value.connected);
 	}
 
 	async function connect() {
@@ -50,30 +75,73 @@
 
 			const selectedDevice = await bluetooth.requestDevice({
 				filters: [{ namePrefix: 'irohsion' }],
-				optionalServices: [SERVICE_UUID]
+				optionalServices: [SERVICE_UUID, OBS_SERVICE_UUID]
 			});
 			device = selectedDevice;
-			device.addEventListener('gattserverdisconnected', () => {
-				server = null;
-				status = null;
-			});
+			device.addEventListener('gattserverdisconnected', () => disconnectRemote('Bluetooth disconnected'));
 
-			server = await selectedDevice.gatt.connect();
-			await readStatus();
+			await reconnectGatt();
 		} catch (err) {
 			error = err instanceof Error ? err.message : String(err);
-			server = null;
+			disconnectRemote(error);
 		} finally {
 			connecting = false;
 		}
 	}
 
+	async function reconnectGatt() {
+		if (!device) return false;
+		try {
+			server = await device.gatt.connect();
+			await readStatus();
+			await readObsStatus();
+			await readPreview();
+			error = '';
+			return true;
+		} catch (err) {
+			disconnectRemote(err instanceof Error ? err.message : String(err));
+			return false;
+		}
+	}
+
+	/** @param {string} reason */
+	function disconnectRemote(reason = '') {
+		try {
+			disconnectGatt(server);
+		} catch {
+			// Browser GATT disconnect can throw if the underlying connection is already gone.
+		}
+		server = null;
+		status = null;
+		obsStatus = null;
+		readingStatus = false;
+		obsBusy = false;
+		previewBusy = false;
+		gattQueue = Promise.resolve();
+		setPreviewUrl('');
+		if (reason) error = reason;
+	}
+
+	async function ensureConnected() {
+		if (isGattConnected(server)) return true;
+		if (device && !connecting) return reconnectGatt();
+		disconnectRemote('Bluetooth disconnected');
+		return false;
+	}
+
+	/** @param {BluetoothRemoteGATTServer | null} value */
+	function disconnectGatt(value) {
+		if (value && value.disconnect) value.disconnect();
+	}
+
 	async function readStatus() {
-		if (!server || readingStatus) return;
+		if (readingStatus || !(await ensureConnected())) return;
 		readingStatus = true;
 
 		try {
 			await enqueueGatt(readStatusNow);
+		} catch (err) {
+			disconnectRemote(err instanceof Error ? err.message : String(err));
 		} finally {
 			readingStatus = false;
 		}
@@ -86,6 +154,101 @@
 		const characteristic = await retryGatt(() => service.getCharacteristic(STATUS_UUID));
 		const offsetCharacteristic = await retryGatt(() => service.getCharacteristic(STATUS_OFFSET_UUID));
 		status = await readJsonStatus(characteristic, offsetCharacteristic);
+	}
+
+	/** @param {boolean} enabled */
+	async function setPreviewEnabled(enabled) {
+		if (!(await ensureConnected())) return;
+		try {
+			await enqueueGatt(async () => {
+				const activeServer = server;
+				if (!activeServer) return;
+				const service = await retryGatt(() => activeServer.getPrimaryService(SERVICE_UUID));
+				const characteristic = await retryGatt(() => service.getCharacteristic(CONTROL_UUID));
+				await writeCharacteristic(characteristic, new TextEncoder().encode(JSON.stringify({ preview_enabled: enabled })));
+			});
+			await readStatus();
+			await readPreview();
+		} catch (err) {
+			disconnectRemote(err instanceof Error ? err.message : String(err));
+		}
+	}
+
+	async function readPreview() {
+		if (previewBusy || !status?.preview?.enabled || !status.preview.decoding || status.preview.jpeg_bytes <= 0 || !(await ensureConnected())) return;
+		previewBusy = true;
+		try {
+			await enqueueGatt(async () => {
+				const activeServer = server;
+				const preview = status?.preview;
+				if (!activeServer || !preview) return;
+				const service = await retryGatt(() => activeServer.getPrimaryService(SERVICE_UUID));
+				const characteristic = await retryGatt(() => service.getCharacteristic(preview.characteristic));
+				const offsetCharacteristic = await retryGatt(() => service.getCharacteristic(preview.offset_characteristic));
+				const bytes = await readChunkedCharacteristic(characteristic, offsetCharacteristic, preview.jpeg_bytes);
+				if (bytes.byteLength > 0) {
+					setPreviewUrl(URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' })));
+				}
+			});
+		} catch {
+			// Preview is best-effort; status polling must keep working even if a frame read races ffmpeg.
+		} finally {
+			previewBusy = false;
+		}
+	}
+
+	async function readObsStatus() {
+		if (!(await ensureConnected())) return;
+		try {
+			await enqueueGatt(async () => {
+				const activeServer = server;
+				if (!activeServer) return;
+				const service = await retryGatt(() => activeServer.getPrimaryService(OBS_SERVICE_UUID));
+				const characteristic = await retryGatt(() => service.getCharacteristic(OBS_STATUS_UUID));
+				const value = await readCharacteristic(characteristic);
+				const text = new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+				obsStatus = JSON.parse(text);
+				if (!editingObsBitrate) {
+					obsBitrate = String(obsStatus?.recording_bitrate_kbps ?? obsBitrate);
+				}
+				obsError = '';
+			});
+		} catch (err) {
+			obsStatus = null;
+			obsError = err instanceof Error ? err.message : String(err);
+		}
+	}
+
+	/** @param {object} command */
+	async function sendObsCommand(command) {
+		if (obsBusy || !(await ensureConnected())) return;
+		obsBusy = true;
+		obsError = '';
+		try {
+			await enqueueGatt(async () => {
+				const activeServer = server;
+				if (!activeServer) return;
+				const service = await retryGatt(() => activeServer.getPrimaryService(OBS_SERVICE_UUID));
+				const characteristic = await retryGatt(() => service.getCharacteristic(OBS_CONTROL_UUID));
+				await writeCharacteristic(characteristic, new TextEncoder().encode(JSON.stringify(command)));
+			});
+			await readObsStatus();
+		} catch (err) {
+			obsError = err instanceof Error ? err.message : String(err);
+			if (isGattDisconnectError(err)) disconnectRemote(obsError);
+		} finally {
+			obsBusy = false;
+		}
+	}
+
+	function setObsBitrate() {
+		const kbps = Number.parseInt(obsBitrate, 10);
+		if (!Number.isFinite(kbps) || kbps <= 0) {
+			obsError = 'Bitrate must be a positive number.';
+			return;
+		}
+		editingObsBitrate = false;
+		void sendObsCommand({ action: 'set_recording_bitrate', kbps });
 	}
 
 	/**
@@ -102,6 +265,12 @@
 	/** @param {number} ms */
 	function sleep(ms) {
 		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+
+	/** @param {unknown} err */
+	function isGattDisconnectError(err) {
+		const message = err instanceof Error ? err.message : String(err);
+		return /gatt|bluetooth|disconnect|device|network|closed|not connected/i.test(message);
 	}
 
 	/**
@@ -227,6 +396,27 @@
 		return interfaces.reduce((total, iface) => total + (iface.server_mbps ?? 0), 0);
 	}
 
+	/** @param {string | null | undefined} value */
+	function strategyLabel(value) {
+		if (value === 'split') return 'Split';
+		if (value === 'roundrobin') return 'Round';
+		return 'Redundant';
+	}
+
+	/** @param {string | null | undefined} value */
+	function strategyClasses(value) {
+		if (value === 'split') return 'bg-sky-300 text-black';
+		if (value === 'roundrobin') return 'bg-fuchsia-300 text-black';
+		return 'bg-amber-300 text-black';
+	}
+
+	/** @param {string} url */
+	function setPreviewUrl(url) {
+		if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+		previewObjectUrl = url;
+		previewUrl = url;
+	}
+
 	/** @param {number | null | undefined} value */
 	function formatSeq(value) {
 		return value == null ? '-' : String(value);
@@ -249,12 +439,31 @@
 	/** @param {Element} _node */
 	function pollRemote(_node) {
 		const statusInterval = setInterval(() => {
-			if (polling) void readStatus();
+			void readStatus();
+			void readObsStatus();
+			void readPreview();
 		}, 1000);
+		const recover = () => {
+			if (!document.hidden) void recoverConnection();
+		};
+		document.addEventListener('visibilitychange', recover);
+		window.addEventListener('focus', recover);
 
 		return () => {
 			clearInterval(statusInterval);
+			document.removeEventListener('visibilitychange', recover);
+			window.removeEventListener('focus', recover);
 		};
+	}
+
+	async function recoverConnection() {
+		if (isGattConnected(server)) {
+			void readStatus();
+			void readObsStatus();
+			void readPreview();
+			return;
+		}
+		if (device && !connecting) await reconnectGatt();
 	}
 </script>
 
@@ -279,17 +488,6 @@
 						]}
 					></span>
 				</button>
-				{#if status}
-					<button
-						class={[
-							'rounded-full px-3 py-2 text-xs font-black',
-							polling ? 'bg-emerald-400 text-black' : 'bg-neutral-950 text-neutral-400'
-						]}
-						onclick={() => (polling = !polling)}
-					>
-						{polling ? 'Poll' : 'Off'}
-					</button>
-				{/if}
 			</div>
 
 			<div class="flex min-w-0 flex-1 items-center justify-end gap-2 text-right">
@@ -323,13 +521,32 @@
 		{/if}
 
 		{#if status}
-			<section {@attach pollRemote} class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-3xl border border-white/10 bg-neutral-950 p-3">
-				<div class="min-w-0">
-					<p class="text-[0.6rem] font-bold text-neutral-500 uppercase">Auto strategy</p>
-					<p class="truncate text-xl font-black tracking-[-0.04em]">{effectiveStrategy}</p>
+			<section {@attach pollRemote} class="overflow-hidden rounded-3xl border border-white/10 bg-neutral-950">
+				<div class="aspect-video bg-black">
+					{#if previewUrl}
+						<img class="h-full w-full object-contain" src={previewUrl} alt="Decoded stream preview" />
+					{:else}
+						<div class="grid h-full place-items-center px-4 text-center text-sm font-bold text-neutral-600">
+							{previewReady ? 'Waiting for preview frame' : 'Preview disabled'}
+						</div>
+					{/if}
 				</div>
-				<div class="rounded-2xl bg-emerald-400 px-3 py-2 text-xs font-black text-black">
-					Auto
+				<div class="flex items-center justify-between gap-2 p-2">
+					<div>
+						<p class="text-[0.6rem] font-bold text-neutral-600 uppercase">Frame preview</p>
+						<p class="text-xs font-bold text-neutral-400">
+							{status.preview?.decoding ? `${status.preview.jpeg_bytes ?? 0} bytes` : 'decoder idle'}
+						</p>
+					</div>
+					<button
+						class={[
+							'rounded-2xl px-3 py-2 text-xs font-black',
+							status.preview?.decoding ? 'bg-emerald-400 text-black' : 'bg-neutral-800 text-neutral-300'
+						]}
+						onclick={() => setPreviewEnabled(!status?.preview?.decoding)}
+					>
+						{status.preview?.decoding ? 'Preview On' : 'Preview Off'}
+					</button>
 				</div>
 			</section>
 
@@ -341,7 +558,11 @@
 								<span class={['h-3 w-3 shrink-0 rounded-full shadow-[0_0_18px]', statusClasses(iface)]} title={statusLabel(iface)}></span>
 								<h2 class="min-w-0 truncate text-xl font-black tracking-[-0.05em]">{iface.name}</h2>
 							</div>
-							<div class="grid grid-cols-2 gap-1.5">
+							<div class="grid grid-cols-[auto_auto_auto] gap-1.5">
+								<div class={['rounded-2xl px-2 py-1.5 text-right', strategyClasses(effectiveStrategy)]}>
+									<p class="text-[0.55rem] font-black uppercase opacity-60">Mode</p>
+									<p class="text-xs font-black">{strategyLabel(effectiveStrategy)}</p>
+								</div>
 								<div class="min-w-16 rounded-2xl bg-black px-2 py-1.5 text-right">
 									<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">TX Mbps</p>
 									<p class="text-xs font-black text-emerald-400">{formatMbps(iface.tx_mbps)}</p>
@@ -369,6 +590,74 @@
 						</div>
 					</article>
 				{/each}
+			</section>
+
+			<section class="rounded-3xl border border-white/10 bg-neutral-950 p-3">
+				<div class="mb-3 flex items-center justify-between gap-3">
+					<div>
+						<p class="text-[0.6rem] font-bold text-neutral-500 uppercase">OBS Recording</p>
+						<p class="text-xl font-black tracking-[-0.05em]">
+							{obsStatus?.recording ? 'Recording' : obsStatus?.connected ? 'Ready' : 'Disconnected'}
+						</p>
+					</div>
+					<span
+						class={[
+							'h-3 w-3 rounded-full shadow-[0_0_18px]',
+							obsStatus?.recording
+								? 'bg-red-500 shadow-red-500/50'
+								: obsStatus?.connected
+									? 'bg-emerald-400 shadow-emerald-400/40'
+									: 'bg-neutral-700'
+						]}
+					></span>
+				</div>
+
+				<div class="grid grid-cols-2 gap-2">
+					<button
+						class="rounded-2xl bg-red-500 px-3 py-3 text-sm font-black text-white disabled:opacity-40"
+						disabled={!server || obsBusy}
+						onclick={() => sendObsCommand({ action: 'start_record' })}
+					>
+						Start Rec
+					</button>
+					<button
+						class="rounded-2xl bg-neutral-800 px-3 py-3 text-sm font-black text-white disabled:opacity-40"
+						disabled={!server || obsBusy}
+						onclick={() => sendObsCommand({ action: 'stop_record' })}
+					>
+						Stop Rec
+					</button>
+				</div>
+
+				<div class="mt-2 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+					<label class="rounded-2xl bg-black px-3 py-2">
+						<span class="block text-[0.55rem] font-bold text-neutral-600 uppercase">Recording bitrate kbps</span>
+						<input
+							class="w-full bg-transparent text-lg font-black text-neutral-100 outline-none"
+							inputmode="numeric"
+							bind:value={obsBitrate}
+							onfocus={() => (editingObsBitrate = true)}
+							oninput={() => (editingObsBitrate = true)}
+							onblur={() => (editingObsBitrate = false)}
+						/>
+					</label>
+					<button
+						class="rounded-2xl bg-sky-300 px-4 py-2 text-sm font-black text-black disabled:opacity-40"
+						disabled={!server || obsBusy}
+						onclick={setObsBitrate}
+					>
+						Set
+					</button>
+				</div>
+
+				{#if obsStatus}
+					<p class="mt-2 text-[0.65rem] font-bold text-neutral-600">
+						{obsStatus.host}:{obsStatus.port} · {obsStatus.recording_bitrate_category}/{obsStatus.recording_bitrate_name}
+					</p>
+				{/if}
+				{#if obsError}
+					<p class="mt-2 text-xs font-bold text-amber-300">{obsError}</p>
+				{/if}
 			</section>
 		{:else}
 			<section class="rounded-3xl border border-white/10 bg-neutral-950 p-5">

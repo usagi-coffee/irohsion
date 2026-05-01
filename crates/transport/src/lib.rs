@@ -25,7 +25,6 @@ const DEFAULT_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link";
 #[derive(Clone, Debug)]
 pub struct EndpointHealth {
     pub endpoint_id: String,
-    pub target_mbps: f32,
     pub achieved_mbps: f32,
     pub last_seq: Option<u64>,
     pub max_seq: Option<u64>,
@@ -307,9 +306,8 @@ pub fn encode_health_report(report: &HealthReport) -> Bytes {
     );
     for endpoint in &report.endpoints {
         payload.push_str(&format!(
-            "endpoint\t{}\t{:.4}\t{:.4}\t{}\t{}\n",
+            "endpoint\t{}\t{:.4}\t{}\t{}\n",
             endpoint.endpoint_id,
-            endpoint.target_mbps,
             endpoint.achieved_mbps,
             endpoint
                 .last_seq
@@ -359,28 +357,31 @@ pub fn decode_health_report(data: &[u8]) -> Result<HealthReport> {
         }
 
         let endpoint_id = fields.next().context("missing endpoint id")?.to_string();
-        let target_mbps = fields
-            .next()
-            .context("missing target throughput")?
-            .parse()
-            .context("invalid target throughput")?;
-        let achieved_mbps = fields
-            .next()
-            .context("missing achieved throughput")?
+        let values = fields.collect::<Vec<_>>();
+        let (achieved_mbps, last_seq_value, max_seq_value) = match values.as_slice() {
+            [achieved_mbps, last_seq] => (*achieved_mbps, Some(*last_seq), None),
+            [achieved_mbps, last_seq, max_seq] => (*achieved_mbps, Some(*last_seq), Some(*max_seq)),
+            // Backward-compatible with older rows:
+            // endpoint <id> <target_mbps> <achieved_mbps> <last_seq> <max_seq>
+            [_target_mbps, achieved_mbps, last_seq, max_seq] => {
+                (*achieved_mbps, Some(*last_seq), Some(*max_seq))
+            }
+            _ => bail!("invalid endpoint health row"),
+        };
+        let achieved_mbps = achieved_mbps
             .parse()
             .context("invalid achieved throughput")?;
-        let last_seq = match fields.next() {
+        let last_seq = match last_seq_value {
             Some("-") | None => None,
             Some(value) => Some(value.parse().context("invalid last_seq")?),
         };
-        let max_seq = match fields.next() {
+        let max_seq = match max_seq_value {
             Some("-") | None => last_seq,
             Some(value) => Some(value.parse().context("invalid max_seq")?),
         };
 
         endpoints.push(EndpointHealth {
             endpoint_id,
-            target_mbps,
             achieved_mbps,
             last_seq,
             max_seq,

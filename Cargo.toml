@@ -4,6 +4,7 @@ members = [
     "crates/protocol",
     "crates/transport",
     "crates/identity",
+    "crates/obs-remote",
     "crates/client",
     "crates/bench",
     "crates/server",
@@ -25,6 +26,8 @@ data-encoding = "2.10"
 iroh = { git = "https://github.com/usagi-coffee/iroh", branch = "bindtodevice" }
 libc = "0.2"
 modular-bitfield = "0.12"
+obs-remote = { path = "crates/obs-remote" }
+obws = "0.15"
 parking_lot = "0.12"
 protocol = { path = "crates/protocol" }
 transport = { path = "crates/transport" }

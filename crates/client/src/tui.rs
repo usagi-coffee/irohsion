@@ -54,7 +54,6 @@ pub struct ClientUiState {
     send_errors: Arc<AtomicU64>,
     last_ingest_from: Arc<RwLock<String>>,
     last_health_received: Arc<RwLock<Option<Instant>>>,
-    last_health_overall: Arc<RwLock<Option<f32>>>,
     paths: Arc<RwLock<BTreeMap<String, Vec<PathRow>>>>,
     logs: Arc<RwLock<VecDeque<String>>>,
     command_tx: Option<UnboundedSender<UiCommand>>,
@@ -64,10 +63,9 @@ pub struct ClientUiState {
 #[derive(Clone)]
 pub struct PathRow {
     pub endpoint_id: String,
-    pub target_mbps: Option<f32>,
     pub split_percentage: Option<f64>,
     pub server_mbps: String,
-    pub degradation: String,
+    pub last_health_at: Option<Instant>,
     pub remote_addr: String,
     pub transport: String,
     pub selected: bool,
@@ -85,10 +83,9 @@ pub fn describe_paths(connection: &iroh::endpoint::Connection, endpoint_id: &str
         .into_iter()
         .map(|path| PathRow {
             endpoint_id: endpoint_id.to_string(),
-            target_mbps: None,
             split_percentage: None,
             server_mbps: "-".to_string(),
-            degradation: "-".to_string(),
+            last_health_at: None,
             remote_addr: path.remote_addr().to_string(),
             transport: transport_kind(&path).to_string(),
             selected: path.is_selected(),
@@ -121,7 +118,6 @@ impl ClientUiState {
             send_errors: Arc::new(AtomicU64::new(0)),
             last_ingest_from: Arc::new(RwLock::new("-".to_string())),
             last_health_received: Arc::new(RwLock::new(None)),
-            last_health_overall: Arc::new(RwLock::new(None)),
             paths: Arc::new(RwLock::new(BTreeMap::new())),
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(128))),
             command_tx,
@@ -158,10 +154,9 @@ impl ClientUiState {
         if rows.is_empty() {
             rows.push(PathRow {
                 endpoint_id: "-".to_string(),
-                target_mbps: None,
                 split_percentage: None,
                 server_mbps: "-".to_string(),
-                degradation: "-".to_string(),
+                last_health_at: None,
                 remote_addr: error,
                 transport: "error".to_string(),
                 selected: false,
@@ -206,47 +201,22 @@ impl ClientUiState {
 
     pub fn record_endpoint_health(&self, endpoints: &[EndpointHealth]) {
         let mut throughput_by_endpoint = BTreeMap::new();
-        let mut target_by_endpoint = BTreeMap::new();
-        let mut total_target = 0.0_f32;
-        let mut total_achieved = 0.0_f32;
         for endpoint in endpoints {
             throughput_by_endpoint.insert(
                 endpoint.endpoint_id.clone(),
                 format!("{:.2}", endpoint.achieved_mbps),
             );
-            target_by_endpoint.insert(endpoint.endpoint_id.clone(), endpoint.target_mbps);
-            if endpoint.target_mbps > 0.0 {
-                total_target += endpoint.target_mbps;
-                total_achieved += endpoint.achieved_mbps.min(endpoint.target_mbps);
-            }
         }
-        *self.last_health_overall.write() = if total_target > 0.0 {
-            Some((1.0 - (total_achieved / total_target).min(1.0)).clamp(0.0, 1.0))
-        } else {
-            None
-        };
 
+        let now = Instant::now();
         for rows in self.paths.write().values_mut() {
             for row in rows {
-                row.target_mbps = target_by_endpoint.get(&row.endpoint_id).copied();
-                row.server_mbps = throughput_by_endpoint
-                    .get(&row.endpoint_id)
-                    .cloned()
-                    .unwrap_or_else(|| "-".to_string());
-                row.degradation = match row.target_mbps {
-                    Some(target_mbps) if target_mbps > 0.0 => row
-                        .server_mbps
-                        .parse::<f32>()
-                        .ok()
-                        .map(|server_mbps| {
-                            format!(
-                                "{:.2}",
-                                (1.0 - (server_mbps / target_mbps).min(1.0)).clamp(0.0, 1.0)
-                            )
-                        })
-                        .unwrap_or_else(|| "-".to_string()),
-                    _ => "-".to_string(),
-                };
+                if let Some(server_mbps) = throughput_by_endpoint.get(&row.endpoint_id) {
+                    row.server_mbps = server_mbps.clone();
+                    row.last_health_at = Some(now);
+                } else {
+                    row.server_mbps = "-".to_string();
+                }
             }
         }
     }
@@ -456,12 +426,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         .map(|at| format!("{:.1}s ago", now.duration_since(at).as_secs_f64()))
         .unwrap_or_else(|| "-".to_string());
     header_lines.push(Line::from(format!("last health {}", last_health)));
-    let health_overall = state
-        .last_health_overall
-        .read()
-        .map(|overall| format!("{overall:.2}"))
-        .unwrap_or_else(|| "-".to_string());
-    header_lines.push(Line::from(format!("health {}", health_overall)));
 
     let header = Paragraph::new(header_lines)
         .block(Block::default().borders(Borders::ALL).title("Overview"))
@@ -509,7 +473,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
                         .unwrap_or_else(|| "-".to_string()),
                 ),
                 Cell::from(row.server_mbps.clone()),
-                Cell::from(row.degradation.clone()),
+                Cell::from(format_health_age(row.last_health_at)),
                 Cell::from(row.transport.clone()),
                 Cell::from(if row.selected { "yes" } else { "no" }),
                 Cell::from(row.status.clone()),
@@ -582,4 +546,16 @@ fn fmt_uptime(elapsed: Duration) -> String {
 
 fn short_endpoint(endpoint_id: &str) -> String {
     endpoint_id.chars().take(ENDPOINT_PREFIX_LEN).collect()
+}
+
+fn format_health_age(last_health_at: Option<Instant>) -> String {
+    let Some(last_health_at) = last_health_at else {
+        return "-".to_string();
+    };
+    let elapsed = last_health_at.elapsed();
+    if elapsed.as_secs() < 60 {
+        format!("{}s ago", elapsed.as_secs())
+    } else {
+        format!("{}m ago", elapsed.as_secs() / 60)
+    }
 }

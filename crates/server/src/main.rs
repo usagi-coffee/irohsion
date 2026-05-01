@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{ArgAction, Parser};
-use cli::{EndpointTarget, SecretArg, endpoint_targets, local_udp_dest, relay_mode};
+use cli::{SecretArg, local_udp_dest, relay_mode};
 use context::ServerCtx;
 use health::{
     HealthConnections, HealthStats, HealthTargets, health_loop, maintain_health_connection,
@@ -34,8 +34,6 @@ const RESTART_CONFIRM_PACKETS: usize = protocol::MAX_FRAGMENTS + 1;
 struct Cli {
     #[arg(long)]
     port: u16,
-    #[arg(long = "endpoint-target")]
-    endpoint_targets: Vec<EndpointTarget>,
     #[arg(long, default_value_t = 1000)]
     health_interval_ms: u64,
     #[arg(long = "relay")]
@@ -116,7 +114,6 @@ struct BufferedPacket {
 #[derive(Clone)]
 struct RegisteredConnection {
     connection: iroh::endpoint::Connection,
-    stable_id: usize,
 }
 
 #[derive(Default)]
@@ -125,7 +122,7 @@ struct RestartDetector {
     highest_seq: u64,
 }
 
-type ConnectionRegistry = Arc<RwLock<BTreeMap<String, RegisteredConnection>>>;
+type ConnectionRegistry = Arc<RwLock<BTreeMap<String, BTreeMap<usize, RegisteredConnection>>>>;
 type ReplyRoutes = Arc<RwLock<Vec<String>>>;
 
 #[tokio::main]
@@ -141,8 +138,6 @@ async fn main() -> Result<()> {
     let secret_key = cli.secret.resolve();
     let udp_dest = local_udp_dest(cli.port);
     let relays = cli.relays.clone();
-    let endpoint_targets = Arc::new(endpoint_targets(&cli.endpoint_targets));
-
     let ui = cli
         .tui
         .then(|| tui::ServerUi::spawn(tui::ServerUiState::new(udp_dest.to_string())));
@@ -210,10 +205,9 @@ async fn main() -> Result<()> {
     {
         let health_connections = health_connections.clone();
         let health_stats = health_stats.clone();
-        let endpoint_targets = endpoint_targets.clone();
         let interval = Duration::from_millis(cli.health_interval_ms);
         tasks.push(tokio::spawn(async move {
-            let _ = health_loop(health_connections, health_stats, endpoint_targets, interval).await;
+            let _ = health_loop(health_connections, health_stats, interval).await;
         }));
     }
 
@@ -250,13 +244,16 @@ async fn main() -> Result<()> {
             let remote = connection.remote_id();
             let remote_key = remote.to_string();
             let stable_id = connection.stable_id();
-            connections.write().insert(
-                remote_key.clone(),
-                RegisteredConnection {
-                    connection: connection.clone(),
+            connections
+                .write()
+                .entry(remote_key.clone())
+                .or_default()
+                .insert(
                     stable_id,
-                },
-            );
+                    RegisteredConnection {
+                        connection: connection.clone(),
+                    },
+                );
             let should_spawn_health = {
                 let mut targets = health_targets.write();
                 targets.insert(remote_key.clone())
@@ -694,16 +691,42 @@ async fn response_loop(
             continue;
         }
 
+        let mut sent = false;
         for remote in remotes {
-            let connection = connections
+            let remote_connections = connections
                 .read()
                 .get(&remote)
-                .map(|registered| registered.connection.clone());
-            let Some(connection) = connection else {
-                continue;
-            };
+                .map(|connections| {
+                    connections
+                        .iter()
+                        .rev()
+                        .map(|(stable_id, registered)| (*stable_id, registered.connection.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
 
-            if connection.send_datagram(payload.clone()).is_ok() {
+            let mut failed = Vec::new();
+            for (stable_id, connection) in remote_connections {
+                match connection.send_datagram(payload.clone()) {
+                    Ok(()) => {
+                        sent = true;
+                        break;
+                    }
+                    Err(_) => failed.push(stable_id),
+                }
+            }
+            if !failed.is_empty() {
+                let mut connections = connections.write();
+                if let Some(remote_connections) = connections.get_mut(&remote) {
+                    for stable_id in failed {
+                        remote_connections.remove(&stable_id);
+                    }
+                    if remote_connections.is_empty() {
+                        connections.remove(&remote);
+                    }
+                }
+            }
+            if sent {
                 break;
             }
         }
@@ -712,11 +735,11 @@ async fn response_loop(
 
 fn remove_connection_if_current(connections: &ConnectionRegistry, remote: &str, stable_id: usize) {
     let mut connections = connections.write();
-    if connections
-        .get(remote)
-        .is_some_and(|connection| connection.stable_id == stable_id)
-    {
-        connections.remove(remote);
+    if let Some(remote_connections) = connections.get_mut(remote) {
+        remote_connections.remove(&stable_id);
+        if remote_connections.is_empty() {
+            connections.remove(remote);
+        }
     }
 }
 

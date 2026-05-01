@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,7 +29,6 @@ pub struct EndpointSample {
 pub async fn health_loop(
     health_connections: HealthConnections,
     health_stats: HealthStats,
-    endpoint_targets: Arc<BTreeMap<String, f32>>,
     interval: Duration,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
@@ -41,7 +40,7 @@ pub async fn health_loop(
             continue;
         }
 
-        let report = build_health_report(seq, &health_stats, &endpoint_targets, interval)?;
+        let report = build_health_report(seq, &health_stats, &connections, interval)?;
         seq = seq.wrapping_add(1);
         let payload = encode_health_report(&report);
         let mut failed = Vec::new();
@@ -124,25 +123,19 @@ pub fn record_health_sample(health_stats: &HealthStats, remote: &str, bytes: u64
 fn build_health_report(
     seq: u64,
     health_stats: &HealthStats,
-    endpoint_targets: &BTreeMap<String, f32>,
+    health_connections: &BTreeMap<String, HealthConnection>,
     interval: Duration,
 ) -> Result<HealthReport> {
     let interval_secs = interval.as_secs_f32().max(0.001);
     let mut drained = health_stats.write();
-    let endpoint_ids = endpoint_targets
-        .keys()
-        .cloned()
-        .chain(drained.keys().cloned())
-        .collect::<BTreeSet<_>>();
+    let endpoint_ids = health_connections.keys().cloned().collect::<Vec<_>>();
     let mut endpoints = Vec::with_capacity(endpoint_ids.len());
 
     for endpoint_id in endpoint_ids {
         let sample = drained.remove(&endpoint_id).unwrap_or_default();
-        let target_mbps = endpoint_targets.get(&endpoint_id).copied().unwrap_or(0.0);
         let achieved_mbps = sample.bytes as f32 * 8.0 / interval_secs / 1_000_000.0;
         endpoints.push(EndpointHealth {
             endpoint_id: endpoint_id.clone(),
-            target_mbps,
             achieved_mbps,
             last_seq: sample.last_seq,
             max_seq: sample.max_seq,

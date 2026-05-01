@@ -17,6 +17,7 @@ use bluer::{
     },
 };
 use iroh::{EndpointId, RelayUrl};
+use obs_remote::{ObsRemote, parse_command as parse_obs_command};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
@@ -32,6 +33,9 @@ pub const CONTROL_UUID: Uuid = Uuid::from_u128(0x8b4f_82c8_4f5a_4e26_8f29_d1f0c0
 pub const PREVIEW_UUID: Uuid = Uuid::from_u128(0x8b4f_82c8_4f5a_4e26_8f29_d1f0c0d10004);
 pub const PREVIEW_OFFSET_UUID: Uuid = Uuid::from_u128(0x8b4f_82c8_4f5a_4e26_8f29_d1f0c0d10005);
 pub const STATUS_OFFSET_UUID: Uuid = Uuid::from_u128(0x8b4f_82c8_4f5a_4e26_8f29_d1f0c0d10006);
+pub const OBS_SERVICE_UUID: Uuid = Uuid::from_u128(0x8b4f_82c8_4f5a_4e26_8f29_d1f0c0d10011);
+pub const OBS_STATUS_UUID: Uuid = Uuid::from_u128(0x8b4f_82c8_4f5a_4e26_8f29_d1f0c0d10012);
+pub const OBS_CONTROL_UUID: Uuid = Uuid::from_u128(0x8b4f_82c8_4f5a_4e26_8f29_d1f0c0d10013);
 
 const PREVIEW_CHUNK_BYTES: usize = 500;
 const STATUS_CHUNK_BYTES: usize = 500;
@@ -51,6 +55,7 @@ pub async fn spawn_remote_server(
     config: RemoteConfig,
     strategy: StrategyState,
     preview: Option<PreviewState>,
+    obs: Option<ObsRemote>,
     ctx: ClientCtx,
 ) -> Result<()> {
     let session = bluer::Session::new()
@@ -66,7 +71,9 @@ pub async fn spawn_remote_server(
         .context("failed to power Bluetooth adapter")?;
 
     let advertisement = Advertisement {
-        service_uuids: vec![SERVICE_UUID].into_iter().collect(),
+        // Keep advertising small and stable. The OBS service is still exposed in GATT and requested
+        // by the web app as an optional service after connecting to the primary remote.
+        service_uuids: [SERVICE_UUID].into_iter().collect(),
         discoverable: Some(true),
         local_name: Some(config.name.clone()),
         ..Default::default()
@@ -99,35 +106,164 @@ pub async fn spawn_remote_server(
     let preview_snapshot_read = preview_snapshot.clone();
     let preview_snapshot_write = preview_snapshot.clone();
     let preview_write = preview.clone();
-    let app = Application {
-        services: vec![Service {
-            uuid: SERVICE_UUID,
+    let obs_status = obs.clone();
+    let obs_control = obs.clone();
+    let mut services = vec![Service {
+        uuid: SERVICE_UUID,
+        primary: true,
+        characteristics: vec![
+            Characteristic {
+                uuid: STATUS_UUID,
+                read: Some(CharacteristicRead {
+                    read: true,
+                    fun: Box::new(move |request| {
+                        let config = read_config.clone();
+                        let strategy = read_strategy.clone();
+                        let preview = read_preview.clone();
+                        let status_offset = status_offset_read.clone();
+                        let status_snapshot = status_snapshot_read.clone();
+                        Box::pin(async move {
+                            let mut snapshot = status_snapshot.read().clone();
+                            if snapshot.is_empty() {
+                                snapshot =
+                                    build_status_payload(&config, &strategy, preview.as_ref())?;
+                                *status_snapshot.write() = snapshot.clone();
+                            }
+                            let max_len = (request.mtu.saturating_sub(1).max(1) as usize)
+                                .min(STATUS_CHUNK_BYTES);
+                            Ok(chunk_bytes(
+                                &snapshot,
+                                status_offset.load(Ordering::Relaxed),
+                                max_len,
+                            ))
+                        }) as ReadFuture
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Characteristic {
+                uuid: STATUS_OFFSET_UUID,
+                write: Some(CharacteristicWrite {
+                    write: true,
+                    method: CharacteristicWriteMethod::Fun(Box::new(move |value, _| {
+                        let status_offset = status_offset_write.clone();
+                        let status_snapshot = status_snapshot_write.clone();
+                        let config = status_write_config.clone();
+                        let strategy = status_write_strategy.clone();
+                        let preview = status_write_preview.clone();
+                        Box::pin(async move {
+                            let offset = parse_u32_offset(&value)?;
+                            if offset == 0 {
+                                *status_snapshot.write() =
+                                    build_status_payload(&config, &strategy, preview.as_ref())?;
+                            }
+                            status_offset.store(offset, Ordering::Relaxed);
+                            Ok(())
+                        }) as WriteFuture
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Characteristic {
+                uuid: CONTROL_UUID,
+                write: Some(CharacteristicWrite {
+                    write: true,
+                    write_without_response: true,
+                    method: CharacteristicWriteMethod::Fun(Box::new(move |value, _| {
+                        let strategy = write_strategy.clone();
+                        let ctx = write_ctx.clone();
+                        let preview = write_preview_control.clone();
+                        Box::pin(async move {
+                            let patch = serde_json::from_slice::<ControlPatch>(&value)
+                                .map_err(|_| ReqError::InvalidValueLength)?;
+                            if let Some(enabled) = patch.preview_enabled {
+                                if let Some(preview) = &preview {
+                                    preview.set_enabled(enabled);
+                                }
+                            }
+                            strategy.apply_patch(patch, &ctx);
+                            Ok(())
+                        }) as WriteFuture
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Characteristic {
+                uuid: PREVIEW_UUID,
+                read: Some(CharacteristicRead {
+                    read: true,
+                    fun: Box::new(move |request| {
+                        let preview = preview_read.clone();
+                        let preview_offset = preview_offset_read.clone();
+                        let preview_snapshot = preview_snapshot_read.clone();
+                        Box::pin(async move {
+                            let Some(preview) = preview else {
+                                return Ok(Vec::new());
+                            };
+                            let mut snapshot = preview_snapshot.read().clone();
+                            if snapshot.is_empty() {
+                                snapshot = preview.latest_jpeg();
+                                *preview_snapshot.write() = snapshot.clone();
+                            }
+                            let max_len = (request.mtu.saturating_sub(1).max(1) as usize)
+                                .min(PREVIEW_CHUNK_BYTES);
+                            Ok(chunk_bytes(
+                                &snapshot,
+                                preview_offset.load(Ordering::Relaxed),
+                                max_len,
+                            ))
+                        }) as ReadFuture
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Characteristic {
+                uuid: PREVIEW_OFFSET_UUID,
+                write: Some(CharacteristicWrite {
+                    write: true,
+                    method: CharacteristicWriteMethod::Fun(Box::new(move |value, _| {
+                        let preview_offset = preview_offset_write.clone();
+                        let preview_snapshot = preview_snapshot_write.clone();
+                        let preview = preview_write.clone();
+                        Box::pin(async move {
+                            let offset = parse_u32_offset(&value)?;
+                            if offset == 0 {
+                                *preview_snapshot.write() = preview
+                                    .as_ref()
+                                    .map_or_else(Vec::new, PreviewState::latest_jpeg);
+                            }
+                            preview_offset.store(offset, Ordering::Relaxed);
+                            Ok(())
+                        }) as WriteFuture
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }];
+    if obs.is_some() {
+        services.push(Service {
+            uuid: OBS_SERVICE_UUID,
             primary: true,
             characteristics: vec![
                 Characteristic {
-                    uuid: STATUS_UUID,
+                    uuid: OBS_STATUS_UUID,
                     read: Some(CharacteristicRead {
                         read: true,
-                        fun: Box::new(move |request| {
-                            let config = read_config.clone();
-                            let strategy = read_strategy.clone();
-                            let preview = read_preview.clone();
-                            let status_offset = status_offset_read.clone();
-                            let status_snapshot = status_snapshot_read.clone();
+                        fun: Box::new(move |_| {
+                            let obs = obs_status.clone();
                             Box::pin(async move {
-                                let mut snapshot = status_snapshot.read().clone();
-                                if snapshot.is_empty() {
-                                    snapshot =
-                                        build_status_payload(&config, &strategy, preview.as_ref())?;
-                                    *status_snapshot.write() = snapshot.clone();
-                                }
-                                let max_len = (request.mtu.saturating_sub(1).max(1) as usize)
-                                    .min(STATUS_CHUNK_BYTES);
-                                Ok(chunk_bytes(
-                                    &snapshot,
-                                    status_offset.load(Ordering::Relaxed),
-                                    max_len,
-                                ))
+                                let Some(obs) = obs else {
+                                    return Ok(Vec::new());
+                                };
+                                serde_json::to_vec(&obs.status().await)
+                                    .map_err(|_| ReqError::Failed)
                             }) as ReadFuture
                         }),
                         ..Default::default()
@@ -135,100 +271,19 @@ pub async fn spawn_remote_server(
                     ..Default::default()
                 },
                 Characteristic {
-                    uuid: STATUS_OFFSET_UUID,
-                    write: Some(CharacteristicWrite {
-                        write: true,
-                        method: CharacteristicWriteMethod::Fun(Box::new(move |value, _| {
-                            let status_offset = status_offset_write.clone();
-                            let status_snapshot = status_snapshot_write.clone();
-                            let config = status_write_config.clone();
-                            let strategy = status_write_strategy.clone();
-                            let preview = status_write_preview.clone();
-                            Box::pin(async move {
-                                let offset = parse_u32_offset(&value)?;
-                                if offset == 0 {
-                                    *status_snapshot.write() =
-                                        build_status_payload(&config, &strategy, preview.as_ref())?;
-                                }
-                                status_offset.store(offset, Ordering::Relaxed);
-                                Ok(())
-                            }) as WriteFuture
-                        })),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                Characteristic {
-                    uuid: CONTROL_UUID,
+                    uuid: OBS_CONTROL_UUID,
                     write: Some(CharacteristicWrite {
                         write: true,
                         write_without_response: true,
                         method: CharacteristicWriteMethod::Fun(Box::new(move |value, _| {
-                            let strategy = write_strategy.clone();
-                            let ctx = write_ctx.clone();
-                            let preview = write_preview_control.clone();
+                            let obs = obs_control.clone();
                             Box::pin(async move {
-                                let patch = serde_json::from_slice::<ControlPatch>(&value)
-                                    .map_err(|_| ReqError::InvalidValueLength)?;
-                                if let Some(enabled) = patch.preview_enabled {
-                                    if let Some(preview) = &preview {
-                                        preview.set_enabled(enabled);
-                                    }
-                                }
-                                strategy.apply_patch(patch, &ctx);
-                                Ok(())
-                            }) as WriteFuture
-                        })),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                Characteristic {
-                    uuid: PREVIEW_UUID,
-                    read: Some(CharacteristicRead {
-                        read: true,
-                        fun: Box::new(move |request| {
-                            let preview = preview_read.clone();
-                            let preview_offset = preview_offset_read.clone();
-                            let preview_snapshot = preview_snapshot_read.clone();
-                            Box::pin(async move {
-                                let Some(preview) = preview else {
-                                    return Ok(Vec::new());
+                                let Some(obs) = obs else {
+                                    return Err(ReqError::NotSupported);
                                 };
-                                let mut snapshot = preview_snapshot.read().clone();
-                                if snapshot.is_empty() {
-                                    snapshot = preview.latest_jpeg();
-                                    *preview_snapshot.write() = snapshot.clone();
-                                }
-                                let max_len = (request.mtu.saturating_sub(1).max(1) as usize)
-                                    .min(PREVIEW_CHUNK_BYTES);
-                                Ok(chunk_bytes(
-                                    &snapshot,
-                                    preview_offset.load(Ordering::Relaxed),
-                                    max_len,
-                                ))
-                            }) as ReadFuture
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                Characteristic {
-                    uuid: PREVIEW_OFFSET_UUID,
-                    write: Some(CharacteristicWrite {
-                        write: true,
-                        method: CharacteristicWriteMethod::Fun(Box::new(move |value, _| {
-                            let preview_offset = preview_offset_write.clone();
-                            let preview_snapshot = preview_snapshot_write.clone();
-                            let preview = preview_write.clone();
-                            Box::pin(async move {
-                                let offset = parse_u32_offset(&value)?;
-                                if offset == 0 {
-                                    *preview_snapshot.write() = preview
-                                        .as_ref()
-                                        .map_or_else(Vec::new, PreviewState::latest_jpeg);
-                                }
-                                preview_offset.store(offset, Ordering::Relaxed);
+                                let command = parse_obs_command(&value)
+                                    .map_err(|_| ReqError::InvalidValueLength)?;
+                                obs.apply(command).await.map_err(|_| ReqError::Failed)?;
                                 Ok(())
                             }) as WriteFuture
                         })),
@@ -238,7 +293,10 @@ pub async fn spawn_remote_server(
                 },
             ],
             ..Default::default()
-        }],
+        });
+    }
+    let app = Application {
+        services,
         ..Default::default()
     };
     let app_handle = adapter

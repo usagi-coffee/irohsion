@@ -88,7 +88,6 @@ pub struct StrategyState {
     packets: Arc<AtomicU64>,
     payload_bytes: Arc<AtomicU64>,
     round_robin_cursor: Arc<AtomicU64>,
-    targets_mbps: Arc<RwLock<BTreeMap<String, Option<f64>>>>,
     endpoint_ids_by_interface: Arc<RwLock<BTreeMap<String, String>>>,
     split_percentages: Arc<RwLock<BTreeMap<String, Option<f64>>>>,
     health_by_interface: Arc<RwLock<BTreeMap<String, InterfaceHealth>>>,
@@ -135,7 +134,7 @@ impl StrategyState {
     }
 
     pub fn status(&self) -> ControlStatus {
-        let targets = self.targets_mbps.read();
+        let endpoint_ids = self.endpoint_ids_by_interface.read();
         let health = self.health_by_interface.read();
         let statuses = self.interface_status.read();
         let mut traffic = self.interface_traffic.write();
@@ -148,9 +147,9 @@ impl StrategyState {
             monitor_packets: self.monitor_packets.load(Ordering::Relaxed),
             packets: self.packets.load(Ordering::Relaxed),
             payload_bytes: self.payload_bytes.load(Ordering::Relaxed),
-            interfaces: targets
+            interfaces: endpoint_ids
                 .iter()
-                .map(|(name, _)| {
+                .map(|(name, _endpoint_id)| {
                     let counters = traffic.get(name).copied().unwrap_or_default();
                     let health = health.get(name);
                     InterfaceControlStatus {
@@ -266,7 +265,12 @@ impl StrategyState {
     }
 
     pub fn effective_split_percentages(&self) -> BTreeMap<String, f64> {
-        let interfaces = self.targets_mbps.read().keys().cloned().collect::<Vec<_>>();
+        let interfaces = self
+            .endpoint_ids_by_interface
+            .read()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         let weights = self.split_weights(&interfaces);
         interfaces
             .into_iter()
@@ -391,10 +395,6 @@ pub fn spawn_strategy_loop(
     recover_backlog_bytes: u64,
     ctx: ClientCtx,
 ) -> StrategyState {
-    let targets_mbps = interfaces
-        .iter()
-        .map(|(interface, _)| (interface.clone(), None))
-        .collect();
     let endpoint_ids_by_interface = interfaces
         .iter()
         .map(|(interface, endpoint_id)| (interface.clone(), endpoint_id.clone()))
@@ -418,7 +418,6 @@ pub fn spawn_strategy_loop(
         packets: Arc::new(AtomicU64::new(0)),
         payload_bytes: Arc::new(AtomicU64::new(0)),
         round_robin_cursor: Arc::new(AtomicU64::new(0)),
-        targets_mbps: Arc::new(RwLock::new(targets_mbps)),
         endpoint_ids_by_interface: Arc::new(RwLock::new(endpoint_ids_by_interface)),
         split_percentages: Arc::new(RwLock::new(split_percentages)),
         health_by_interface: Arc::new(RwLock::new(BTreeMap::new())),
