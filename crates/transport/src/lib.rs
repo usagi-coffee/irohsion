@@ -24,6 +24,7 @@ pub struct EndpointHealth {
     pub endpoint_id: String,
     pub target_mbps: f32,
     pub achieved_mbps: f32,
+    pub last_seq: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -162,8 +163,14 @@ pub fn encode_health_report(report: &HealthReport) -> Bytes {
     );
     for endpoint in &report.endpoints {
         payload.push_str(&format!(
-            "endpoint\t{}\t{:.4}\t{:.4}\n",
-            endpoint.endpoint_id, endpoint.target_mbps, endpoint.achieved_mbps
+            "endpoint\t{}\t{:.4}\t{:.4}\t{}\n",
+            endpoint.endpoint_id,
+            endpoint.target_mbps,
+            endpoint.achieved_mbps,
+            endpoint
+                .last_seq
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
         ));
     }
     Bytes::from(payload)
@@ -215,6 +222,10 @@ pub fn decode_health_report(data: &[u8]) -> Result<HealthReport> {
                 .context("missing achieved throughput")?
                 .parse()
                 .context("invalid achieved throughput")?,
+            last_seq: match fields.next() {
+                Some("-") | None => None,
+                Some(value) => Some(value.parse().context("invalid last_seq")?),
+            },
         });
     }
 

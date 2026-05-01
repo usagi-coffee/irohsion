@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::context::ClientCtx;
+use transport::HealthReport;
+
+const AUTO_SPLIT_HEALTH_STALE_MS: u64 = 2_500;
+const AUTO_SPLIT_DEGRADE_LAG_PACKETS: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -79,8 +83,16 @@ pub struct StrategyState {
     payload_bytes: Arc<AtomicU64>,
     round_robin_cursor: Arc<AtomicU64>,
     targets_mbps: Arc<RwLock<BTreeMap<String, Option<f64>>>>,
+    endpoint_ids_by_interface: Arc<RwLock<BTreeMap<String, String>>>,
     split_percentages: Arc<RwLock<BTreeMap<String, Option<f64>>>>,
+    health_by_interface: Arc<RwLock<BTreeMap<String, InterfaceHealth>>>,
     interface_traffic: Arc<RwLock<BTreeMap<String, InterfaceTraffic>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InterfaceHealth {
+    last_seq: Option<u64>,
+    last_unix_ms: u64,
 }
 
 impl StrategyState {
@@ -250,6 +262,58 @@ impl StrategyState {
             .collect()
     }
 
+    pub fn record_health_report(&self, report: &HealthReport) {
+        let endpoint_ids = self.endpoint_ids_by_interface.read().clone();
+        let endpoints = report
+            .endpoints
+            .iter()
+            .map(|endpoint| (endpoint.endpoint_id.as_str(), endpoint.last_seq))
+            .collect::<BTreeMap<_, _>>();
+        let mut health = self.health_by_interface.write();
+        for (interface, endpoint_id) in endpoint_ids {
+            if let Some(last_seq) = endpoints.get(endpoint_id.as_str()) {
+                health.insert(
+                    interface,
+                    InterfaceHealth {
+                        last_seq: *last_seq,
+                        last_unix_ms: report.unix_ms,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn auto_split_interfaces(&self, interfaces: &[String]) -> Vec<String> {
+        let health = self.health_by_interface.read();
+        let fresh = interfaces
+            .iter()
+            .filter_map(|interface| {
+                let state = health.get(interface)?;
+                let age_ms = unix_ms_now().saturating_sub(state.last_unix_ms);
+                (age_ms <= AUTO_SPLIT_HEALTH_STALE_MS).then_some((interface.clone(), state.last_seq))
+            })
+            .collect::<Vec<_>>();
+        let best_last_seq = fresh.iter().filter_map(|(_, last_seq)| *last_seq).max();
+        let Some(best_last_seq) = best_last_seq else {
+            return interfaces.to_vec();
+        };
+
+        let healthy = fresh
+            .into_iter()
+            .filter(|(_, last_seq)| {
+                last_seq.is_some_and(|seq| {
+                    best_last_seq.saturating_sub(seq) <= AUTO_SPLIT_DEGRADE_LAG_PACKETS
+                })
+            })
+            .map(|(interface, _)| interface)
+            .collect::<Vec<_>>();
+        if healthy.len() >= 2 {
+            healthy
+        } else {
+            interfaces.to_vec()
+        }
+    }
+
     pub fn degrade_to_redundant(&self, ctx: &ClientCtx, reason: String) {
         if self.mode() != StrategyMode::Auto {
             return;
@@ -269,7 +333,7 @@ impl StrategyState {
 }
 
 pub fn spawn_strategy_loop(
-    interfaces: Vec<String>,
+    interfaces: Vec<(String, String)>,
     poll_interval: Duration,
     degrade_backlog_bytes: u64,
     recover_backlog_bytes: u64,
@@ -277,15 +341,19 @@ pub fn spawn_strategy_loop(
 ) -> StrategyState {
     let targets_mbps = interfaces
         .iter()
-        .map(|interface| (interface.clone(), None))
+        .map(|(interface, _)| (interface.clone(), None))
+        .collect();
+    let endpoint_ids_by_interface = interfaces
+        .iter()
+        .map(|(interface, endpoint_id)| (interface.clone(), endpoint_id.clone()))
         .collect();
     let split_percentages = interfaces
         .iter()
-        .map(|interface| (interface.clone(), None))
+        .map(|(interface, _)| (interface.clone(), None))
         .collect();
     let interface_traffic = interfaces
         .iter()
-        .map(|interface| (interface.clone(), InterfaceTraffic::default()))
+        .map(|(interface, _)| (interface.clone(), InterfaceTraffic::default()))
         .collect();
     let state = StrategyState {
         mode: Arc::new(AtomicU8::new(StrategyMode::Auto as u8)),
@@ -295,7 +363,9 @@ pub fn spawn_strategy_loop(
         payload_bytes: Arc::new(AtomicU64::new(0)),
         round_robin_cursor: Arc::new(AtomicU64::new(0)),
         targets_mbps: Arc::new(RwLock::new(targets_mbps)),
+        endpoint_ids_by_interface: Arc::new(RwLock::new(endpoint_ids_by_interface)),
         split_percentages: Arc::new(RwLock::new(split_percentages)),
+        health_by_interface: Arc::new(RwLock::new(BTreeMap::new())),
         interface_traffic: Arc::new(RwLock::new(interface_traffic)),
     };
     ctx.record_split_percentages(&state.effective_split_percentages());
@@ -352,7 +422,7 @@ impl InterfaceTraffic {
 }
 
 async fn strategy_loop(
-    interfaces: Vec<String>,
+    interfaces: Vec<(String, String)>,
     poll_interval: Duration,
     degrade_backlog_bytes: u64,
     recover_backlog_bytes: u64,
@@ -367,7 +437,7 @@ async fn strategy_loop(
         }
 
         let mut worst = None::<(&str, u64)>;
-        for interface in &interfaces {
+        for (interface, _) in &interfaces {
             let Some(backlog) = tc_backlog(interface).await else {
                 continue;
             };
@@ -407,6 +477,13 @@ async fn strategy_loop(
             _ => {}
         }
     }
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 async fn tc_backlog(interface: &str) -> Option<u64> {

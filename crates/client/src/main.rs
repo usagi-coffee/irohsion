@@ -135,7 +135,6 @@ async fn main() -> Result<()> {
     if paths.len() > MAX_FRAGMENTS {
         bail!("at most {MAX_FRAGMENTS} interfaces are supported by the packed packet header");
     }
-    let health = spawn_health_receivers(&paths, ctx.clone());
     let health_endpoint_summary = health_endpoint_ids.join(", ");
     ctx.set_health_endpoint(health_endpoint_summary.clone());
     if cli.tc_backlog_poll_ms == 0 {
@@ -150,13 +149,15 @@ async fn main() -> Result<()> {
     let strategy = spawn_strategy_loop(
         paths
             .iter()
-            .map(|path| path.interface_name.clone())
+            .zip(health_endpoint_ids.iter())
+            .map(|(path, endpoint_id)| (path.interface_name.clone(), endpoint_id.clone()))
             .collect(),
         Duration::from_millis(cli.tc_backlog_poll_ms),
         cli.tc_backlog_degrade_bytes,
         cli.tc_backlog_recover_bytes,
         ctx.clone(),
     );
+    let health = spawn_health_receivers(&paths, ctx.clone(), strategy.clone());
     {
         let strategy = strategy.clone();
         let ctx = ctx.clone();
@@ -335,17 +336,29 @@ fn send_packet(
 ) {
     let mode = strategy.mode();
     let effective = strategy.current();
+    let split_paths = if matches!(mode, StrategyMode::Auto) && matches!(effective, PathStrategy::Split) {
+        let healthy = strategy.auto_split_interfaces(path_names);
+        paths.iter()
+            .filter(|path| healthy.iter().any(|name| name == &path.interface_name))
+            .collect::<Vec<_>>()
+    } else {
+        paths.iter().collect::<Vec<_>>()
+    };
     if should_split(
         payload.len(),
         cli.split_threshold_bytes,
         cli.mtu,
-        paths.len(),
+        split_paths.len(),
         mode,
         effective,
     ) {
-        let fragments = u8::try_from(paths.len()).expect("path count fits in u8");
-        let split_ranges = weighted_split_ranges(payload.len(), &strategy.split_weights(path_names));
-        for (fragment, path) in paths.iter().enumerate() {
+        let split_names = split_paths
+            .iter()
+            .map(|path| path.interface_name.clone())
+            .collect::<Vec<_>>();
+        let fragments = u8::try_from(split_paths.len()).expect("path count fits in u8");
+        let split_ranges = weighted_split_ranges(payload.len(), &strategy.split_weights(&split_names));
+        for (fragment, path) in split_paths.iter().enumerate() {
             let (start, end) = split_ranges[fragment];
             let packet = Arc::new(encode_packet(
                 PacketHeader {

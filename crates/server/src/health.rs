@@ -11,7 +11,13 @@ use transport::{EndpointHealth, HEALTH_ALPN, HealthReport, encode_health_report}
 
 pub type HealthConnections = Arc<RwLock<BTreeMap<String, iroh::endpoint::Connection>>>;
 pub type HealthTargets = Arc<RwLock<HashSet<String>>>;
-pub type HealthStats = Arc<RwLock<BTreeMap<String, u64>>>;
+pub type HealthStats = Arc<RwLock<BTreeMap<String, EndpointSample>>>;
+
+#[derive(Clone, Copy, Default)]
+pub struct EndpointSample {
+    pub bytes: u64,
+    pub last_seq: Option<u64>,
+}
 
 pub async fn health_loop(
     health_connections: HealthConnections,
@@ -86,8 +92,11 @@ pub async fn maintain_health_connection(
     }
 }
 
-pub fn record_health_bytes(health_stats: &HealthStats, remote: &str, bytes: u64) {
-    *health_stats.write().entry(remote.to_string()).or_default() += bytes;
+pub fn record_health_sample(health_stats: &HealthStats, remote: &str, bytes: u64, seq: u64) {
+    let mut stats = health_stats.write();
+    let sample = stats.entry(remote.to_string()).or_default();
+    sample.bytes = sample.bytes.saturating_add(bytes);
+    sample.last_seq = Some(sample.last_seq.map_or(seq, |current| current.max(seq)));
 }
 
 fn build_health_report(
@@ -106,13 +115,14 @@ fn build_health_report(
     let mut endpoints = Vec::with_capacity(endpoint_ids.len());
 
     for endpoint_id in endpoint_ids {
-        let bytes = drained.remove(&endpoint_id).unwrap_or(0);
+        let sample = drained.remove(&endpoint_id).unwrap_or_default();
         let target_mbps = endpoint_targets.get(&endpoint_id).copied().unwrap_or(0.0);
-        let achieved_mbps = bytes as f32 * 8.0 / interval_secs / 1_000_000.0;
+        let achieved_mbps = sample.bytes as f32 * 8.0 / interval_secs / 1_000_000.0;
         endpoints.push(EndpointHealth {
             endpoint_id: endpoint_id.clone(),
             target_mbps,
             achieved_mbps,
+            last_seq: sample.last_seq,
         });
     }
     drained.clear();

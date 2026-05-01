@@ -17,7 +17,7 @@ use cli::{EndpointTarget, SecretArg, endpoint_targets, local_udp_dest, relay_mod
 use context::ServerCtx;
 use health::{
     HealthConnections, HealthStats, HealthTargets, health_loop, maintain_health_connection,
-    record_health_bytes,
+    record_health_sample,
 };
 use iroh::{Endpoint, RelayUrl, endpoint::presets};
 use parking_lot::RwLock;
@@ -270,10 +270,11 @@ async fn main() -> Result<()> {
                                     data.len() as u64,
                                     packet.header.sequence,
                                 );
-                                record_health_bytes(
+                                record_health_sample(
                                     &health_stats,
                                     &remote_key,
                                     packet.payload.len() as u64,
+                                    packet.header.sequence,
                                 );
                                 if tx.send(packet).await.is_err() {
                                     break;
