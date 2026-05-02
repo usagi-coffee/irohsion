@@ -498,6 +498,16 @@
 			window.location.replace(url.toString());
 		}
 	}
+
+	/** @param {Element} node */
+	function scrollChatToBottom(node) {
+		$effect(() => {
+			chatMessages.length;
+			setTimeout(() => {
+				node.scrollTop = node.scrollHeight;
+			}, 0);
+		});
+	}
 </script>
 
 <svelte:head>
@@ -599,7 +609,7 @@
 					</div>
 				</div>
 
-				<div class="grid max-h-72 gap-2 overflow-y-auto pr-1">
+				<div {@attach scrollChatToBottom} class="grid max-h-72 gap-2 overflow-y-auto pr-1">
 					{#if chatMessages.length}
 						{#each chatMessages as message (message.id)}
 							<article class="rounded-2xl bg-black px-3 py-2">
