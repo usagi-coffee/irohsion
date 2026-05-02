@@ -1,14 +1,20 @@
 use crate::tui;
 
 pub async fn wait_for_shutdown(ui_state: Option<tui::ClientUiState>) {
-    if let Some(ui_state) = ui_state {
-        loop {
-            if ui_state.should_quit() {
-                return;
+    let ui_shutdown = async {
+        if let Some(ui_state) = ui_state {
+            loop {
+                if ui_state.should_quit() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        } else {
+            std::future::pending::<()>().await;
         }
-    } else {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    };
+    tokio::select! {
+        _ = ui_shutdown => {}
+        _ = tokio::signal::ctrl_c() => {}
+    };
 }

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{self, Stdout},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -83,7 +84,7 @@ pub fn describe_paths(connection: &iroh::endpoint::Connection, endpoint_id: &str
         .map(|path| PathRow {
             endpoint_id: endpoint_id.to_string(),
             split_percentage: None,
-            server_mbps: "-".to_string(),
+            server_mbps: "0.00".to_string(),
             last_health_at: None,
             remote_addr: path.remote_addr().to_string(),
             transport: transport_kind(&path).to_string(),
@@ -170,7 +171,7 @@ impl ClientUiState {
             rows.push(PathRow {
                 endpoint_id: "-".to_string(),
                 split_percentage: None,
-                server_mbps: "-".to_string(),
+                server_mbps: "0.00".to_string(),
                 last_health_at: None,
                 remote_addr: error,
                 transport: "error".to_string(),
@@ -253,7 +254,7 @@ impl ClientUiState {
                     row.server_mbps = server_mbps.clone();
                     row.last_health_at = Some(now);
                 } else {
-                    row.server_mbps = "-".to_string();
+                    row.server_mbps = "0.00".to_string();
                 }
             }
         }
@@ -287,6 +288,30 @@ impl ClientUi {
             join: Some(join),
         }
     }
+}
+
+pub fn spawn_status_file_writer(
+    state: ClientUiState,
+    path: PathBuf,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        let mut snapshot = Snapshot::default();
+        loop {
+            ticker.tick().await;
+            if state.should_quit() {
+                break;
+            }
+            let contents = format_status_file(&state, &mut snapshot);
+            if let Err(err) = write_status_file(&path, &contents) {
+                state.push_log_line(format!(
+                    "ERROR failed writing OBS status file path={} error={err}",
+                    path.display()
+                ));
+            }
+        }
+    })
 }
 
 impl Drop for ClientUi {
@@ -369,6 +394,97 @@ struct Snapshot {
     client_mbps_by_interface: BTreeMap<String, f64>,
 }
 
+fn update_client_path_rates(state: &ClientUiState, snapshot: &mut Snapshot, now: Instant) {
+    let sent_bytes_by_interface = state.sent_bytes_by_interface.read().clone();
+    if snapshot
+        .last_client_rate_at
+        .is_some_and(|last| now.duration_since(last) < CLIENT_PATH_MBPS_INTERVAL)
+    {
+        return;
+    }
+
+    let rate_delta = snapshot
+        .last_client_rate_at
+        .map(|last| now.duration_since(last).as_secs_f64().max(0.001))
+        .unwrap_or(CLIENT_PATH_MBPS_INTERVAL.as_secs_f64());
+    let mut client_mbps_by_interface = BTreeMap::new();
+    for (interface, sent_bytes) in &sent_bytes_by_interface {
+        let previous = snapshot
+            .last_sent_bytes_by_interface
+            .get(interface)
+            .copied()
+            .unwrap_or(0);
+        client_mbps_by_interface.insert(
+            interface.clone(),
+            (sent_bytes.saturating_sub(previous)) as f64 * 8.0 / rate_delta / 1_000_000.0,
+        );
+    }
+    snapshot.last_client_rate_at = Some(now);
+    snapshot.last_sent_bytes_by_interface = sent_bytes_by_interface;
+    snapshot.client_mbps_by_interface = client_mbps_by_interface;
+}
+
+fn format_status_file(state: &ClientUiState, snapshot: &mut Snapshot) -> String {
+    let now = Instant::now();
+    update_client_path_rates(state, snapshot, now);
+
+    let paths = state.paths.read();
+    let mut lines = Vec::new();
+    for interface in &state.interfaces {
+        let client_mbps = snapshot
+            .client_mbps_by_interface
+            .get(interface)
+            .map(|mbps| format!("{mbps:.2}"))
+            .unwrap_or_else(|| "0.00".to_string());
+        let Some(rows) = paths.get(interface) else {
+            lines.push(format!(
+                "{interface:<10} {client_mbps:>5} / {:>5}  split {:>4}  {:>8}  -",
+                "0.00", "0%", "-"
+            ));
+            continue;
+        };
+        for row in rows {
+            lines.push(format!(
+                "{interface:<10} {client_mbps:>5} / {:>5}  split {:>4}  {:>8}  {}",
+                format_file_server_mbps(&row.server_mbps),
+                format_split_percentage(row.split_percentage),
+                format_health_age(row.last_health_at),
+                row.status
+            ));
+        }
+    }
+    if lines.is_empty() {
+        "-".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn format_file_server_mbps(server_mbps: &str) -> String {
+    if server_mbps == "-" {
+        return "0.00".to_string();
+    }
+    server_mbps.to_string()
+}
+
+fn format_split_percentage(split_percentage: Option<f64>) -> String {
+    split_percentage
+        .map(|percentage| format!("{percentage:.0}%"))
+        .unwrap_or_else(|| "0%".to_string())
+}
+
+fn write_status_file(path: &PathBuf, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(tmp, path)
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Snapshot) {
     let area = frame.area();
     let layout = Layout::default()
@@ -394,31 +510,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         / 1_000_000.0;
     let send_mbps =
         (sent_bytes.saturating_sub(snapshot.last_sent_bytes)) as f64 * 8.0 / delta / 1_000_000.0;
-    let sent_bytes_by_interface = state.sent_bytes_by_interface.read().clone();
-    if snapshot
-        .last_client_rate_at
-        .is_none_or(|last| now.duration_since(last) >= CLIENT_PATH_MBPS_INTERVAL)
-    {
-        let rate_delta = snapshot
-            .last_client_rate_at
-            .map(|last| now.duration_since(last).as_secs_f64().max(0.001))
-            .unwrap_or(CLIENT_PATH_MBPS_INTERVAL.as_secs_f64());
-        let mut client_mbps_by_interface = BTreeMap::new();
-        for (interface, sent_bytes) in &sent_bytes_by_interface {
-            let previous = snapshot
-                .last_sent_bytes_by_interface
-                .get(interface)
-                .copied()
-                .unwrap_or(0);
-            client_mbps_by_interface.insert(
-                interface.clone(),
-                (sent_bytes.saturating_sub(previous)) as f64 * 8.0 / rate_delta / 1_000_000.0,
-            );
-        }
-        snapshot.last_client_rate_at = Some(now);
-        snapshot.last_sent_bytes_by_interface = sent_bytes_by_interface.clone();
-        snapshot.client_mbps_by_interface = client_mbps_by_interface;
-    }
+    update_client_path_rates(state, snapshot, now);
     snapshot.last_at = Some(now);
     snapshot.last_ingested_bytes = ingested_bytes;
     snapshot.last_sent_bytes = sent_bytes;
@@ -494,8 +586,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         let client_mbps = snapshot
             .client_mbps_by_interface
             .get(interface)
-            .map(|mbps| format!("{mbps:.2}"))
-            .unwrap_or_else(|| "-".to_string());
+            .map(|mbps| format_client_mbps(*mbps, false))
+            .unwrap_or_else(|| "0.00".to_string());
         for row in path_rows {
             rows.push(Row::new(vec![
                 Cell::from(interface.clone()),
@@ -580,6 +672,20 @@ fn fmt_uptime(elapsed: Duration) -> String {
 
 fn short_endpoint(endpoint_id: &str) -> String {
     endpoint_id.chars().take(ENDPOINT_PREFIX_LEN).collect()
+}
+
+fn format_client_mbps(mbps: f64, include_unit: bool) -> String {
+    if mbps <= 0.005 {
+        if include_unit {
+            "0.00 Mbps".to_string()
+        } else {
+            "0.00".to_string()
+        }
+    } else if include_unit {
+        format!("{mbps:.2} Mbps")
+    } else {
+        format!("{mbps:.2}")
+    }
 }
 
 fn format_health_age(last_health_at: Option<Instant>) -> String {

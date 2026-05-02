@@ -7,6 +7,7 @@ mod tui;
 
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -55,6 +56,10 @@ struct Cli {
     #[arg(long)]
     tui: bool,
     #[arg(long)]
+    status_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 1000)]
+    status_file_interval_ms: u64,
+    #[arg(long)]
     split_threshold_bytes: Option<usize>,
     #[arg(long)]
     mtu: Option<usize>,
@@ -90,6 +95,9 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let interface_configs = parse_interface_configs(&cli.interfaces)?;
+    if cli.status_file_interval_ms == 0 {
+        bail!("--status-file-interval-ms must be greater than zero");
+    }
 
     let listen_udp = SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::LOCALHOST,
@@ -102,8 +110,8 @@ async fn main() -> Result<()> {
             .with_context(|| format!("failed to bind local UDP ingest socket on {listen_udp}"))?,
     );
     let (ui_command_tx, mut ui_command_rx) = mpsc::unbounded_channel();
-    let ui = cli.tui.then(|| {
-        tui::ClientUi::spawn(tui::ClientUiState::new(
+    let ui_state = (cli.tui || cli.status_file.is_some()).then(|| {
+        tui::ClientUiState::new(
             listen_socket
                 .local_addr()
                 .expect("listen socket has local addr")
@@ -115,9 +123,19 @@ async fn main() -> Result<()> {
                 .map(|config| config.binding.name.clone())
                 .collect(),
             Some(ui_command_tx),
-        ))
+        )
     });
-    let ctx = ClientCtx::new(ui.as_ref().map(|ui| ui.state.clone()));
+    let _ui = cli
+        .tui
+        .then(|| tui::ClientUi::spawn(ui_state.clone().expect("TUI state is enabled")));
+    let _status_file = cli.status_file.clone().map(|path| {
+        tui::spawn_status_file_writer(
+            ui_state.clone().expect("status file state is enabled"),
+            path,
+            Duration::from_millis(cli.status_file_interval_ms),
+        )
+    });
+    let ctx = ClientCtx::new(ui_state);
     let health_endpoint_ids = interface_configs
         .iter()
         .map(|config| config.endpoint_id.clone())
