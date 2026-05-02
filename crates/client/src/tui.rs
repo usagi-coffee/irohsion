@@ -437,6 +437,7 @@ fn format_status_file(state: &ClientUiState, snapshot: &mut Snapshot) -> String 
     let paths = state.paths.read();
     let mut lines = Vec::new();
     for interface in &state.interfaces {
+        let display_name = fixed_status_name(interface);
         let client_mbps = snapshot
             .client_mbps_by_interface
             .get(interface)
@@ -444,14 +445,14 @@ fn format_status_file(state: &ClientUiState, snapshot: &mut Snapshot) -> String 
             .unwrap_or_else(|| "0.00".to_string());
         let Some(rows) = paths.get(interface) else {
             lines.push(format!(
-                "{interface:<10} {client_mbps:>5} / {:>5}  split {:>4}  {:>8}  -",
+                "{display_name} {client_mbps:>5} / {:>5}  @ {:>4}  {:>8}  -",
                 "0.00", "0%", "-"
             ));
             continue;
         };
         for row in rows {
             lines.push(format!(
-                "{interface:<10} {client_mbps:>5} / {:>5}  split {:>4}  {:>8}  {}",
+                "{display_name} {client_mbps:>5} / {:>5}  @ {:>4}  {:>8}  {}",
                 format_file_server_mbps(&row.server_mbps),
                 format_split_percentage(row.split_percentage),
                 format_health_age(row.last_health_at),
@@ -464,6 +465,10 @@ fn format_status_file(state: &ClientUiState, snapshot: &mut Snapshot) -> String 
     } else {
         lines.join("\n")
     }
+}
+
+fn fixed_status_name(name: &str) -> String {
+    format!("{:<10}", name.chars().take(10).collect::<String>())
 }
 
 fn format_file_server_mbps(server_mbps: &str) -> String {
