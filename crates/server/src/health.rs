@@ -20,6 +20,8 @@ pub type HealthConnections = Arc<RwLock<BTreeMap<String, HealthConnection>>>;
 pub type HealthTargets = Arc<RwLock<HashSet<String>>>;
 pub type HealthStats = Arc<RwLock<BTreeMap<String, EndpointSample>>>;
 
+const MAX_CHAT_MESSAGES_PER_HEALTH_REPORT: usize = 3;
+
 #[derive(Clone, Copy, Default)]
 pub struct EndpointSample {
     pub bytes: u64,
@@ -158,7 +160,11 @@ fn build_health_report(
         endpoints,
         chat: twitch_chat
             .map(|chat| {
-                chat.recent_messages()
+                let mut messages = chat.recent_messages();
+                if messages.len() > MAX_CHAT_MESSAGES_PER_HEALTH_REPORT {
+                    messages.drain(0..messages.len() - MAX_CHAT_MESSAGES_PER_HEALTH_REPORT);
+                }
+                messages
                     .into_iter()
                     .map(|message| ChatMessage {
                         id: message.id,

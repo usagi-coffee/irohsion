@@ -42,6 +42,16 @@ impl TwitchChat {
         self.messages.read().iter().cloned().collect()
     }
 
+    pub fn messages_after(&self, last_id: u64, limit: usize) -> Vec<TwitchChatMessage> {
+        self.messages
+            .read()
+            .iter()
+            .filter(|message| message.id > last_id)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     fn push(&self, user: String, text: String) -> Result<()> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let unix_ms = SystemTime::now()
