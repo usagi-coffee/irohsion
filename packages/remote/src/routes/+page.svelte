@@ -18,7 +18,7 @@
 	/** @typedef {{ enabled: boolean, decoding: boolean, jpeg_bytes: number, characteristic: string, offset_characteristic: string, chunk_bytes: number }} PreviewStatus */
 	/** @typedef {{ id: number, unix_ms: number, user: string, text: string }} ChatMessage */
 	/** @typedef {{ control: ControlStatus, preview?: PreviewStatus, chat?: ChatMessage[] }} RemoteStatus */
-	/** @typedef {{ enabled: boolean, connected: boolean, host: string, port: number, last_error?: string | null, recording?: boolean | null, recording_bitrate_kbps?: number | null, recording_bitrate_category: string, recording_bitrate_name: string }} ObsStatus */
+	/** @typedef {{ enabled: boolean, connected: boolean, host: string, port: number, last_error?: string | null, recording?: boolean | null, recording_bitrate_kbps?: number | null, video_fps?: number | null, recording_bitrate_category: string, recording_bitrate_name: string }} ObsStatus */
 
 	/** @type {BluetoothDevice | null} */
 	let device = $state(null);
@@ -256,6 +256,11 @@
 		}
 		editingObsBitrate = false;
 		void sendObsCommand({ action: 'set_recording_bitrate', kbps });
+	}
+
+	/** @param {30 | 60} fps */
+	function setObsFps(fps) {
+		void sendObsCommand({ action: 'set_video_fps', fps });
 	}
 
 	/**
@@ -714,9 +719,35 @@
 					>
 						Stop Rec
 					</button>
-				</div>
+					</div>
 
-				<div class="mt-2 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+					<div class="mt-2 rounded-2xl bg-black px-3 py-2">
+						<p class="mb-2 text-[0.55rem] font-bold text-neutral-600 uppercase">Video FPS</p>
+						<div class="grid grid-cols-2 gap-1.5">
+							<button
+								class={[
+									'rounded-xl px-3 py-2 text-sm font-black disabled:opacity-40',
+									(obsStatus?.video_fps ?? 0) === 30 ? 'bg-sky-300 text-black' : 'bg-neutral-800 text-neutral-200'
+								]}
+								disabled={!server || obsBusy}
+								onclick={() => setObsFps(30)}
+							>
+								30
+							</button>
+							<button
+								class={[
+									'rounded-xl px-3 py-2 text-sm font-black disabled:opacity-40',
+									(obsStatus?.video_fps ?? 0) === 60 ? 'bg-sky-300 text-black' : 'bg-neutral-800 text-neutral-200'
+								]}
+								disabled={!server || obsBusy}
+								onclick={() => setObsFps(60)}
+							>
+								60
+							</button>
+						</div>
+					</div>
+
+					<div class="mt-2 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
 					<label class="rounded-2xl bg-black px-3 py-2">
 						<span class="block text-[0.55rem] font-bold text-neutral-600 uppercase">Recording bitrate kbps</span>
 						<input

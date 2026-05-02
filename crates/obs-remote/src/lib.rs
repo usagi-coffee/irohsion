@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use obws::Client;
+use obws::requests::config::SetVideoSettings;
 use obws::requests::profiles::SetParameter;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,7 @@ pub struct ObsStatus {
     pub streaming: Option<bool>,
     pub recording: Option<bool>,
     pub recording_bitrate_kbps: Option<u32>,
+    pub video_fps: Option<u32>,
     pub recording_bitrate_category: String,
     pub recording_bitrate_name: String,
 }
@@ -56,6 +58,7 @@ pub enum ObsCommand {
     StartRecord,
     StopRecord,
     SetRecordingBitrate { kbps: u32 },
+    SetVideoFps { fps: u32 },
 }
 
 impl ObsRemote {
@@ -71,6 +74,7 @@ impl ObsRemote {
             streaming: None,
             recording: None,
             recording_bitrate_kbps: None,
+            video_fps: None,
             recording_bitrate_category: config.recording_bitrate_category.clone(),
             recording_bitrate_name: config.recording_bitrate_name.clone(),
         };
@@ -137,6 +141,19 @@ impl ObsRemote {
                 self.set_recording_bitrate(&client, kbps).await?;
                 self.refresh().await?;
             }
+            ObsCommand::SetVideoFps { fps } => {
+                if !matches!(fps, 30 | 60) {
+                    return Err(anyhow!("video fps must be 30 or 60"));
+                }
+                let client = self.ensure_client().await?;
+                with_obs_timeout(client.config().set_video_settings(SetVideoSettings {
+                    fps_numerator: Some(fps),
+                    fps_denominator: Some(1),
+                    ..Default::default()
+                }))
+                .await?;
+                self.refresh().await?;
+            }
         }
         Ok(())
     }
@@ -176,18 +193,27 @@ impl ObsRemote {
         let mut state = self.inner.write();
         state.status.connected = false;
         state.status.recording = None;
+        state.status.video_fps = None;
     }
 
     async fn refresh(&self) -> Result<()> {
         let client = self.ensure_client().await?;
         let recording = with_obs_timeout(client.recording().status()).await?;
         let bitrate = self.read_recording_bitrate(&client).await;
+        let video_fps = with_obs_timeout(client.config().video_settings())
+            .await
+            .ok()
+            .and_then(|settings| {
+                (settings.fps_denominator != 0)
+                    .then(|| settings.fps_numerator / settings.fps_denominator)
+            });
 
         let mut state = self.inner.write();
         state.status.connected = true;
         state.status.last_error = None;
         state.status.recording = Some(recording.active);
         state.status.recording_bitrate_kbps = bitrate;
+        state.status.video_fps = video_fps;
         Ok(())
     }
 
@@ -293,6 +319,7 @@ impl Default for ObsStatus {
             streaming: None,
             recording: None,
             recording_bitrate_kbps: None,
+            video_fps: None,
             recording_bitrate_category: String::new(),
             recording_bitrate_name: String::new(),
         }
