@@ -39,22 +39,18 @@ pub fn spawn_health_receivers(
                         continue;
                     };
 
-                    let ctx = ctx.clone();
-                    let strategy = strategy.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            match connection.read_datagram().await {
-                                Ok(payload) => match decode_health_report(&payload) {
-                                    Ok(report) => {
-                                        strategy.record_health_report(&report);
-                                        ctx.record_health_report(&report);
-                                    }
-                                    Err(err) => ctx.invalid_health_report(&err.to_string()),
-                                },
-                                Err(_) => break,
-                            }
+                    loop {
+                        match connection.read_datagram().await {
+                            Ok(payload) => match decode_health_report(&payload) {
+                                Ok(report) => {
+                                    strategy.record_health_report(&report);
+                                    ctx.record_health_report(&report);
+                                }
+                                Err(err) => ctx.invalid_health_report(&err.to_string()),
+                            },
+                            Err(_) => break,
                         }
-                    });
+                    }
                 }
             }
         });

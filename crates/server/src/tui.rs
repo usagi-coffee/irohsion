@@ -190,6 +190,12 @@ impl ServerUiState {
             .fetch_add(1, Ordering::Relaxed)
             + 1;
         let entry = connections.entry(remote.to_string()).or_default();
+        entry.last_error = None;
+        entry.paths.iter_mut().for_each(|row| {
+            if row.status.starts_with("closed:") {
+                row.status = "up".to_string();
+            }
+        });
         entry.received_packets += 1;
         entry.received_bytes += bytes;
         entry.last_seq = Some(sequence);

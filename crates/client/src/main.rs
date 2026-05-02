@@ -58,10 +58,6 @@ struct Cli {
     split_threshold_bytes: Option<usize>,
     #[arg(long)]
     mtu: Option<usize>,
-    #[arg(long, default_value_t = 0)]
-    burst_max_delay_ms: u64,
-    #[arg(long)]
-    burst_max_bytes: Option<usize>,
     #[arg(long, default_value_t = 500)]
     tc_backlog_poll_ms: u64,
     #[arg(long, default_value_t = 65_536)]
@@ -186,9 +182,6 @@ async fn main() -> Result<()> {
     ctx.set_health_endpoint(health_endpoint_summary.clone());
     if cli.tc_backlog_poll_ms == 0 {
         bail!("--tc-backlog-poll-ms must be greater than zero");
-    }
-    if cli.burst_max_bytes == Some(0) {
-        bail!("--burst-max-bytes must be greater than zero when set");
     }
     if cli.tc_backlog_recover_bytes > cli.tc_backlog_degrade_bytes {
         bail!("--tc-backlog-recover-bytes must be <= --tc-backlog-degrade-bytes");
@@ -376,10 +369,7 @@ async fn main() -> Result<()> {
 
     let mut seq = 0_u64;
     let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];
-    let burst_delay = burst_delay(cli.burst_max_delay_ms);
-    let mut pending = Vec::new();
     loop {
-        pending.clear();
         let shutdown = wait_for_shutdown(ctx.ui_state());
         let (len, src) = tokio::select! {
             biased;
@@ -391,63 +381,21 @@ async fn main() -> Result<()> {
             }
         };
 
-        pending.push(PendingPacket::new(src, &buf[..len]));
-        let mut pending_bytes = len;
-
-        if let Some(delay) = burst_delay {
-            loop {
-                if matches!(cli.burst_max_bytes, Some(limit) if pending_bytes >= limit) {
-                    break;
-                }
-
-                let Ok(Ok((len, src))) =
-                    tokio::time::timeout(delay, listen_socket.recv_from(&mut buf)).await
-                else {
-                    break;
-                };
-                pending.push(PendingPacket::new(src, &buf[..len]));
-                pending_bytes = pending_bytes.saturating_add(len);
-            }
+        let payload = &buf[..len];
+        // Remember the active local UDP peer so reverse traffic has somewhere to go.
+        *last_ingest_peer.write() = Some(src);
+        ctx.record_ingest(payload.len() as u64, src.to_string());
+        strategy.record_packet(payload.len() as u64);
+        if let Some(preview) = &preview {
+            preview.submit_packet(payload);
         }
 
-        for packet in &pending {
-            // Remember the active local UDP peer so reverse traffic has somewhere to go.
-            *last_ingest_peer.write() = Some(packet.src);
-            ctx.record_ingest(packet.payload.len() as u64, packet.src.to_string());
-            strategy.record_packet(packet.payload.len() as u64);
-            if let Some(preview) = &preview {
-                preview.submit_packet(&packet.payload);
-            }
-
-            ctx.ingested_packet(seq, packet.payload.len(), packet.src);
-            send_packet(
-                &packet.payload,
-                seq,
-                &cli,
-                &paths,
-                &path_names,
-                &strategy,
-                &ctx,
-            );
-            seq = next_sequence(seq);
-        }
+        ctx.ingested_packet(seq, payload.len(), src);
+        send_packet(payload, seq, &cli, &paths, &path_names, &strategy, &ctx);
+        seq = next_sequence(seq);
     }
 
     Ok(())
-}
-
-struct PendingPacket {
-    src: SocketAddr,
-    payload: Vec<u8>,
-}
-
-impl PendingPacket {
-    fn new(src: SocketAddr, payload: &[u8]) -> Self {
-        Self {
-            src,
-            payload: payload.to_vec(),
-        }
-    }
 }
 
 fn spawn_interface_watchers(
@@ -478,7 +426,7 @@ fn spawn_interface_watchers(
                             });
                         }
                     }
-                    Err(err) => {
+                    Err(_) => {
                         if let Some(endpoint) = path.mark_failed(None) {
                             tokio::spawn(async move {
                                 endpoint.close().await;
@@ -487,10 +435,6 @@ fn spawn_interface_watchers(
                             path.request_reconnect();
                         }
                         strategy.record_interface_dead(&path.interface_name);
-                        ctx.record_send_error(
-                            path.interface_name.clone(),
-                            format!("interface unavailable, retrying: {err}"),
-                        );
                     }
                 }
             }
@@ -820,14 +764,6 @@ fn send_on_path(
     }
 }
 
-fn burst_delay(delay_ms: u64) -> Option<Duration> {
-    if delay_ms == 0 {
-        None
-    } else {
-        Some(Duration::from_millis(delay_ms))
-    }
-}
-
 fn should_split(
     packet_len: usize,
     threshold: Option<usize>,
@@ -881,9 +817,8 @@ fn weighted_split_ranges(packet_len: usize, weights: &[f64]) -> Vec<(usize, usiz
 
 #[cfg(test)]
 mod tests {
-    use super::{burst_delay, should_split, weighted_split_ranges};
+    use super::{should_split, weighted_split_ranges};
     use crate::path_strategy::{PathStrategy, StrategyMode};
-    use std::time::Duration;
 
     #[test]
     fn weighted_ranges_cover_packet_once() {
@@ -1009,15 +944,5 @@ mod tests {
             StrategyMode::RoundRobin,
             PathStrategy::RoundRobin,
         ));
-    }
-
-    #[test]
-    fn zero_burst_delay_disables_batching() {
-        assert_eq!(burst_delay(0), None);
-    }
-
-    #[test]
-    fn burst_delay_uses_requested_milliseconds() {
-        assert_eq!(burst_delay(4), Some(Duration::from_millis(4)));
     }
 }

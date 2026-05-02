@@ -316,7 +316,8 @@ async fn main() -> Result<()> {
                         Err(_) => ctx.record_invalid(),
                     },
                     Err(err) => {
-                        remove_connection_if_current(&connections, &remote_key, stable_id);
+                        let remaining_connections =
+                            remove_connection_if_current(&connections, &remote_key, stable_id);
                         if health_connections
                             .read()
                             .get(&remote_key)
@@ -324,7 +325,9 @@ async fn main() -> Result<()> {
                         {
                             health_connections.write().remove(&remote_key);
                         }
-                        ctx.record_disconnect(remote_key.clone(), err.to_string());
+                        if !remaining_connections {
+                            ctx.record_disconnect(remote_key.clone(), err.to_string());
+                        }
                         break;
                     }
                 }
@@ -757,14 +760,21 @@ async fn response_loop(
     }
 }
 
-fn remove_connection_if_current(connections: &ConnectionRegistry, remote: &str, stable_id: usize) {
+fn remove_connection_if_current(
+    connections: &ConnectionRegistry,
+    remote: &str,
+    stable_id: usize,
+) -> bool {
     let mut connections = connections.write();
     if let Some(remote_connections) = connections.get_mut(remote) {
         remote_connections.remove(&stable_id);
         if remote_connections.is_empty() {
             connections.remove(remote);
+            return false;
         }
+        return true;
     }
+    false
 }
 
 fn set_reply_routes(reply_routes: &ReplyRoutes, remote: &str, reset: bool) {

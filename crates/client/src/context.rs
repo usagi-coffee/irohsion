@@ -146,15 +146,7 @@ impl ClientCtx {
     }
 
     pub fn forwarded_return_packet(&self, interface: &str, peer: SocketAddr, bytes: usize) {
-        if let Some(ui) = &self.ui {
-            ui.push_log_line(format!(
-                "INFO forwarded return packet to local UDP peer interface={interface} peer={peer} bytes={bytes}"
-            ));
-        } else {
-            println!(
-                "INFO forwarded return packet to local UDP peer interface={interface} peer={peer} bytes={bytes}"
-            );
-        }
+        let _ = (interface, peer, bytes);
     }
 
     pub fn return_path_closed(&self, interface: &str, error: &str) {
@@ -168,15 +160,7 @@ impl ClientCtx {
     }
 
     pub fn missing_return_peer(&self, interface: &str, bytes: usize) {
-        if let Some(ui) = &self.ui {
-            ui.push_log_line(format!(
-                "WARN dropping return packet because no local UDP peer has sent traffic yet interface={interface} bytes={bytes}"
-            ));
-        } else {
-            eprintln!(
-                "WARN dropping return packet because no local UDP peer has sent traffic yet interface={interface} bytes={bytes}"
-            );
-        }
+        let _ = (interface, bytes);
     }
 
     pub fn return_forward_error(&self, interface: &str, peer: SocketAddr, error: &str) {

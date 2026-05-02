@@ -16,6 +16,7 @@ use transport::HealthReport;
 
 const AUTO_SPLIT_HEALTH_STALE_MS: u64 = 2_500;
 const AUTO_SPLIT_DEGRADE_LAG_PACKETS: u64 = 800;
+const TC_BACKLOG_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -551,11 +552,15 @@ fn unix_ms_now() -> u64 {
 }
 
 async fn tc_backlog(interface: &str) -> Option<u64> {
-    let output = Command::new("tc")
-        .args(["-s", "qdisc", "show", "dev", interface])
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        TC_BACKLOG_TIMEOUT,
+        Command::new("tc")
+            .args(["-s", "qdisc", "show", "dev", interface])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
