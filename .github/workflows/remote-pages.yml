@@ -2,7 +2,7 @@ name: Remote Pages
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - ".github/workflows/remote-pages.yml"
       - "packages/remote/**"
