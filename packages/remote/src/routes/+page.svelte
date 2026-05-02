@@ -478,6 +478,26 @@
 		}
 		if (device && !connecting) await reconnectGatt();
 	}
+
+	async function forceUpdate() {
+		error = '';
+		try {
+			if ('serviceWorker' in navigator) {
+				const registrations = await navigator.serviceWorker.getRegistrations();
+				await Promise.all(registrations.map((registration) => registration.unregister()));
+			}
+			if ('caches' in window) {
+				const keys = await caches.keys();
+				await Promise.all(keys.map((key) => caches.delete(key)));
+			}
+		} catch (err) {
+			error = err instanceof Error ? err.message : String(err);
+		} finally {
+			const url = new URL(window.location.href);
+			url.searchParams.set('update', String(Date.now()));
+			window.location.replace(url.toString());
+		}
+	}
 </script>
 
 <svelte:head>
@@ -501,6 +521,14 @@
 						]}
 					></span>
 				</button>
+				<span
+					class={[
+						'h-3.5 w-3.5 rounded-full',
+						obsStatus?.connected ? 'bg-emerald-400 shadow-[0_0_18px_rgba(52,211,153,0.9)]' : 'bg-red-500'
+					]}
+					title={obsStatus?.connected ? 'OBS connected' : 'OBS disconnected'}
+					aria-label={obsStatus?.connected ? 'OBS connected' : 'OBS disconnected'}
+				></span>
 			</div>
 
 			<div class="flex min-w-0 flex-1 items-center justify-end gap-2 text-right">
@@ -560,6 +588,33 @@
 					>
 						{status.preview?.decoding ? 'Preview On' : 'Preview Off'}
 					</button>
+				</div>
+			</section>
+
+			<section class="rounded-3xl border border-white/10 bg-neutral-950 p-3">
+				<div class="mb-2 flex items-center justify-between gap-3">
+					<div>
+						<p class="text-[0.6rem] font-bold text-neutral-500 uppercase">Twitch Chat</p>
+						<p class="text-xl font-black tracking-[-0.05em]">{chatMessages.length} messages</p>
+					</div>
+				</div>
+
+				<div class="grid max-h-72 gap-2 overflow-y-auto pr-1">
+					{#if chatMessages.length}
+						{#each chatMessages as message (message.id)}
+							<article class="rounded-2xl bg-black px-3 py-2">
+								<div class="mb-1 flex items-baseline justify-between gap-2">
+									<p class="min-w-0 truncate text-sm font-black text-sky-300">{message.user}</p>
+									<p class="shrink-0 text-[0.6rem] font-bold text-neutral-600">{formatChatTime(message.unix_ms)}</p>
+								</div>
+								<p class="break-words text-sm font-semibold text-neutral-100">{message.text}</p>
+							</article>
+						{/each}
+					{:else}
+						<p class="rounded-2xl bg-black px-3 py-4 text-sm font-bold text-neutral-600">
+							No chat messages
+						</p>
+					{/if}
 				</div>
 			</section>
 
@@ -673,36 +728,18 @@
 				{/if}
 			</section>
 
-			<section class="rounded-3xl border border-white/10 bg-neutral-950 p-3">
-				<div class="mb-2 flex items-center justify-between gap-3">
-					<div>
-						<p class="text-[0.6rem] font-bold text-neutral-500 uppercase">Twitch Chat</p>
-						<p class="text-xl font-black tracking-[-0.05em]">{chatMessages.length} messages</p>
-					</div>
-				</div>
-
-				<div class="grid max-h-72 gap-2 overflow-y-auto pr-1">
-					{#if chatMessages.length}
-						{#each chatMessages as message (message.id)}
-							<article class="rounded-2xl bg-black px-3 py-2">
-								<div class="mb-1 flex items-baseline justify-between gap-2">
-									<p class="min-w-0 truncate text-sm font-black text-sky-300">{message.user}</p>
-									<p class="shrink-0 text-[0.6rem] font-bold text-neutral-600">{formatChatTime(message.unix_ms)}</p>
-								</div>
-								<p class="break-words text-sm font-semibold text-neutral-100">{message.text}</p>
-							</article>
-						{/each}
-					{:else}
-						<p class="rounded-2xl bg-black px-3 py-4 text-sm font-bold text-neutral-600">
-							No chat messages
-						</p>
-					{/if}
-				</div>
-			</section>
 		{:else}
 			<section class="rounded-3xl border border-white/10 bg-neutral-950 p-5">
 				<p class="text-neutral-400">Connect to the irohsion BLE remote to monitor paths.</p>
 			</section>
+			<div class="sticky bottom-[max(0.5rem,env(safe-area-inset-bottom))]">
+				<button
+					class="w-full rounded-2xl border border-white/10 bg-neutral-900 px-4 py-3 text-sm font-black text-neutral-100 active:scale-[0.99]"
+					onclick={forceUpdate}
+				>
+					Force Update
+				</button>
+			</div>
 		{/if}
 	</div>
 </main>

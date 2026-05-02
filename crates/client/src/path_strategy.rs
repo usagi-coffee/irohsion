@@ -264,9 +264,14 @@ impl StrategyState {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        let weights = self.split_weights(&interfaces);
+        self.effective_split_percentages_for(&interfaces)
+    }
+
+    pub fn effective_split_percentages_for(&self, interfaces: &[String]) -> BTreeMap<String, f64> {
+        let weights = self.split_weights(interfaces);
         interfaces
-            .into_iter()
+            .iter()
+            .cloned()
             .zip(weights)
             .map(|(interface, weight)| (interface, weight * 100.0))
             .collect()

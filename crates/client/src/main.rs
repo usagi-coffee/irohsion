@@ -210,9 +210,14 @@ async fn main() -> Result<()> {
             strategy.record_interface_reconnecting(&path.interface_name);
         }
     }
+    let path_names = paths
+        .iter()
+        .map(|path| path.interface_name.clone())
+        .collect::<Vec<_>>();
     spawn_interface_watchers(&paths, strategy.clone(), ctx.clone());
     spawn_reconnect_loops(&paths, &health_endpoint_ids, strategy.clone(), ctx.clone());
     spawn_connection_liveness(&paths, &health_endpoint_ids, strategy.clone(), ctx.clone());
+    spawn_split_display_updates(&paths, &path_names, strategy.clone(), ctx.clone());
     {
         let strategy = strategy.clone();
         let ctx = ctx.clone();
@@ -243,10 +248,6 @@ async fn main() -> Result<()> {
             }
         });
     }
-    let path_names = paths
-        .iter()
-        .map(|path| path.interface_name.clone())
-        .collect::<Vec<_>>();
     let _health = health;
     let preview = (cli.remote && cli.remote_preview).then(|| {
         spawn_preview(
@@ -540,6 +541,44 @@ fn spawn_connection_liveness(
     }
 }
 
+fn spawn_split_display_updates(
+    paths: &[transport::PathConnection],
+    path_names: &[String],
+    strategy: path_strategy::StrategyState,
+    ctx: ClientCtx,
+) {
+    let paths = paths.to_vec();
+    let path_names = path_names.to_vec();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            let mode = strategy.mode();
+            let effective = strategy.current();
+            let (split_interface_names, _) =
+                if matches!(mode, StrategyMode::Auto) && matches!(effective, PathStrategy::Split) {
+                    strategy.auto_path_groups(&path_names)
+                } else {
+                    (path_names.clone(), Vec::new())
+                };
+            let displayed_split_names = paths
+                .iter()
+                .filter(|path| path.is_connected())
+                .filter(|path| {
+                    !matches!(effective, PathStrategy::Split)
+                        || split_interface_names
+                            .iter()
+                            .any(|name| name == &path.interface_name)
+                })
+                .map(|path| path.interface_name.clone())
+                .collect::<Vec<_>>();
+            ctx.record_split_percentages(
+                &strategy.effective_split_percentages_for(&displayed_split_names),
+            );
+        }
+    });
+}
+
 fn spawn_reconnect_loops(
     paths: &[transport::PathConnection],
     endpoint_ids: &[String],
@@ -641,6 +680,18 @@ fn send_packet(
                 .any(|name| name == &path.interface_name)
         })
         .collect::<Vec<_>>();
+    let displayed_split_names = if matches!(effective, PathStrategy::Split) {
+        split_paths
+            .iter()
+            .map(|path| path.interface_name.clone())
+            .collect::<Vec<_>>()
+    } else {
+        active_paths
+            .iter()
+            .map(|path| path.interface_name.clone())
+            .collect::<Vec<_>>()
+    };
+    ctx.record_split_percentages(&strategy.effective_split_percentages_for(&displayed_split_names));
     let rescue_paths = if rescue_interface_names.is_empty() {
         Vec::new()
     } else {

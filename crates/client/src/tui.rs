@@ -185,6 +185,7 @@ impl ClientUiState {
             row.status = "failed".to_string();
             row.remote_addr = error.clone();
             row.selected = false;
+            row.split_percentage = None;
         }
     }
 
