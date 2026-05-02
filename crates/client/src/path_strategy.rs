@@ -16,6 +16,7 @@ use transport::HealthReport;
 
 const AUTO_SPLIT_HEALTH_STALE_MS: u64 = 2_500;
 const AUTO_SPLIT_DEGRADE_LAG_PACKETS: u64 = 800;
+const AUTO_WEIGHT_MIN_SHARE: f64 = 0.05;
 const TC_BACKLOG_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -50,6 +51,7 @@ impl StrategyMode {
 pub struct InterfaceControlStatus {
     pub name: String,
     pub status: InterfaceLinkStatus,
+    pub split_percentage: f64,
     pub tx_packets: u64,
     pub tx_bytes: u64,
     pub tx_mbps: f64,
@@ -80,6 +82,7 @@ pub struct ControlStatus {
 pub struct StrategyState {
     mode: Arc<AtomicU8>,
     strategy: Arc<AtomicU8>,
+    weighted_auto_split: Arc<AtomicBool>,
     monitor_packets: Arc<AtomicBool>,
     packets: Arc<AtomicU64>,
     payload_bytes: Arc<AtomicU64>,
@@ -105,10 +108,12 @@ struct InterfaceFailure;
 
 impl StrategyState {
     fn sync_ui(&self, ctx: &ClientCtx) {
-        ctx.record_strategy_state(
-            &format!("{:?}", self.mode()).to_lowercase(),
-            &format!("{:?}", self.current()).to_lowercase(),
-        );
+        let mode = if self.weighted_auto_split_enabled() && self.mode() == StrategyMode::Auto {
+            "auto+weighted".to_string()
+        } else {
+            format!("{:?}", self.mode()).to_lowercase()
+        };
+        ctx.record_strategy_state(&mode, &format!("{:?}", self.current()).to_lowercase());
     }
 
     pub fn current(&self) -> PathStrategy {
@@ -133,6 +138,7 @@ impl StrategyState {
         let endpoint_ids = self.endpoint_ids_by_interface.read();
         let health = self.health_by_interface.read();
         let statuses = self.interface_status.read();
+        let split_percentages = self.effective_split_percentages();
         let mut traffic = self.interface_traffic.write();
         for counters in traffic.values_mut() {
             counters.update_rate();
@@ -154,6 +160,7 @@ impl StrategyState {
                             .get(name)
                             .copied()
                             .unwrap_or(InterfaceLinkStatus::Dead),
+                        split_percentage: split_percentages.get(name).copied().unwrap_or(0.0),
                         tx_packets: counters.tx_packets,
                         tx_bytes: counters.tx_bytes,
                         tx_mbps: counters.tx_mbps,
@@ -164,6 +171,23 @@ impl StrategyState {
                 })
                 .collect(),
         }
+    }
+
+    pub fn weighted_auto_split_enabled(&self) -> bool {
+        self.weighted_auto_split.load(Ordering::Relaxed)
+    }
+
+    pub fn toggle_weighted_auto_split(&self, ctx: &ClientCtx) {
+        let enabled = !self.weighted_auto_split.fetch_xor(true, Ordering::Relaxed);
+        ctx.record_strategy_change(
+            if enabled {
+                "auto+weighted"
+            } else {
+                "auto weighted off"
+            },
+            "tui hotkey",
+        );
+        self.sync_ui(ctx);
     }
 
     pub fn set_mode(&self, mode: StrategyMode, ctx: &ClientCtx, reason: &str) {
@@ -238,7 +262,7 @@ impl StrategyState {
         } else {
             1.0 / interfaces.len() as f64
         };
-        let mut weights = interfaces
+        let weights = interfaces
             .iter()
             .map(|interface| {
                 percentages
@@ -250,12 +274,14 @@ impl StrategyState {
             })
             .collect::<Vec<_>>();
         let total = weights.iter().sum::<f64>();
-        if total <= f64::EPSILON {
-            weights.fill(even_weight);
-        } else {
-            weights.iter_mut().for_each(|weight| *weight /= total);
+        normalize_weights_with_fallback(weights, even_weight, total)
+    }
+
+    pub fn active_split_weights(&self, interfaces: &[String]) -> Vec<f64> {
+        if self.mode() == StrategyMode::Auto && self.weighted_auto_split_enabled() {
+            return self.auto_split_weights(interfaces);
         }
-        weights
+        self.split_weights(interfaces)
     }
 
     pub fn effective_split_percentages(&self) -> BTreeMap<String, f64> {
@@ -269,7 +295,7 @@ impl StrategyState {
     }
 
     pub fn effective_split_percentages_for(&self, interfaces: &[String]) -> BTreeMap<String, f64> {
-        let weights = self.split_weights(interfaces);
+        let weights = self.active_split_weights(interfaces);
         interfaces
             .iter()
             .cloned()
@@ -361,6 +387,42 @@ impl StrategyState {
         (healthy, degraded)
     }
 
+    fn auto_split_weights(&self, interfaces: &[String]) -> Vec<f64> {
+        if interfaces.is_empty() {
+            return Vec::new();
+        }
+
+        let health = self.health_by_interface.read();
+        let best_last_seq = interfaces
+            .iter()
+            .filter_map(|interface| health.get(interface).and_then(|state| state.last_seq))
+            .max();
+        let raw = interfaces
+            .iter()
+            .map(|interface| {
+                let Some(state) = health.get(interface) else {
+                    return AUTO_WEIGHT_MIN_SHARE;
+                };
+                let age_ms = unix_ms_now().saturating_sub(state.last_unix_ms);
+                if age_ms > AUTO_SPLIT_HEALTH_STALE_MS {
+                    return AUTO_WEIGHT_MIN_SHARE;
+                }
+
+                let lag_penalty = best_last_seq
+                    .zip(state.last_seq)
+                    .map(|(best, seq)| {
+                        let lag = best.saturating_sub(seq) as f64;
+                        (1.0 - lag / AUTO_SPLIT_DEGRADE_LAG_PACKETS as f64).clamp(0.0, 1.0)
+                    })
+                    .unwrap_or(1.0);
+                let throughput_weight = f64::from(state.server_mbps.max(0.0)).max(0.01);
+                (throughput_weight * lag_penalty).max(AUTO_WEIGHT_MIN_SHARE)
+            })
+            .collect::<Vec<_>>();
+
+        normalize_weights(raw)
+    }
+
     pub fn auto_split_ready(&self, interfaces: &[String]) -> bool {
         self.auto_path_groups(interfaces).0.len() >= 2
     }
@@ -413,6 +475,7 @@ pub fn spawn_strategy_loop(
     let state = StrategyState {
         mode: Arc::new(AtomicU8::new(StrategyMode::Auto as u8)),
         strategy: Arc::new(AtomicU8::new(PathStrategy::Split as u8)),
+        weighted_auto_split: Arc::new(AtomicBool::new(true)),
         monitor_packets: Arc::new(AtomicBool::new(true)),
         packets: Arc::new(AtomicU64::new(0)),
         payload_bytes: Arc::new(AtomicU64::new(0)),
@@ -549,6 +612,25 @@ fn unix_ms_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn normalize_weights(weights: Vec<f64>) -> Vec<f64> {
+    let fallback = if weights.is_empty() {
+        0.0
+    } else {
+        1.0 / weights.len() as f64
+    };
+    let total = weights.iter().sum::<f64>();
+    normalize_weights_with_fallback(weights, fallback, total)
+}
+
+fn normalize_weights_with_fallback(mut weights: Vec<f64>, fallback: f64, total: f64) -> Vec<f64> {
+    if total <= f64::EPSILON {
+        weights.fill(fallback);
+    } else {
+        weights.iter_mut().for_each(|weight| *weight /= total);
+    }
+    weights
 }
 
 async fn tc_backlog(interface: &str) -> Option<u64> {

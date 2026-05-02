@@ -17,40 +17,70 @@ pub enum SecretArg {
 pub struct InterfaceSpec {
     pub name: String,
     pub secret: Option<SecretKey>,
+    pub label: Option<String>,
 }
 
 pub struct InterfaceConfig {
     pub binding: InterfaceBinding,
     pub endpoint_id: String,
     pub secret_key: SecretKey,
+    pub label: String,
 }
 
 impl FromStr for InterfaceSpec {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some((name, secret)) = s.rsplit_once(':') {
-            if name.is_empty() {
-                return Err("interface name cannot be empty".to_string());
+        let parts = s.split(':').collect::<Vec<_>>();
+        match parts.as_slice() {
+            [name] => {
+                if name.is_empty() {
+                    return Err("interface name cannot be empty".to_string());
+                }
+                Ok(Self {
+                    name: (*name).to_string(),
+                    secret: None,
+                    label: None,
+                })
             }
-
-            let secret = SecretKey::from_str(secret).map_err(|_| {
-                "invalid interface secret; expected iroh secret key hex".to_string()
-            })?;
-            return Ok(Self {
-                name: name.to_string(),
-                secret: Some(secret),
-            });
+            [name, secret] => {
+                if name.is_empty() {
+                    return Err("interface name cannot be empty".to_string());
+                }
+                let secret = SecretKey::from_str(secret).map_err(|_| {
+                    "invalid interface secret; expected iroh secret key hex".to_string()
+                })?;
+                Ok(Self {
+                    name: (*name).to_string(),
+                    secret: Some(secret),
+                    label: None,
+                })
+            }
+            [name, secret, label] => {
+                if name.is_empty() {
+                    return Err("interface name cannot be empty".to_string());
+                }
+                if label.is_empty() {
+                    return Err("interface label cannot be empty".to_string());
+                }
+                let secret = if secret.is_empty() {
+                    None
+                } else {
+                    Some(SecretKey::from_str(secret).map_err(|_| {
+                        "invalid interface secret; expected iroh secret key hex".to_string()
+                    })?)
+                };
+                Ok(Self {
+                    name: (*name).to_string(),
+                    secret,
+                    label: Some((*label).to_string()),
+                })
+            }
+            _ => Err(
+                "interface spec must be interface, interface:secret, or interface:secret:label"
+                    .to_string(),
+            ),
         }
-
-        if s.is_empty() {
-            return Err("interface name cannot be empty".to_string());
-        }
-
-        Ok(Self {
-            name: s.to_string(),
-            secret: None,
-        })
     }
 }
 
@@ -107,11 +137,14 @@ pub fn parse_interface_configs(specs: &[InterfaceSpec]) -> Result<Vec<InterfaceC
 
 fn build_interface_config(spec: &InterfaceSpec) -> Result<InterfaceConfig> {
     let secret_key = spec.secret.clone().unwrap_or_else(|| SecretKey::generate());
-    let binding = resolve_interface_ipv4(&spec.name)?;
+    let mut binding = resolve_interface_ipv4(&spec.name)?;
+    let label = spec.label.clone().unwrap_or_else(|| spec.name.clone());
+    binding.display_name.clone_from(&label);
     let endpoint_id = secret_key.public().to_string();
     Ok(InterfaceConfig {
         binding,
         endpoint_id,
         secret_key,
+        label,
     })
 }

@@ -13,7 +13,7 @@
 	/** @typedef {{ connected?: boolean, disconnect?: () => void, getPrimaryService: (uuid: string) => Promise<BluetoothRemoteGATTService> }} BluetoothRemoteGATTServer */
 	/** @typedef {{ name?: string, gatt: BluetoothRemoteGATT, addEventListener: (event: 'gattserverdisconnected', handler: () => void) => void }} BluetoothDevice */
 	/** @typedef {{ requestDevice: (options: object) => Promise<BluetoothDevice> }} BluetoothApi */
-	/** @typedef {{ name: string, status?: 'connected' | 'reconnecting' | 'dead', tx_packets?: number, tx_bytes?: number, tx_mbps?: number, server_mbps?: number | null, server_last_seq?: number | null, server_max_seq?: number | null }} InterfaceStatus */
+	/** @typedef {{ name: string, status?: 'connected' | 'reconnecting' | 'dead', split_percentage?: number, tx_packets?: number, tx_bytes?: number, tx_mbps?: number, server_mbps?: number | null, server_last_seq?: number | null, server_max_seq?: number | null }} InterfaceStatus */
 	/** @typedef {{ mode: string, effective_strategy: string, packets: number, payload_bytes: number, interfaces: InterfaceStatus[] }} ControlStatus */
 	/** @typedef {{ enabled: boolean, decoding: boolean, jpeg_bytes: number, characteristic: string, offset_characteristic: string, chunk_bytes: number }} PreviewStatus */
 	/** @typedef {{ id: number, unix_ms: number, user: string, text: string }} ChatMessage */
@@ -429,6 +429,11 @@
 		return value == null ? '-' : String(value);
 	}
 
+	/** @param {number | null | undefined} value */
+	function formatSplit(value) {
+		return `${Math.round(value ?? 0)}%`;
+	}
+
 	/** @param {number | null | undefined} unixMs */
 	function formatChatTime(unixMs) {
 		if (!unixMs) return '';
@@ -636,14 +641,18 @@
 								<span class={['h-3 w-3 shrink-0 rounded-full shadow-[0_0_18px]', statusClasses(iface)]} title={statusLabel(iface)}></span>
 								<h2 class="min-w-0 truncate text-xl font-black tracking-[-0.05em]">{iface.name}</h2>
 							</div>
-							<div class="grid grid-cols-[auto_auto_auto] gap-1.5">
-								<div class={['rounded-2xl px-2 py-1.5 text-right', strategyClasses(effectiveStrategy)]}>
-									<p class="text-[0.55rem] font-black uppercase opacity-60">Mode</p>
-									<p class="text-xs font-black">{strategyLabel(effectiveStrategy)}</p>
-								</div>
-								<div class="min-w-16 rounded-2xl bg-black px-2 py-1.5 text-right">
-									<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">TX Mbps</p>
-									<p class="text-xs font-black text-emerald-400">{formatMbps(iface.tx_mbps)}</p>
+								<div class="grid grid-cols-[auto_auto_auto_auto] gap-1.5">
+									<div class={['rounded-2xl px-2 py-1.5 text-right', strategyClasses(effectiveStrategy)]}>
+										<p class="text-[0.55rem] font-black uppercase opacity-60">Mode</p>
+										<p class="text-xs font-black">{strategyLabel(effectiveStrategy)}</p>
+									</div>
+									<div class="min-w-14 rounded-2xl bg-black px-2 py-1.5 text-right">
+										<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">Split</p>
+										<p class="text-xs font-black text-amber-300">{formatSplit(iface.split_percentage)}</p>
+									</div>
+									<div class="min-w-16 rounded-2xl bg-black px-2 py-1.5 text-right">
+										<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">TX Mbps</p>
+										<p class="text-xs font-black text-emerald-400">{formatMbps(iface.tx_mbps)}</p>
 								</div>
 								<div class="min-w-16 rounded-2xl bg-black px-2 py-1.5 text-right">
 									<p class="text-[0.55rem] font-bold text-neutral-600 uppercase">Srv Mbps</p>

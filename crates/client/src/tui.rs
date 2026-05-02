@@ -36,6 +36,7 @@ pub enum UiCommand {
     SetRedundant,
     SetSplit,
     SetRoundRobin,
+    ToggleWeightedAuto,
 }
 
 #[derive(Clone)]
@@ -369,6 +370,11 @@ fn run(state: ClientUiState) -> io::Result<()> {
                             let _ = tx.send(UiCommand::SetSplit);
                         }
                     }
+                    KeyCode::Char('w') => {
+                        if let Some(tx) = &state.command_tx {
+                            let _ = tx.send(UiCommand::ToggleWeightedAuto);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -546,7 +552,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         state.effective_strategy.read().clone()
     )));
     header_lines.push(Line::from(
-        "keys a=auto  r=redundant  s=split  ctrl+r=roundrobin  q=quit",
+        "keys a=auto  w=weighted-auto  r=redundant  s=split  ctrl+r=roundrobin  q=quit",
     ));
     header_lines.push(Line::from(format!(
         "last ingest from {}",

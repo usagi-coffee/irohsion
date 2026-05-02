@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
             "-".to_string(),
             interface_configs
                 .iter()
-                .map(|config| config.binding.name.clone())
+                .map(|config| config.label.clone())
                 .collect(),
             Some(ui_command_tx),
         )
@@ -153,6 +153,7 @@ async fn main() -> Result<()> {
             binding,
             endpoint_id,
             secret_key,
+            label: _,
         } = config;
         let path = match connect_path_with_secret(
             binding.clone(),
@@ -167,13 +168,13 @@ async fn main() -> Result<()> {
                     .connection()
                     .expect("newly connected path has a live connection");
                 ctx.record_connection_paths(
-                    path.interface_name.clone(),
+                    path.display_name.clone(),
                     &endpoint_id,
                     &connection,
                     true,
                 );
                 ctx.connected_path(
-                    &path.interface_name,
+                    &path.display_name,
                     &endpoint_id,
                     SocketAddr::V4(
                         path.current_bound_addr()
@@ -184,10 +185,10 @@ async fn main() -> Result<()> {
             }
             Err(err) => {
                 ctx.record_send_error(
-                    binding.name.clone(),
+                    binding.display_name.clone(),
                     format!("initial connect failed, retrying: {err}"),
                 );
-                ctx.reconnect_failed(&binding.name, &err.to_string());
+                ctx.reconnect_failed(&binding.display_name, &err.to_string());
                 PathConnection::pending(binding, server_addr.clone(), secret_key, &cli.relays)
             }
         };
@@ -208,7 +209,7 @@ async fn main() -> Result<()> {
         paths
             .iter()
             .zip(health_endpoint_ids.iter())
-            .map(|(path, endpoint_id)| (path.interface_name.clone(), endpoint_id.clone()))
+            .map(|(path, endpoint_id)| (path.display_name.clone(), endpoint_id.clone()))
             .collect(),
         Duration::from_millis(cli.tc_backlog_poll_ms),
         cli.tc_backlog_degrade_bytes,
@@ -218,12 +219,12 @@ async fn main() -> Result<()> {
     let health = spawn_health_receivers(&paths, ctx.clone(), strategy.clone());
     for path in &paths {
         if path.reconnect_requested() {
-            strategy.record_interface_reconnecting(&path.interface_name);
+            strategy.record_interface_reconnecting(&path.display_name);
         }
     }
     let path_names = paths
         .iter()
-        .map(|path| path.interface_name.clone())
+        .map(|path| path.display_name.clone())
         .collect::<Vec<_>>();
     spawn_interface_watchers(&paths, strategy.clone(), ctx.clone());
     spawn_reconnect_loops(&paths, &health_endpoint_ids, strategy.clone(), ctx.clone());
@@ -254,6 +255,9 @@ async fn main() -> Result<()> {
                             &ctx,
                             "tui hotkey",
                         );
+                    }
+                    tui::UiCommand::ToggleWeightedAuto => {
+                        strategy.toggle_weighted_auto_split(&ctx);
                     }
                 }
             }
@@ -324,7 +328,7 @@ async fn main() -> Result<()> {
 
     for path in &paths {
         let path = path.clone();
-        let interface_name = path.interface_name.clone();
+        let interface_name = path.display_name.clone();
         let listen_socket = listen_socket.clone();
         let last_ingest_peer = last_ingest_peer.clone();
         let ctx = ctx.clone();
@@ -429,11 +433,12 @@ fn spawn_interface_watchers(
                 tokio::time::sleep(INTERFACE_WATCH_INTERVAL).await;
 
                 match resolve_interface_ipv4(&path.interface_name) {
-                    Ok(binding) => {
+                    Ok(mut binding) => {
+                        binding.display_name.clone_from(&path.display_name);
                         if let Some(endpoint) = path.mark_interface_changed(binding.clone()) {
-                            strategy.record_interface_reconnecting(&path.interface_name);
+                            strategy.record_interface_reconnecting(&path.display_name);
                             ctx.record_send_error(
-                                path.interface_name.clone(),
+                                path.display_name.clone(),
                                 format!(
                                     "interface address changed, reconnecting: {}",
                                     binding.bind_addr
@@ -452,7 +457,7 @@ fn spawn_interface_watchers(
                         } else {
                             path.request_reconnect();
                         }
-                        strategy.record_interface_dead(&path.interface_name);
+                        strategy.record_interface_dead(&path.display_name);
                     }
                 }
             }
@@ -478,7 +483,7 @@ fn spawn_connection_liveness(
                 };
 
                 ctx.record_connection_paths(
-                    path.interface_name.clone(),
+                    path.display_name.clone(),
                     &endpoint_id,
                     &connection,
                     false,
@@ -488,9 +493,9 @@ fn spawn_connection_liveness(
                 };
 
                 let connection_id = connection.stable_id();
-                strategy.record_interface_reconnecting(&path.interface_name);
+                strategy.record_interface_reconnecting(&path.display_name);
                 ctx.record_send_error(
-                    path.interface_name.clone(),
+                    path.display_name.clone(),
                     format!("connection closed: {reason}"),
                 );
                 if let Some(endpoint) = path.mark_failed(Some(connection_id)) {
@@ -530,9 +535,9 @@ fn spawn_split_display_updates(
                     !matches!(effective, PathStrategy::Split)
                         || split_interface_names
                             .iter()
-                            .any(|name| name == &path.interface_name)
+                            .any(|name| name == &path.display_name)
                 })
-                .map(|path| path.interface_name.clone())
+                .map(|path| path.display_name.clone())
                 .collect::<Vec<_>>();
             ctx.record_split_percentages(
                 &strategy.effective_split_percentages_for(&displayed_split_names),
@@ -558,47 +563,47 @@ fn spawn_reconnect_loops(
                     continue;
                 }
 
-                strategy.record_interface_reconnecting(&path.interface_name);
+                strategy.record_interface_reconnecting(&path.display_name);
                 match tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, path.reconnect()).await {
                     Ok(Ok(connection)) => {
                         retry_delay = Duration::from_millis(250);
-                        strategy.record_interface_success(&path.interface_name);
+                        strategy.record_interface_success(&path.display_name);
                         ctx.record_connection_paths(
-                            path.interface_name.clone(),
+                            path.display_name.clone(),
                             &endpoint_id,
                             &connection,
                             true,
                         );
                         if let Some(bound_addr) = path.current_bound_addr() {
                             ctx.connected_path(
-                                &path.interface_name,
+                                &path.display_name,
                                 &endpoint_id,
                                 SocketAddr::V4(bound_addr),
                             );
                         }
                     }
                     Ok(Err(err)) => {
-                        strategy.record_interface_dead(&path.interface_name);
+                        strategy.record_interface_dead(&path.display_name);
                         let error = err.to_string();
                         ctx.record_send_error(
-                            path.interface_name.clone(),
+                            path.display_name.clone(),
                             format!("reconnect failed: {error}"),
                         );
-                        ctx.reconnect_failed(&path.interface_name, &error);
+                        ctx.reconnect_failed(&path.display_name, &error);
                         tokio::time::sleep(retry_delay).await;
                         retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
                     }
                     Err(_) => {
-                        strategy.record_interface_dead(&path.interface_name);
+                        strategy.record_interface_dead(&path.display_name);
                         let error = format!(
                             "reconnect timed out after {}s",
                             RECONNECT_ATTEMPT_TIMEOUT.as_secs()
                         );
                         ctx.record_send_error(
-                            path.interface_name.clone(),
+                            path.display_name.clone(),
                             format!("reconnect failed: {error}"),
                         );
-                        ctx.reconnect_failed(&path.interface_name, &error);
+                        ctx.reconnect_failed(&path.display_name, &error);
                         tokio::time::sleep(retry_delay).await;
                         retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
                     }
@@ -639,18 +644,18 @@ fn send_packet(
         .filter(|path| {
             split_interface_names
                 .iter()
-                .any(|name| name == &path.interface_name)
+                .any(|name| name == &path.display_name)
         })
         .collect::<Vec<_>>();
     let displayed_split_names = if matches!(effective, PathStrategy::Split) {
         split_paths
             .iter()
-            .map(|path| path.interface_name.clone())
+            .map(|path| path.display_name.clone())
             .collect::<Vec<_>>()
     } else {
         active_paths
             .iter()
-            .map(|path| path.interface_name.clone())
+            .map(|path| path.display_name.clone())
             .collect::<Vec<_>>()
     };
     ctx.record_split_percentages(&strategy.effective_split_percentages_for(&displayed_split_names));
@@ -663,7 +668,7 @@ fn send_packet(
             .filter(|path| {
                 rescue_interface_names
                     .iter()
-                    .any(|name| name == &path.interface_name)
+                    .any(|name| name == &path.display_name)
             })
             .collect::<Vec<_>>()
     };
@@ -677,11 +682,11 @@ fn send_packet(
     ) {
         let split_names = split_paths
             .iter()
-            .map(|path| path.interface_name.clone())
+            .map(|path| path.display_name.clone())
             .collect::<Vec<_>>();
         let fragments = u8::try_from(split_paths.len()).expect("path count fits in u8");
         let split_ranges =
-            weighted_split_ranges(payload.len(), &strategy.split_weights(&split_names));
+            weighted_split_ranges(payload.len(), &strategy.active_split_weights(&split_names));
         for (fragment, path) in split_paths.iter().enumerate() {
             let (start, end) = split_ranges[fragment];
             let packet = Arc::new(encode_packet(
@@ -758,24 +763,24 @@ fn send_on_path(
     let connection_id = path.connection_id();
     match path.send(packet) {
         Ok(()) => {
-            strategy.record_interface_success(&path.interface_name);
-            strategy.record_interface_send(&path.interface_name, packet_len);
-            ctx.record_send(path.interface_name.clone(), payload_len);
+            strategy.record_interface_success(&path.display_name);
+            strategy.record_interface_send(&path.display_name, packet_len);
+            ctx.record_send(path.display_name.clone(), payload_len);
         }
         Err(err) => {
-            strategy.record_interface_failure(&path.interface_name);
+            strategy.record_interface_failure(&path.display_name);
             if let Some(endpoint) = path.mark_failed(connection_id) {
                 tokio::spawn(async move {
                     endpoint.close().await;
                 });
             }
-            ctx.record_send_error(path.interface_name.clone(), err.to_string());
-            ctx.send_failure(&path.interface_name, seq, &err.to_string());
+            ctx.record_send_error(path.display_name.clone(), err.to_string());
+            ctx.send_failure(&path.display_name, seq, &err.to_string());
             strategy.degrade_to_redundant(
                 ctx,
                 format!(
                     "send error interface={} sequence={} error={err}",
-                    path.interface_name, seq
+                    path.display_name, seq
                 ),
             );
         }

@@ -49,12 +49,14 @@ pub struct HealthReport {
 #[derive(Clone, Debug)]
 pub struct InterfaceBinding {
     pub name: String,
+    pub display_name: String,
     pub bind_addr: SocketAddrV4,
 }
 
 #[derive(Clone)]
 pub struct PathConnection {
     pub interface_name: String,
+    pub display_name: String,
     pub bound_addr: SocketAddrV4,
     server_addr: EndpointAddr,
     secret_key: SecretKey,
@@ -73,10 +75,10 @@ impl PathConnection {
     pub fn send(&self, packet: Arc<Bytes>) -> Result<()> {
         let connection = self
             .connection()
-            .with_context(|| format!("path {} has no live connection", self.interface_name))?;
+            .with_context(|| format!("path {} has no live connection", self.display_name))?;
         connection
             .send_datagram((*packet).clone())
-            .map_err(|err| anyhow!("send_datagram failed on {}: {err}", self.interface_name))
+            .map_err(|err| anyhow!("send_datagram failed on {}: {err}", self.display_name))
     }
 
     pub fn connection(&self) -> Option<iroh::endpoint::Connection> {
@@ -127,6 +129,7 @@ impl PathConnection {
     ) -> Self {
         Self {
             interface_name: binding.name,
+            display_name: binding.display_name,
             bound_addr: binding.bind_addr,
             server_addr,
             secret_key,
@@ -165,7 +168,8 @@ impl PathConnection {
     }
 
     pub async fn reconnect(&self) -> Result<iroh::endpoint::Connection> {
-        let binding = resolve_interface_ipv4(&self.interface_name)?;
+        let mut binding = resolve_interface_ipv4(&self.interface_name)?;
+        binding.display_name.clone_from(&self.display_name);
         let live = connect_live_path(
             binding,
             self.server_addr.clone(),
@@ -203,11 +207,13 @@ pub async fn connect_path_with_secret(
     relays: &[RelayUrl],
 ) -> Result<PathConnection> {
     let interface_name = binding.name.clone();
+    let display_name = binding.display_name.clone();
     let live = connect_live_path(binding, server_addr.clone(), secret_key.clone(), relays).await?;
     let bound_addr = live.binding.bind_addr;
 
     Ok(PathConnection {
         interface_name,
+        display_name,
         bound_addr,
         server_addr,
         secret_key,
@@ -245,7 +251,7 @@ async fn connect_live_path(
     let connection = endpoint
         .connect(server_addr, ALPN)
         .await
-        .with_context(|| format!("failed to connect path {}", binding.name))?;
+        .with_context(|| format!("failed to connect path {}", binding.display_name))?;
 
     Ok(LivePath {
         binding,
@@ -286,6 +292,7 @@ pub fn resolve_interface_ipv4(name: &str) -> Result<InterfaceBinding> {
     let addr = find_interface_ipv4(name)?;
     Ok(InterfaceBinding {
         name: name.to_string(),
+        display_name: name.to_string(),
         bind_addr: SocketAddrV4::new(addr, 0),
     })
 }
