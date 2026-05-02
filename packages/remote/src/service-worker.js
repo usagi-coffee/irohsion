@@ -1,8 +1,16 @@
 import { build, files, prerendered, version } from "$service-worker";
 
 const CACHE_NAME = `irohsion-remote-${version}`;
+const SCOPE_PATH = new URL(self.registration.scope).pathname.replace(/\/$/, "");
+const scoped = (path) => {
+  if (!SCOPE_PATH || path.startsWith(`${SCOPE_PATH}/`)) return path;
+  if (path === "/") return `${SCOPE_PATH}/`;
+  return `${SCOPE_PATH}${path}`;
+};
 const APP_SHELL = [
-  ...new Set([...build, ...files, ...prerendered, "/", "/index.html"]),
+  ...new Set(
+    [...build, ...files, ...prerendered, "/", "/index.html"].map(scoped),
+  ),
 ];
 
 self.addEventListener("install", (event) => {
@@ -56,7 +64,7 @@ self.addEventListener("fetch", (event) => {
         }
 
         if (event.request.mode === "navigate") {
-          return (await cache.match("/")) || cache.match("/index.html");
+          return (await cache.match(scoped("/"))) || cache.match(scoped("/index.html"));
         }
 
         throw error;

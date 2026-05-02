@@ -1,4 +1,5 @@
 <script>
+	import { base } from '$app/paths';
 	import './layout.css';
 	import favicon from '$lib/assets/favicon.svg';
 
@@ -6,7 +7,7 @@
 
 	function registerServiceWorker() {
 		if (!('serviceWorker' in navigator)) return;
-		navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+		navigator.serviceWorker.register(`${base}/service-worker.js`).catch(() => {});
 	}
 </script>
 
