@@ -16,8 +16,8 @@ use bytes::Bytes;
 use clap::{ArgAction, Parser};
 use cli::{InterfaceSpec, SecretArg, parse_interface_configs};
 use client_remote::{
-    RemoteConfig, RemoteControlHooks, RemotePreview, RemotePreviewHooks, RemoteReady, RemoteServer,
-    spawn_remote_server,
+    RemoteChatHooks, RemoteConfig, RemoteControlHooks, RemotePreview, RemotePreviewHooks,
+    RemoteReady, RemoteServer, spawn_remote_server,
 };
 use context::ClientCtx;
 use health::spawn_health_receivers;
@@ -269,6 +269,11 @@ async fn main() -> Result<()> {
             },
             |_| Ok(()),
         ));
+        let chat_ctx = ctx.clone();
+        let chat = Arc::new(RemoteChatHooks::new(move || {
+            serde_json::to_value(chat_ctx.chat_messages())
+                .unwrap_or(serde_json::Value::Array(Vec::new()))
+        }));
         let remote_preview = preview.clone().map(|preview| {
             let enabled_preview = preview.clone();
             let set_enabled_preview = preview.clone();
@@ -290,6 +295,7 @@ async fn main() -> Result<()> {
             },
             control,
             preview: remote_preview,
+            chat: Some(chat),
             obs,
             on_ready: Arc::new(move |ready: RemoteReady| {
                 ready_ctx.record_remote_ready(

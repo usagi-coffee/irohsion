@@ -25,6 +25,7 @@ use protocol::{DecodedPacket, MAX_SEQUENCE, PacketHeader, decode_packet};
 use runtime::wait_for_shutdown;
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::timeout};
 use transport::ALPN;
+use twitch_remote::spawn_twitch_chat;
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
 const RESTART_BACKWARD_GAP: u64 = 4_096;
@@ -46,6 +47,10 @@ struct Cli {
     flow_idle_reset_secs: u64,
     #[arg(long, default_value_t = 100)]
     max_reorder_delay_ms: u64,
+    #[arg(long)]
+    twitch_channel: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    twitch_chat_history: usize,
 }
 
 #[derive(Debug)]
@@ -169,6 +174,10 @@ async fn main() -> Result<()> {
     let health_connections: HealthConnections = Arc::new(RwLock::new(BTreeMap::new()));
     let health_targets: HealthTargets = Arc::new(RwLock::new(std::collections::HashSet::new()));
     let health_stats: HealthStats = Arc::new(RwLock::new(BTreeMap::new()));
+    let twitch_chat = cli
+        .twitch_channel
+        .clone()
+        .map(|channel| spawn_twitch_chat(channel, cli.twitch_chat_history));
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
     {
@@ -205,9 +214,10 @@ async fn main() -> Result<()> {
     {
         let health_connections = health_connections.clone();
         let health_stats = health_stats.clone();
+        let twitch_chat = twitch_chat.clone();
         let interval = Duration::from_millis(cli.health_interval_ms);
         tasks.push(tokio::spawn(async move {
-            let _ = health_loop(health_connections, health_stats, interval).await;
+            let _ = health_loop(health_connections, health_stats, twitch_chat, interval).await;
         }));
     }
 

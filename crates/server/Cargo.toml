@@ -16,3 +16,4 @@ rand.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 transport.workspace = true
+twitch-remote.workspace = true

@@ -16,7 +16,8 @@
 	/** @typedef {{ name: string, status?: 'connected' | 'reconnecting' | 'dead', tx_packets?: number, tx_bytes?: number, tx_mbps?: number, server_mbps?: number | null, server_last_seq?: number | null, server_max_seq?: number | null }} InterfaceStatus */
 	/** @typedef {{ mode: string, effective_strategy: string, packets: number, payload_bytes: number, interfaces: InterfaceStatus[] }} ControlStatus */
 	/** @typedef {{ enabled: boolean, decoding: boolean, jpeg_bytes: number, characteristic: string, offset_characteristic: string, chunk_bytes: number }} PreviewStatus */
-	/** @typedef {{ control: ControlStatus, preview?: PreviewStatus }} RemoteStatus */
+	/** @typedef {{ id: number, unix_ms: number, user: string, text: string }} ChatMessage */
+	/** @typedef {{ control: ControlStatus, preview?: PreviewStatus, chat?: ChatMessage[] }} RemoteStatus */
 	/** @typedef {{ enabled: boolean, connected: boolean, host: string, port: number, last_error?: string | null, recording?: boolean | null, recording_bitrate_kbps?: number | null, recording_bitrate_category: string, recording_bitrate_name: string }} ObsStatus */
 
 	/** @type {BluetoothDevice | null} */
@@ -44,6 +45,7 @@
 	let interfaces = $derived(getInterfaces(status));
 	let effectiveStrategy = $derived(getEffectiveStrategy(status));
 	let previewReady = $derived(isPreviewAvailable(status));
+	let chatMessages = $derived(getChatMessages(status));
 
 	/** @param {RemoteStatus | null} value */
 	function getInterfaces(value) {
@@ -58,6 +60,11 @@
 	/** @param {RemoteStatus | null} value */
 	function isPreviewAvailable(value) {
 		return Boolean(value && value.preview?.enabled);
+	}
+
+	/** @param {RemoteStatus | null} value */
+	function getChatMessages(value) {
+		return value?.chat ?? [];
 	}
 
 	/** @param {BluetoothRemoteGATTServer | null} value */
@@ -422,6 +429,12 @@
 		return value == null ? '-' : String(value);
 	}
 
+	/** @param {number | null | undefined} unixMs */
+	function formatChatTime(unixMs) {
+		if (!unixMs) return '';
+		return new Date(unixMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+	}
+
 	/** @param {InterfaceStatus} iface */
 	function statusLabel(iface) {
 		if (iface.status === 'connected') return 'Connected';
@@ -658,6 +671,33 @@
 				{#if obsError}
 					<p class="mt-2 text-xs font-bold text-amber-300">{obsError}</p>
 				{/if}
+			</section>
+
+			<section class="rounded-3xl border border-white/10 bg-neutral-950 p-3">
+				<div class="mb-2 flex items-center justify-between gap-3">
+					<div>
+						<p class="text-[0.6rem] font-bold text-neutral-500 uppercase">Twitch Chat</p>
+						<p class="text-xl font-black tracking-[-0.05em]">{chatMessages.length} messages</p>
+					</div>
+				</div>
+
+				<div class="grid max-h-72 gap-2 overflow-y-auto pr-1">
+					{#if chatMessages.length}
+						{#each chatMessages as message (message.id)}
+							<article class="rounded-2xl bg-black px-3 py-2">
+								<div class="mb-1 flex items-baseline justify-between gap-2">
+									<p class="min-w-0 truncate text-sm font-black text-sky-300">{message.user}</p>
+									<p class="shrink-0 text-[0.6rem] font-bold text-neutral-600">{formatChatTime(message.unix_ms)}</p>
+								</div>
+								<p class="break-words text-sm font-semibold text-neutral-100">{message.text}</p>
+							</article>
+						{/each}
+					{:else}
+						<p class="rounded-2xl bg-black px-3 py-4 text-sm font-bold text-neutral-600">
+							No chat messages
+						</p>
+					{/if}
+				</div>
 			</section>
 		{:else}
 			<section class="rounded-3xl border border-white/10 bg-neutral-950 p-5">

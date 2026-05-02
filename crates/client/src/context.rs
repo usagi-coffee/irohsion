@@ -1,14 +1,17 @@
 use crate::tui;
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use transport::{HealthReport, transport_kind};
+use transport::{ChatMessage, HealthReport, transport_kind};
+
+const MAX_CHAT_MESSAGES: usize = 100;
 
 #[derive(Clone)]
 pub struct ClientCtx {
     ui: Option<tui::ClientUiState>,
     last_health_unix_ms: Arc<RwLock<Option<u64>>>,
+    chat_messages: Arc<RwLock<VecDeque<ChatMessage>>>,
 }
 
 impl Default for ClientCtx {
@@ -16,6 +19,7 @@ impl Default for ClientCtx {
         Self {
             ui: None,
             last_health_unix_ms: Arc::new(RwLock::new(None)),
+            chat_messages: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_CHAT_MESSAGES))),
         }
     }
 }
@@ -25,6 +29,7 @@ impl ClientCtx {
         Self {
             ui,
             last_health_unix_ms: Arc::new(RwLock::new(None)),
+            chat_messages: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_CHAT_MESSAGES))),
         }
     }
 
@@ -76,9 +81,31 @@ impl ClientCtx {
             return;
         }
         *last = Some(report.unix_ms);
+        self.record_chat_messages(&report.chat);
         if let Some(ui) = &self.ui {
             ui.record_health_received();
             ui.record_endpoint_health(&report.endpoints);
+        }
+    }
+
+    pub fn chat_messages(&self) -> Vec<ChatMessage> {
+        self.chat_messages.read().iter().cloned().collect()
+    }
+
+    fn record_chat_messages(&self, messages: &[ChatMessage]) {
+        if messages.is_empty() {
+            return;
+        }
+
+        let mut stored = self.chat_messages.write();
+        for message in messages {
+            if stored.iter().any(|existing| existing.id == message.id) {
+                continue;
+            }
+            stored.push_back(message.clone());
+        }
+        while stored.len() > MAX_CHAT_MESSAGES {
+            stored.pop_front();
         }
     }
 

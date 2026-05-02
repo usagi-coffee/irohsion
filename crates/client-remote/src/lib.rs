@@ -85,6 +85,28 @@ pub trait RemotePreview: Send + Sync + 'static {
     fn latest_jpeg(&self) -> Vec<u8>;
 }
 
+pub trait RemoteChat: Send + Sync + 'static {
+    fn messages(&self) -> serde_json::Value;
+}
+
+pub struct RemoteChatHooks {
+    messages: Arc<dyn Fn() -> serde_json::Value + Send + Sync>,
+}
+
+impl RemoteChatHooks {
+    pub fn new(messages: impl Fn() -> serde_json::Value + Send + Sync + 'static) -> Self {
+        Self {
+            messages: Arc::new(messages),
+        }
+    }
+}
+
+impl RemoteChat for RemoteChatHooks {
+    fn messages(&self) -> serde_json::Value {
+        (self.messages)()
+    }
+}
+
 pub struct RemotePreviewHooks {
     enabled: Arc<dyn Fn() -> bool + Send + Sync>,
     set_enabled: Arc<dyn Fn(bool) + Send + Sync>,
@@ -139,6 +161,7 @@ pub struct RemoteServer {
     pub config: RemoteConfig,
     pub control: Arc<dyn RemoteControl>,
     pub preview: Option<Arc<dyn RemotePreview>>,
+    pub chat: Option<Arc<dyn RemoteChat>>,
     pub obs: Option<ObsRemote>,
     pub on_ready: Arc<dyn Fn(RemoteReady) + Send + Sync>,
 }
@@ -148,6 +171,7 @@ pub async fn spawn_remote_server(server: RemoteServer) -> Result<()> {
         config,
         control,
         preview,
+        chat,
         obs,
         on_ready,
     } = server;
@@ -178,6 +202,7 @@ pub async fn spawn_remote_server(server: RemoteServer) -> Result<()> {
     let read_config = config.clone();
     let read_control = control.clone();
     let read_preview = preview.clone();
+    let read_chat = chat.clone();
     let status_offset = Arc::new(AtomicUsize::new(0));
     let status_offset_read = status_offset.clone();
     let status_offset_write = status_offset.clone();
@@ -187,6 +212,7 @@ pub async fn spawn_remote_server(server: RemoteServer) -> Result<()> {
     let status_write_config = config.clone();
     let status_write_control = control.clone();
     let status_write_preview = preview.clone();
+    let status_write_chat = chat.clone();
     let write_control = control.clone();
     let write_preview_control = preview.clone();
     let preview_read = preview.clone();
@@ -211,13 +237,18 @@ pub async fn spawn_remote_server(server: RemoteServer) -> Result<()> {
                         let config = read_config.clone();
                         let control = read_control.clone();
                         let preview = read_preview.clone();
+                        let chat = read_chat.clone();
                         let status_offset = status_offset_read.clone();
                         let status_snapshot = status_snapshot_read.clone();
                         Box::pin(async move {
                             let mut snapshot = status_snapshot.read().clone();
                             if snapshot.is_empty() {
-                                snapshot =
-                                    build_status_payload(&config, &*control, preview.as_deref())?;
+                                snapshot = build_status_payload(
+                                    &config,
+                                    &*control,
+                                    preview.as_deref(),
+                                    chat.as_deref(),
+                                )?;
                                 *status_snapshot.write() = snapshot.clone();
                             }
                             let max_len = (request.mtu.saturating_sub(1).max(1) as usize)
@@ -243,11 +274,16 @@ pub async fn spawn_remote_server(server: RemoteServer) -> Result<()> {
                         let config = status_write_config.clone();
                         let control = status_write_control.clone();
                         let preview = status_write_preview.clone();
+                        let chat = status_write_chat.clone();
                         Box::pin(async move {
                             let offset = parse_u32_offset(&value)?;
                             if offset == 0 {
-                                *status_snapshot.write() =
-                                    build_status_payload(&config, &*control, preview.as_deref())?;
+                                *status_snapshot.write() = build_status_payload(
+                                    &config,
+                                    &*control,
+                                    preview.as_deref(),
+                                    chat.as_deref(),
+                                )?;
                             }
                             status_offset.store(offset, Ordering::Relaxed);
                             Ok(())
@@ -416,8 +452,10 @@ fn build_status_payload(
     config: &RemoteConfig,
     control: &dyn RemoteControl,
     preview: Option<&dyn RemotePreview>,
+    chat: Option<&dyn RemoteChat>,
 ) -> bluer::gatt::local::ReqResult<Vec<u8>> {
-    serde_json::to_vec(&status_payload(config, control, preview)).map_err(|_| ReqError::Failed)
+    serde_json::to_vec(&status_payload(config, control, preview, chat))
+        .map_err(|_| ReqError::Failed)
 }
 
 #[derive(Serialize)]
@@ -428,6 +466,7 @@ struct StatusPayload {
     relays: Vec<String>,
     control: serde_json::Value,
     preview: PreviewStatus,
+    chat: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -449,6 +488,7 @@ fn status_payload(
     config: &RemoteConfig,
     control: &dyn RemoteControl,
     preview: Option<&dyn RemotePreview>,
+    chat: Option<&dyn RemoteChat>,
 ) -> StatusPayload {
     StatusPayload {
         kind: "irohsion-client-remote",
@@ -456,6 +496,9 @@ fn status_payload(
         addrs: config.addrs.iter().map(ToString::to_string).collect(),
         relays: config.relays.iter().map(ToString::to_string).collect(),
         control: control.status(),
+        chat: chat
+            .map(RemoteChat::messages)
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
         preview: PreviewStatus {
             enabled: preview.is_some(),
             decoding: preview.is_some_and(RemotePreview::enabled),

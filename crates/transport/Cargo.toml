@@ -9,4 +9,5 @@ bytes.workspace = true
 iroh.workspace = true
 libc.workspace = true
 rand.workspace = true
+serde.workspace = true
 tracing.workspace = true

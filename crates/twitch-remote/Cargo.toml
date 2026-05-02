@@ -1,0 +1,10 @@
+[package]
+name = "twitch-remote"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+twitch-irc.workspace = true

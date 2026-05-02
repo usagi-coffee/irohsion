@@ -6,6 +6,7 @@ members = [
     "crates/identity",
     "crates/obs-remote",
     "crates/client-remote",
+    "crates/twitch-remote",
     "crates/client",
     "crates/bench",
     "crates/server",
@@ -40,7 +41,9 @@ serde_json = "1.0"
 tokio = { version = "1.52", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+twitch-irc = "6"
 uuid = "1.19"
+twitch-remote = { path = "crates/twitch-remote" }
 
 [patch.crates-io]
 netwatch = { git = "https://github.com/usagi-coffee/net-tools" }

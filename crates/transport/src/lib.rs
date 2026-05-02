@@ -30,11 +30,20 @@ pub struct EndpointHealth {
     pub max_seq: Option<u64>,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChatMessage {
+    pub id: u64,
+    pub unix_ms: u64,
+    pub user: String,
+    pub text: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct HealthReport {
     pub seq: u64,
     pub unix_ms: u64,
     pub endpoints: Vec<EndpointHealth>,
+    pub chat: Vec<ChatMessage>,
 }
 
 #[derive(Clone, Debug)]
@@ -319,6 +328,15 @@ pub fn encode_health_report(report: &HealthReport) -> Bytes {
                 .unwrap_or_else(|| "-".to_string())
         ));
     }
+    for message in &report.chat {
+        payload.push_str(&format!(
+            "chat\t{}\t{}\t{}\t{}\n",
+            message.id,
+            message.unix_ms,
+            encode_health_text(&message.user),
+            encode_health_text(&message.text)
+        ));
+    }
     Bytes::from(payload)
 }
 
@@ -345,6 +363,7 @@ pub fn decode_health_report(data: &[u8]) -> Result<HealthReport> {
         .parse()
         .context("invalid health report unix_ms")?;
     let mut endpoints = Vec::new();
+    let mut chat = Vec::new();
     for line in lines {
         if line.is_empty() {
             continue;
@@ -352,6 +371,28 @@ pub fn decode_health_report(data: &[u8]) -> Result<HealthReport> {
 
         let mut fields = line.split('\t');
         let kind = fields.next().context("missing health report row kind")?;
+        if kind == "chat" {
+            let id = fields
+                .next()
+                .context("missing chat id")?
+                .parse()
+                .context("invalid chat id")?;
+            let unix_ms = fields
+                .next()
+                .context("missing chat unix_ms")?
+                .parse()
+                .context("invalid chat unix_ms")?;
+            let user = decode_health_text(fields.next().context("missing chat user")?);
+            let text = decode_health_text(fields.next().context("missing chat text")?);
+            chat.push(ChatMessage {
+                id,
+                unix_ms,
+                user,
+                text,
+            });
+            continue;
+        }
+
         if kind != "endpoint" {
             bail!("unexpected health report row kind");
         }
@@ -392,7 +433,82 @@ pub fn decode_health_report(data: &[u8]) -> Result<HealthReport> {
         seq,
         unix_ms,
         endpoints,
+        chat,
     })
+}
+
+fn encode_health_text(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => encoded.push_str("\\\\"),
+            '\t' => encoded.push_str("\\t"),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            _ => encoded.push(ch),
+        }
+    }
+    encoded
+}
+
+fn decode_health_text(text: &str) -> String {
+    let mut decoded = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('\\') => decoded.push('\\'),
+            Some('t') => decoded.push('\t'),
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_report_round_trips_chat_messages() {
+        let report = HealthReport {
+            seq: 7,
+            unix_ms: 1234,
+            endpoints: vec![EndpointHealth {
+                endpoint_id: "endpoint".to_string(),
+                achieved_mbps: 1.25,
+                last_seq: Some(10),
+                max_seq: Some(12),
+            }],
+            chat: vec![ChatMessage {
+                id: 42,
+                unix_ms: 5678,
+                user: "viewer\tname".to_string(),
+                text: "hello\\nnot newline\nsecond line".to_string(),
+            }],
+        };
+
+        let decoded = decode_health_report(&encode_health_report(&report)).unwrap();
+
+        assert_eq!(decoded.seq, report.seq);
+        assert_eq!(decoded.unix_ms, report.unix_ms);
+        assert_eq!(decoded.endpoints.len(), 1);
+        assert_eq!(decoded.chat.len(), 1);
+        assert_eq!(decoded.chat[0].id, report.chat[0].id);
+        assert_eq!(decoded.chat[0].unix_ms, report.chat[0].unix_ms);
+        assert_eq!(decoded.chat[0].user, report.chat[0].user);
+        assert_eq!(decoded.chat[0].text, report.chat[0].text);
+    }
 }
 
 fn find_interface_ipv4(name: &str) -> Result<Ipv4Addr> {

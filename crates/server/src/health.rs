@@ -7,7 +7,8 @@ use std::{
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use parking_lot::RwLock;
-use transport::{EndpointHealth, HEALTH_ALPN, HealthReport, encode_health_report};
+use transport::{ChatMessage, EndpointHealth, HEALTH_ALPN, HealthReport, encode_health_report};
+use twitch_remote::TwitchChat;
 
 #[derive(Clone)]
 pub struct HealthConnection {
@@ -29,6 +30,7 @@ pub struct EndpointSample {
 pub async fn health_loop(
     health_connections: HealthConnections,
     health_stats: HealthStats,
+    twitch_chat: Option<TwitchChat>,
     interval: Duration,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
@@ -40,7 +42,13 @@ pub async fn health_loop(
             continue;
         }
 
-        let report = build_health_report(seq, &health_stats, &connections, interval)?;
+        let report = build_health_report(
+            seq,
+            &health_stats,
+            &connections,
+            twitch_chat.as_ref(),
+            interval,
+        )?;
         seq = seq.wrapping_add(1);
         let payload = encode_health_report(&report);
         let mut failed = Vec::new();
@@ -124,6 +132,7 @@ fn build_health_report(
     seq: u64,
     health_stats: &HealthStats,
     health_connections: &BTreeMap<String, HealthConnection>,
+    twitch_chat: Option<&TwitchChat>,
     interval: Duration,
 ) -> Result<HealthReport> {
     let interval_secs = interval.as_secs_f32().max(0.001);
@@ -147,6 +156,19 @@ fn build_health_report(
         seq,
         unix_ms: unix_ms_now()?,
         endpoints,
+        chat: twitch_chat
+            .map(|chat| {
+                chat.recent_messages()
+                    .into_iter()
+                    .map(|message| ChatMessage {
+                        id: message.id,
+                        unix_ms: message.unix_ms,
+                        user: message.user,
+                        text: message.text,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
