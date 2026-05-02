@@ -254,6 +254,13 @@ async fn main() -> Result<()> {
                         connection: connection.clone(),
                     },
                 );
+            health_connections.write().insert(
+                remote_key.clone(),
+                health::HealthConnection {
+                    connection: connection.clone(),
+                    stable_id,
+                },
+            );
             let should_spawn_health = {
                 let mut targets = health_targets.write();
                 targets.insert(remote_key.clone())
@@ -300,6 +307,13 @@ async fn main() -> Result<()> {
                     },
                     Err(err) => {
                         remove_connection_if_current(&connections, &remote_key, stable_id);
+                        if health_connections
+                            .read()
+                            .get(&remote_key)
+                            .is_some_and(|connection| connection.stable_id == stable_id)
+                        {
+                            health_connections.write().remove(&remote_key);
+                        }
                         ctx.record_disconnect(remote_key.clone(), err.to_string());
                         break;
                     }

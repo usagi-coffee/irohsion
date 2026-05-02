@@ -1,5 +1,7 @@
 # AGENTS
 
+< DO NOT KEEP BACKWARD COMPATIBLITY >
+
 ## Goals
 
 Multipath UDP stream over `iroh`.

@@ -2,7 +2,6 @@ mod context;
 mod health;
 mod path_strategy;
 mod preview;
-mod remote;
 mod runtime;
 mod tui;
 
@@ -16,6 +15,10 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{ArgAction, Parser};
 use cli::{InterfaceSpec, SecretArg, parse_interface_configs};
+use client_remote::{
+    RemoteConfig, RemoteControlHooks, RemotePreview, RemotePreviewHooks, RemoteReady, RemoteServer,
+    spawn_remote_server,
+};
 use context::ClientCtx;
 use health::spawn_health_receivers;
 use iroh::{EndpointId, RelayUrl};
@@ -24,11 +27,11 @@ use parking_lot::RwLock;
 use path_strategy::{PathStrategy, StrategyMode, spawn_strategy_loop};
 use preview::spawn_preview;
 use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_packet};
-use remote::{RemoteConfig, spawn_remote_server};
 use runtime::wait_for_shutdown;
 use tokio::{net::UdpSocket, sync::mpsc};
 use transport::{
-    PathConnection, build_server_addr, connect_path_with_secret, resolve_interface_ipv4,
+    PathConnection, build_server_addr, connect_path_with_secret, decode_health_report,
+    resolve_interface_ipv4,
 };
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
@@ -75,8 +78,6 @@ struct Cli {
     remote_preview_max_jpeg_bytes: usize,
     #[arg(long, default_value_t = 10)]
     remote_preview_decode_interval_secs: u64,
-    #[arg(long)]
-    obs_remote: bool,
     #[arg(long, default_value = "127.0.0.1")]
     obs_websocket_host: String,
     #[arg(long, default_value_t = 4455)]
@@ -151,7 +152,12 @@ async fn main() -> Result<()> {
                 let connection = path
                     .connection()
                     .expect("newly connected path has a live connection");
-                ctx.record_connection_paths(path.interface_name.clone(), &endpoint_id, &connection);
+                ctx.record_connection_paths(
+                    path.interface_name.clone(),
+                    &endpoint_id,
+                    &connection,
+                    true,
+                );
                 ctx.connected_path(
                     &path.interface_name,
                     &endpoint_id,
@@ -249,27 +255,52 @@ async fn main() -> Result<()> {
         )
     });
     if cli.remote {
-        let obs = cli.obs_remote.then(|| {
-            ObsRemote::new(ObsConfig {
-                host: cli.obs_websocket_host.clone(),
-                port: cli.obs_websocket_port,
-                password: cli.obs_websocket_password.clone(),
-                recording_bitrate_category: cli.obs_recording_bitrate_category.clone(),
-                recording_bitrate_name: cli.obs_recording_bitrate_name.clone(),
-            })
+        let obs = Some(ObsRemote::new(ObsConfig {
+            host: cli.obs_websocket_host.clone(),
+            port: cli.obs_websocket_port,
+            password: cli.obs_websocket_password.clone(),
+            recording_bitrate_category: cli.obs_recording_bitrate_category.clone(),
+            recording_bitrate_name: cli.obs_recording_bitrate_name.clone(),
+        }));
+        let control_strategy = strategy.clone();
+        let control = Arc::new(RemoteControlHooks::new(
+            move || {
+                serde_json::to_value(control_strategy.status()).unwrap_or(serde_json::Value::Null)
+            },
+            |_| Ok(()),
+        ));
+        let remote_preview = preview.clone().map(|preview| {
+            let enabled_preview = preview.clone();
+            let set_enabled_preview = preview.clone();
+            let len_preview = preview.clone();
+            Arc::new(RemotePreviewHooks::new(
+                move || enabled_preview.enabled(),
+                move |enabled| set_enabled_preview.set_enabled(enabled),
+                move || len_preview.latest_jpeg_len(),
+                move || preview.latest_jpeg(),
+            )) as Arc<dyn RemotePreview>
         });
-        spawn_remote_server(
-            RemoteConfig {
+        let ready_ctx = ctx.clone();
+        spawn_remote_server(RemoteServer {
+            config: RemoteConfig {
                 name: cli.remote_name.clone(),
                 endpoint: cli.endpoint,
                 addrs: cli.addrs.clone(),
                 relays: cli.relays.clone(),
             },
-            strategy.clone(),
-            preview.clone(),
+            control,
+            preview: remote_preview,
             obs,
-            ctx.clone(),
-        )
+            on_ready: Arc::new(move |ready: RemoteReady| {
+                ready_ctx.record_remote_ready(
+                    &ready.adapter,
+                    &ready.name,
+                    &ready.service_uuid,
+                    &ready.status_uuid,
+                    &ready.control_uuid,
+                );
+            }),
+        })
         .await?;
     }
 
@@ -291,6 +322,12 @@ async fn main() -> Result<()> {
                 loop {
                     match connection.read_datagram().await {
                         Ok(payload) => {
+                            if let Ok(report) = decode_health_report(&payload) {
+                                strategy.record_health_report(&report);
+                                ctx.record_health_report(&report);
+                                continue;
+                            }
+
                             let Some(peer) = last_ingest_peer.read().as_ref().copied() else {
                                 ctx.missing_return_peer(&interface_name, payload.len());
                                 continue;
@@ -471,7 +508,12 @@ fn spawn_connection_liveness(
                     continue;
                 };
 
-                ctx.record_connection_paths(path.interface_name.clone(), &endpoint_id, &connection);
+                ctx.record_connection_paths(
+                    path.interface_name.clone(),
+                    &endpoint_id,
+                    &connection,
+                    false,
+                );
                 let Some(reason) = connection.close_reason() else {
                     continue;
                 };
@@ -518,6 +560,7 @@ fn spawn_reconnect_loops(
                             path.interface_name.clone(),
                             &endpoint_id,
                             &connection,
+                            true,
                         );
                         if let Some(bound_addr) = path.current_bound_addr() {
                             ctx.connected_path(

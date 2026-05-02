@@ -78,9 +78,8 @@ pub struct ClientUi {
 }
 
 pub fn describe_paths(connection: &iroh::endpoint::Connection, endpoint_id: &str) -> Vec<PathRow> {
-    connection
-        .paths()
-        .into_iter()
+    let paths = selected_paths(connection);
+    paths
         .map(|path| PathRow {
             endpoint_id: endpoint_id.to_string(),
             split_percentage: None,
@@ -92,6 +91,22 @@ pub fn describe_paths(connection: &iroh::endpoint::Connection, endpoint_id: &str
             status: if path.is_closed() { "closed" } else { "up" }.to_string(),
         })
         .collect()
+}
+
+fn selected_paths(
+    connection: &iroh::endpoint::Connection,
+) -> impl Iterator<Item = iroh::endpoint::PathInfo> {
+    let paths = connection.paths().into_iter().collect::<Vec<_>>();
+    let selected = paths
+        .iter()
+        .filter(|path| path.is_selected())
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        paths.into_iter()
+    } else {
+        selected.into_iter()
+    }
 }
 
 impl ClientUiState {
@@ -173,8 +188,30 @@ impl ClientUiState {
         }
     }
 
-    pub fn record_path(&self, interface: String, rows: Vec<PathRow>) {
-        self.paths.write().insert(interface, rows);
+    pub fn record_path(&self, interface: String, mut rows: Vec<PathRow>) {
+        let mut paths = self.paths.write();
+        if let Some(existing_rows) = paths.get(&interface) {
+            for row in &mut rows {
+                let existing = existing_rows
+                    .iter()
+                    .find(|existing| {
+                        existing.endpoint_id == row.endpoint_id
+                            && existing.transport == row.transport
+                            && existing.remote_addr == row.remote_addr
+                    })
+                    .or_else(|| {
+                        existing_rows
+                            .iter()
+                            .find(|existing| existing.endpoint_id == row.endpoint_id)
+                    });
+                if let Some(existing) = existing {
+                    row.split_percentage = existing.split_percentage;
+                    row.server_mbps.clone_from(&existing.server_mbps);
+                    row.last_health_at = existing.last_health_at;
+                }
+            }
+        }
+        paths.insert(interface, rows);
     }
 
     pub fn record_split_percentages(&self, percentages: &BTreeMap<String, f64>) {
@@ -398,11 +435,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
             Style::default().fg(Color::Gray),
         ),
     ])];
+    let last_health = state
+        .last_health_received
+        .read()
+        .map(|at| format!("{:.1}s ago", now.duration_since(at).as_secs_f64()))
+        .unwrap_or_else(|| "-".to_string());
     header_lines.push(Line::from(format!("server {}", state.server_endpoint)));
-    header_lines.push(Line::from(format!(
-        "health {}",
-        state.health_endpoint.read().clone()
-    )));
+    header_lines.push(Line::from(format!("health {}", last_health)));
     header_lines.push(Line::from(format!(
         "port {}  interfaces {}",
         state.port,
@@ -420,12 +459,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ClientUiState, snapshot: &mut Sn
         "last ingest from {}",
         state.last_ingest_from.read().clone()
     )));
-    let last_health = state
-        .last_health_received
-        .read()
-        .map(|at| format!("{:.1}s ago", now.duration_since(at).as_secs_f64()))
-        .unwrap_or_else(|| "-".to_string());
-    header_lines.push(Line::from(format!("last health {}", last_health)));
 
     let header = Paragraph::new(header_lines)
         .block(Block::default().borders(Borders::ALL).title("Overview"))
@@ -554,7 +587,7 @@ fn format_health_age(last_health_at: Option<Instant>) -> String {
     };
     let elapsed = last_health_at.elapsed();
     if elapsed.as_secs() < 60 {
-        format!("{}s ago", elapsed.as_secs())
+        format!("{:.1}s ago", elapsed.as_secs_f64())
     } else {
         format!("{}m ago", elapsed.as_secs() / 60)
     }

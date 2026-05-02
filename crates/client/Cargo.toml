@@ -5,9 +5,9 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bluer.workspace = true
 bytes.workspace = true
 cli.workspace = true
+client-remote.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 iroh.workspace = true
@@ -21,4 +21,3 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 transport.workspace = true
-uuid.workspace = true

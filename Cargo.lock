@@ -482,10 +482,10 @@ name = "client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bluer",
  "bytes",
  "clap",
  "cli",
+ "client-remote",
  "crossterm",
  "iroh",
  "libc",
@@ -498,6 +498,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "transport",
+]
+
+[[package]]
+name = "client-remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bluer",
+ "iroh",
+ "obs-remote",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 

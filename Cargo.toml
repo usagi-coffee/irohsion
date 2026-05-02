@@ -5,6 +5,7 @@ members = [
     "crates/transport",
     "crates/identity",
     "crates/obs-remote",
+    "crates/client-remote",
     "crates/client",
     "crates/bench",
     "crates/server",
@@ -20,6 +21,7 @@ anyhow = "1.0"
 bluer = { version = "0.17", features = ["bluetoothd"] }
 bytes = "1.11"
 cli = { path = "crates/cli" }
+client-remote = { path = "crates/client-remote" }
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
 data-encoding = "2.10"

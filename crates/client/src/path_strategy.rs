@@ -75,11 +75,6 @@ pub struct ControlStatus {
     pub interfaces: Vec<InterfaceControlStatus>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ControlPatch {
-    pub preview_enabled: Option<bool>,
-}
-
 #[derive(Clone)]
 pub struct StrategyState {
     mode: Arc<AtomicU8>,
@@ -169,8 +164,6 @@ impl StrategyState {
                 .collect(),
         }
     }
-
-    pub fn apply_patch(&self, _patch: ControlPatch, _ctx: &ClientCtx) {}
 
     pub fn set_mode(&self, mode: StrategyMode, ctx: &ClientCtx, reason: &str) {
         self.mode.store(mode as u8, Ordering::Relaxed);

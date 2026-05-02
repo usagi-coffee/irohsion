@@ -87,9 +87,8 @@ pub fn server_addrs(endpoint: &iroh::Endpoint) -> Vec<String> {
 }
 
 pub fn describe_paths(connection: &iroh::endpoint::Connection) -> Vec<PathRow> {
-    connection
-        .paths()
-        .into_iter()
+    let paths = selected_paths(connection);
+    paths
         .map(|path| PathRow {
             remote_addr: path.remote_addr().to_string(),
             transport: transport_kind(&path).to_string(),
@@ -97,6 +96,22 @@ pub fn describe_paths(connection: &iroh::endpoint::Connection) -> Vec<PathRow> {
             status: if path.is_closed() { "closed" } else { "up" }.to_string(),
         })
         .collect()
+}
+
+fn selected_paths(
+    connection: &iroh::endpoint::Connection,
+) -> impl Iterator<Item = iroh::endpoint::PathInfo> {
+    let paths = connection.paths().into_iter().collect::<Vec<_>>();
+    let selected = paths
+        .iter()
+        .filter(|path| path.is_selected())
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        paths.into_iter()
+    } else {
+        selected.into_iter()
+    }
 }
 
 impl ServerUiState {
