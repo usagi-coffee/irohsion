@@ -1,0 +1,10 @@
+[package]
+name = "kick-remote"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+kick-rust.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true

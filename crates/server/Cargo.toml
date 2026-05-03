@@ -10,6 +10,7 @@ cli.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 iroh.workspace = true
+kick-remote.workspace = true
 parking_lot.workspace = true
 protocol.workspace = true
 rand.workspace = true

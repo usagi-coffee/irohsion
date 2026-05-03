@@ -16,7 +16,8 @@ use transport::HealthReport;
 
 const AUTO_SPLIT_HEALTH_STALE_MS: u64 = 2_500;
 const AUTO_SPLIT_DEGRADE_LAG_PACKETS: u64 = 800;
-const AUTO_WEIGHT_MIN_SHARE: f64 = 0.05;
+const AUTO_WEIGHT_MIN_RAW_SHARE: f64 = 0.01;
+const AUTO_WEIGHT_MIN_LAG_PENALTY: f64 = 0.35;
 const TC_BACKLOG_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -278,10 +279,12 @@ impl StrategyState {
     }
 
     pub fn active_split_weights(&self, interfaces: &[String]) -> Vec<f64> {
-        if self.mode() == StrategyMode::Auto && self.weighted_auto_split_enabled() {
-            return self.auto_split_weights(interfaces);
-        }
-        self.split_weights(interfaces)
+        let weights = if self.mode() == StrategyMode::Auto && self.weighted_auto_split_enabled() {
+            self.auto_split_weights(interfaces)
+        } else {
+            self.split_weights(interfaces)
+        };
+        self.zero_failed_weights(interfaces, weights)
     }
 
     pub fn effective_split_percentages(&self) -> BTreeMap<String, f64> {
@@ -344,6 +347,9 @@ impl StrategyState {
             .filter(|interface| !failed.contains(*interface))
             .cloned()
             .collect::<Vec<_>>();
+        if self.weighted_auto_split_enabled() {
+            return (candidates, Vec::new());
+        }
         if candidates.len() < 2 {
             degraded.extend(candidates.iter().cloned());
             return (candidates, degraded);
@@ -393,6 +399,7 @@ impl StrategyState {
         }
 
         let health = self.health_by_interface.read();
+        let failed = self.recently_failed_interfaces();
         let best_last_seq = interfaces
             .iter()
             .filter_map(|interface| health.get(interface).and_then(|state| state.last_seq))
@@ -400,27 +407,47 @@ impl StrategyState {
         let raw = interfaces
             .iter()
             .map(|interface| {
+                if failed.contains(interface) {
+                    return 0.0;
+                }
                 let Some(state) = health.get(interface) else {
-                    return AUTO_WEIGHT_MIN_SHARE;
+                    return AUTO_WEIGHT_MIN_RAW_SHARE;
                 };
                 let age_ms = unix_ms_now().saturating_sub(state.last_unix_ms);
                 if age_ms > AUTO_SPLIT_HEALTH_STALE_MS {
-                    return AUTO_WEIGHT_MIN_SHARE;
+                    return AUTO_WEIGHT_MIN_RAW_SHARE;
                 }
 
                 let lag_penalty = best_last_seq
                     .zip(state.last_seq)
                     .map(|(best, seq)| {
                         let lag = best.saturating_sub(seq) as f64;
-                        (1.0 - lag / AUTO_SPLIT_DEGRADE_LAG_PACKETS as f64).clamp(0.0, 1.0)
+                        (1.0 - lag / AUTO_SPLIT_DEGRADE_LAG_PACKETS as f64)
+                            .clamp(AUTO_WEIGHT_MIN_LAG_PENALTY, 1.0)
                     })
                     .unwrap_or(1.0);
                 let throughput_weight = f64::from(state.server_mbps.max(0.0)).max(0.01);
-                (throughput_weight * lag_penalty).max(AUTO_WEIGHT_MIN_SHARE)
+                (throughput_weight * lag_penalty).max(AUTO_WEIGHT_MIN_RAW_SHARE)
             })
             .collect::<Vec<_>>();
 
         normalize_weights(raw)
+    }
+
+    fn zero_failed_weights(&self, interfaces: &[String], mut weights: Vec<f64>) -> Vec<f64> {
+        let failed = self.recently_failed_interfaces();
+        for (interface, weight) in interfaces.iter().zip(weights.iter_mut()) {
+            if failed.contains(interface) {
+                *weight = 0.0;
+            }
+        }
+        let total = weights.iter().sum::<f64>();
+        if total <= f64::EPSILON {
+            weights
+        } else {
+            weights.iter_mut().for_each(|weight| *weight /= total);
+            weights
+        }
     }
 
     pub fn auto_split_ready(&self, interfaces: &[String]) -> bool {

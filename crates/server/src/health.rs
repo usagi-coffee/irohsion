@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
+use kick_remote::KickChat;
 use parking_lot::RwLock;
 use transport::{ChatMessage, EndpointHealth, HEALTH_ALPN, HealthReport, encode_health_report};
 use twitch_remote::TwitchChat;
@@ -22,6 +23,12 @@ pub type HealthStats = Arc<RwLock<BTreeMap<String, EndpointSample>>>;
 
 const MAX_CHAT_MESSAGES_PER_HEALTH_REPORT: usize = 3;
 
+#[derive(Clone, Default)]
+pub struct ChatSources {
+    pub twitch: Option<TwitchChat>,
+    pub kick: Option<KickChat>,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct EndpointSample {
     pub bytes: u64,
@@ -32,7 +39,7 @@ pub struct EndpointSample {
 pub async fn health_loop(
     health_connections: HealthConnections,
     health_stats: HealthStats,
-    twitch_chat: Option<TwitchChat>,
+    chat_sources: ChatSources,
     interval: Duration,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
@@ -44,13 +51,8 @@ pub async fn health_loop(
             continue;
         }
 
-        let report = build_health_report(
-            seq,
-            &health_stats,
-            &connections,
-            twitch_chat.as_ref(),
-            interval,
-        )?;
+        let report =
+            build_health_report(seq, &health_stats, &connections, &chat_sources, interval)?;
         seq = seq.wrapping_add(1);
         let payload = encode_health_report(&report);
         let mut failed = Vec::new();
@@ -134,7 +136,7 @@ fn build_health_report(
     seq: u64,
     health_stats: &HealthStats,
     health_connections: &BTreeMap<String, HealthConnection>,
-    twitch_chat: Option<&TwitchChat>,
+    chat_sources: &ChatSources,
     interval: Duration,
 ) -> Result<HealthReport> {
     let interval_secs = interval.as_secs_f32().max(0.001);
@@ -158,24 +160,41 @@ fn build_health_report(
         seq,
         unix_ms: unix_ms_now()?,
         endpoints,
-        chat: twitch_chat
-            .map(|chat| {
-                let mut messages = chat.recent_messages();
-                if messages.len() > MAX_CHAT_MESSAGES_PER_HEALTH_REPORT {
-                    messages.drain(0..messages.len() - MAX_CHAT_MESSAGES_PER_HEALTH_REPORT);
-                }
-                messages
-                    .into_iter()
-                    .map(|message| ChatMessage {
-                        id: message.id,
-                        unix_ms: message.unix_ms,
-                        user: message.user,
-                        text: message.text,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        chat: recent_chat_messages(chat_sources),
     })
+}
+
+fn recent_chat_messages(chat_sources: &ChatSources) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+    if let Some(chat) = &chat_sources.twitch {
+        messages.extend(
+            chat.recent_messages()
+                .into_iter()
+                .map(|message| ChatMessage {
+                    id: message.id << 1,
+                    unix_ms: message.unix_ms,
+                    user: message.user,
+                    text: message.text,
+                }),
+        );
+    }
+    if let Some(chat) = &chat_sources.kick {
+        messages.extend(
+            chat.recent_messages()
+                .into_iter()
+                .map(|message| ChatMessage {
+                    id: (message.id << 1) | 1,
+                    unix_ms: message.unix_ms,
+                    user: message.user,
+                    text: message.text,
+                }),
+        );
+    }
+    messages.sort_by_key(|message| (message.unix_ms, message.id));
+    if messages.len() > MAX_CHAT_MESSAGES_PER_HEALTH_REPORT {
+        messages.drain(0..messages.len() - MAX_CHAT_MESSAGES_PER_HEALTH_REPORT);
+    }
+    messages
 }
 
 fn unix_ms_now() -> Result<u64> {

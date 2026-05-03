@@ -16,10 +16,11 @@ use clap::{ArgAction, Parser};
 use cli::{SecretArg, local_udp_dest, relay_mode};
 use context::ServerCtx;
 use health::{
-    HealthConnections, HealthStats, HealthTargets, health_loop, maintain_health_connection,
-    record_health_sample,
+    ChatSources, HealthConnections, HealthStats, HealthTargets, health_loop,
+    maintain_health_connection, record_health_sample,
 };
 use iroh::{Endpoint, RelayUrl, endpoint::presets};
+use kick_remote::spawn_kick_chat;
 use parking_lot::RwLock;
 use protocol::{DecodedPacket, MAX_SEQUENCE, PacketHeader, decode_packet};
 use runtime::wait_for_shutdown;
@@ -49,8 +50,10 @@ struct Cli {
     max_reorder_delay_ms: u64,
     #[arg(long)]
     twitch_channel: Option<String>,
+    #[arg(long)]
+    kick_channel: Option<String>,
     #[arg(long, default_value_t = 50)]
-    twitch_chat_history: usize,
+    chat_history: usize,
 }
 
 #[derive(Debug)]
@@ -177,7 +180,11 @@ async fn main() -> Result<()> {
     let twitch_chat = cli
         .twitch_channel
         .clone()
-        .map(|channel| spawn_twitch_chat(channel, cli.twitch_chat_history));
+        .map(|channel| spawn_twitch_chat(channel, cli.chat_history));
+    let kick_chat = cli
+        .kick_channel
+        .clone()
+        .map(|channel| spawn_kick_chat(channel, cli.chat_history));
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
     {
@@ -214,10 +221,13 @@ async fn main() -> Result<()> {
     {
         let health_connections = health_connections.clone();
         let health_stats = health_stats.clone();
-        let twitch_chat = twitch_chat.clone();
+        let chat_sources = ChatSources {
+            twitch: twitch_chat.clone(),
+            kick: kick_chat.clone(),
+        };
         let interval = Duration::from_millis(cli.health_interval_ms);
         tasks.push(tokio::spawn(async move {
-            let _ = health_loop(health_connections, health_stats, twitch_chat, interval).await;
+            let _ = health_loop(health_connections, health_stats, chat_sources, interval).await;
         }));
     }
 

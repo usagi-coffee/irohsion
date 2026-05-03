@@ -36,6 +36,7 @@ use transport::{
 };
 
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
+const MPEG_TS_PACKET_SIZE: usize = 188;
 const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERFACE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -63,6 +64,8 @@ struct Cli {
     split_threshold_bytes: Option<usize>,
     #[arg(long)]
     mtu: Option<usize>,
+    #[arg(long)]
+    mpeg_ts_chunk_bytes: Option<usize>,
     #[arg(long, default_value_t = 500)]
     tc_backlog_poll_ms: u64,
     #[arg(long, default_value_t = 65_536)]
@@ -97,6 +100,14 @@ async fn main() -> Result<()> {
     let interface_configs = parse_interface_configs(&cli.interfaces)?;
     if cli.status_file_interval_ms == 0 {
         bail!("--status-file-interval-ms must be greater than zero");
+    }
+    if let Some(chunk_bytes) = cli.mpeg_ts_chunk_bytes {
+        if chunk_bytes == 0 || chunk_bytes % MPEG_TS_PACKET_SIZE != 0 {
+            bail!("--mpeg-ts-chunk-bytes must be a non-zero multiple of {MPEG_TS_PACKET_SIZE}");
+        }
+    }
+    if cli.mtu == Some(0) {
+        bail!("--mtu must be greater than zero when set");
     }
 
     let listen_udp = SocketAddr::V4(SocketAddrV4::new(
@@ -412,9 +423,16 @@ async fn main() -> Result<()> {
             preview.submit_packet(payload);
         }
 
-        ctx.ingested_packet(seq, payload.len(), src);
-        send_packet(payload, seq, &cli, &paths, &path_names, &strategy, &ctx);
-        seq = next_sequence(seq);
+        seq = send_payload(
+            payload,
+            seq,
+            src,
+            &cli,
+            &paths,
+            &path_names,
+            &strategy,
+            &ctx,
+        );
     }
 
     Ok(())
@@ -613,6 +631,140 @@ fn spawn_reconnect_loops(
     }
 }
 
+fn send_payload(
+    payload: &[u8],
+    seq: u64,
+    src: SocketAddr,
+    cli: &Cli,
+    paths: &[transport::PathConnection],
+    path_names: &[String],
+    strategy: &path_strategy::StrategyState,
+    ctx: &ClientCtx,
+) -> u64 {
+    if let Some(next_seq) =
+        send_mpeg_ts_chunks(payload, seq, src, cli, paths, path_names, strategy, ctx)
+    {
+        return next_seq;
+    }
+
+    ctx.ingested_packet(seq, payload.len(), src);
+    send_packet(payload, seq, cli, paths, path_names, strategy, ctx);
+    next_sequence(seq)
+}
+
+fn send_mpeg_ts_chunks(
+    payload: &[u8],
+    seq: u64,
+    src: SocketAddr,
+    cli: &Cli,
+    paths: &[transport::PathConnection],
+    path_names: &[String],
+    strategy: &path_strategy::StrategyState,
+    ctx: &ClientCtx,
+) -> Option<u64> {
+    let chunk_bytes = cli.mpeg_ts_chunk_bytes?;
+    if payload.len() <= chunk_bytes || !is_mpeg_ts_payload(payload) {
+        return None;
+    }
+
+    let chunks = payload.chunks(chunk_bytes).collect::<Vec<_>>();
+    let active_paths = paths
+        .iter()
+        .filter(|path| path.is_connected())
+        .collect::<Vec<_>>();
+    if active_paths.is_empty() {
+        return Some(seq);
+    }
+
+    let mode = strategy.mode();
+    let effective = strategy.current();
+    let mut next_seq = seq;
+    if matches!(effective, PathStrategy::RoundRobin) {
+        for chunk in chunks {
+            ctx.ingested_packet(next_seq, chunk.len(), src);
+            let packet = single_fragment_packet(next_seq, chunk);
+            let index = strategy.next_round_robin_index(active_paths.len());
+            send_on_path(
+                active_paths[index],
+                packet,
+                strategy,
+                ctx,
+                next_seq,
+                chunk.len() as u64,
+            );
+            next_seq = next_sequence(next_seq);
+        }
+        return Some(next_seq);
+    }
+
+    if matches!(effective, PathStrategy::Redundant) || matches!(mode, StrategyMode::Redundant) {
+        for chunk in chunks {
+            ctx.ingested_packet(next_seq, chunk.len(), src);
+            let packet = single_fragment_packet(next_seq, chunk);
+            for path in &active_paths {
+                send_on_path(
+                    path,
+                    packet.clone(),
+                    strategy,
+                    ctx,
+                    next_seq,
+                    chunk.len() as u64,
+                );
+            }
+            next_seq = next_sequence(next_seq);
+        }
+        return Some(next_seq);
+    }
+
+    let (split_interface_names, _) =
+        if matches!(mode, StrategyMode::Auto) && matches!(effective, PathStrategy::Split) {
+            strategy.auto_path_groups(path_names)
+        } else {
+            (path_names.to_vec(), Vec::new())
+        };
+    let split_paths = active_paths
+        .iter()
+        .copied()
+        .filter(|path| {
+            split_interface_names
+                .iter()
+                .any(|name| name == &path.display_name)
+        })
+        .collect::<Vec<_>>();
+    if split_paths.is_empty() {
+        return Some(next_seq);
+    }
+
+    let split_names = split_paths
+        .iter()
+        .map(|path| path.display_name.clone())
+        .collect::<Vec<_>>();
+    ctx.record_split_percentages(&strategy.effective_split_percentages_for(&split_names));
+    let chunk_ranges =
+        weighted_split_ranges(chunks.len(), &strategy.active_split_weights(&split_names));
+    for (path_index, path) in split_paths.iter().enumerate() {
+        let (start, end) = chunk_ranges[path_index];
+        for chunk in &chunks[start..end] {
+            ctx.ingested_packet(next_seq, chunk.len(), src);
+            let packet = single_fragment_packet(next_seq, chunk);
+            send_on_path(path, packet, strategy, ctx, next_seq, chunk.len() as u64);
+            next_seq = next_sequence(next_seq);
+        }
+    }
+    Some(next_seq)
+}
+
+fn single_fragment_packet(seq: u64, payload: &[u8]) -> Arc<Bytes> {
+    Arc::new(encode_packet(
+        PacketHeader {
+            sequence: seq,
+            fragment: 0,
+            fragments: 1,
+        },
+        payload,
+    ))
+}
+
 fn send_packet(
     payload: &[u8],
     seq: u64,
@@ -684,11 +836,24 @@ fn send_packet(
             .iter()
             .map(|path| path.display_name.clone())
             .collect::<Vec<_>>();
-        let fragments = u8::try_from(split_paths.len()).expect("path count fits in u8");
-        let split_ranges =
-            weighted_split_ranges(payload.len(), &strategy.active_split_weights(&split_names));
-        for (fragment, path) in split_paths.iter().enumerate() {
-            let (start, end) = split_ranges[fragment];
+        let Some(split_ranges) = packet_split_ranges(
+            payload.len(),
+            &strategy.active_split_weights(&split_names),
+            cli.mtu,
+        ) else {
+            ctx.record_send_error(
+                "split".to_string(),
+                format!(
+                    "packet length {} requires more than {MAX_FRAGMENTS} fragments for mtu {:?}",
+                    payload.len(),
+                    cli.mtu
+                ),
+            );
+            return;
+        };
+        let fragments = u8::try_from(split_ranges.len()).expect("fragment count fits in u8");
+        for (fragment, (path_index, start, end)) in split_ranges.into_iter().enumerate() {
+            let path = split_paths[path_index];
             let packet = Arc::new(encode_packet(
                 PacketHeader {
                     sequence: seq,
@@ -795,6 +960,10 @@ fn should_split(
     mode: StrategyMode,
     strategy: PathStrategy,
 ) -> bool {
+    if matches!(mtu, Some(mtu) if packet_len >= mtu) {
+        return true;
+    }
+
     if path_count <= 1 {
         return false;
     }
@@ -803,10 +972,6 @@ fn should_split(
         StrategyMode::Split => return true,
         StrategyMode::Redundant | StrategyMode::RoundRobin => return false,
         StrategyMode::Auto => {}
-    }
-
-    if matches!(mtu, Some(mtu) if packet_len >= mtu) {
-        return true;
     }
 
     matches!(strategy, PathStrategy::Split)
@@ -819,6 +984,14 @@ fn next_sequence(sequence: u64) -> u64 {
     } else {
         sequence + 1
     }
+}
+
+fn is_mpeg_ts_payload(payload: &[u8]) -> bool {
+    !payload.is_empty()
+        && payload.len() % MPEG_TS_PACKET_SIZE == 0
+        && payload
+            .chunks_exact(MPEG_TS_PACKET_SIZE)
+            .all(|packet| packet.first() == Some(&0x47))
 }
 
 fn weighted_split_ranges(packet_len: usize, weights: &[f64]) -> Vec<(usize, usize)> {
@@ -838,9 +1011,55 @@ fn weighted_split_ranges(packet_len: usize, weights: &[f64]) -> Vec<(usize, usiz
     ranges
 }
 
+fn packet_split_ranges(
+    packet_len: usize,
+    weights: &[f64],
+    mtu: Option<usize>,
+) -> Option<Vec<(usize, usize, usize)>> {
+    if let Some(max_payload) = mtu.filter(|mtu| packet_len >= *mtu) {
+        return mtu_chunked_split_ranges(packet_len, weights, max_payload);
+    }
+
+    let weighted_ranges = weighted_split_ranges(packet_len, weights);
+    let mut ranges = Vec::new();
+    for (path_index, (start, end)) in weighted_ranges.into_iter().enumerate() {
+        if start == end {
+            continue;
+        }
+        ranges.push((path_index, start, end));
+    }
+    (ranges.len() <= MAX_FRAGMENTS).then_some(ranges)
+}
+
+fn mtu_chunked_split_ranges(
+    packet_len: usize,
+    weights: &[f64],
+    max_payload: usize,
+) -> Option<Vec<(usize, usize, usize)>> {
+    let chunks = (0..packet_len)
+        .step_by(max_payload)
+        .map(|start| (start, (start + max_payload).min(packet_len)))
+        .collect::<Vec<_>>();
+    if chunks.len() > MAX_FRAGMENTS {
+        return None;
+    }
+    if chunks.is_empty() || weights.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let chunk_ranges = weighted_split_ranges(chunks.len(), weights);
+    let mut ranges = Vec::with_capacity(chunks.len());
+    for (path_index, (chunk_start, chunk_end)) in chunk_ranges.into_iter().enumerate() {
+        for chunk in &chunks[chunk_start..chunk_end] {
+            ranges.push((path_index, chunk.0, chunk.1));
+        }
+    }
+    Some(ranges)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{should_split, weighted_split_ranges};
+    use super::{is_mpeg_ts_payload, packet_split_ranges, should_split, weighted_split_ranges};
     use crate::path_strategy::{PathStrategy, StrategyMode};
 
     #[test]
@@ -855,6 +1074,44 @@ mod tests {
         let ranges = weighted_split_ranges(1001, &[0.5, 0.5]);
 
         assert_eq!(ranges, vec![(0, 501), (501, 1001)]);
+    }
+
+    #[test]
+    fn mtu_capped_ranges_split_oversized_weighted_fragments() {
+        let ranges = packet_split_ranges(2256, &[0.9, 0.1], Some(1128)).unwrap();
+
+        assert_eq!(ranges, vec![(0, 0, 1128), (0, 1128, 2256)]);
+        assert!(ranges.iter().all(|(_, start, end)| end - start <= 1128));
+    }
+
+    #[test]
+    fn mtu_capped_ranges_distribute_even_chunks_across_even_weights() {
+        let ranges = packet_split_ranges(2256, &[0.5, 0.5], Some(1128)).unwrap();
+
+        assert_eq!(ranges, vec![(0, 0, 1128), (1, 1128, 2256)]);
+    }
+
+    #[test]
+    fn mtu_capped_ranges_can_split_over_one_path() {
+        let ranges = packet_split_ranges(2256, &[1.0], Some(1128)).unwrap();
+
+        assert_eq!(ranges, vec![(0, 0, 1128), (0, 1128, 2256)]);
+    }
+
+    #[test]
+    fn detects_mpeg_ts_payloads() {
+        let mut payload = vec![0_u8; 376];
+        payload[0] = 0x47;
+        payload[188] = 0x47;
+
+        assert!(is_mpeg_ts_payload(&payload));
+    }
+
+    #[test]
+    fn rejects_mpeg_ts_payloads_without_sync_bytes() {
+        let payload = vec![0_u8; 376];
+
+        assert!(!is_mpeg_ts_payload(&payload));
     }
 
     #[test]
@@ -899,7 +1156,7 @@ mod tests {
             StrategyMode::Split,
             PathStrategy::Split,
         ));
-        assert!(!should_split(
+        assert!(should_split(
             1200,
             None,
             Some(1000),
@@ -946,8 +1203,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_redundant_mode_ignores_mtu_and_threshold() {
-        assert!(!should_split(
+    fn explicit_redundant_mode_still_honors_mtu() {
+        assert!(should_split(
             1128,
             Some(100),
             Some(1128),
@@ -958,8 +1215,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_round_robin_mode_ignores_mtu_and_threshold() {
-        assert!(!should_split(
+    fn explicit_round_robin_mode_still_honors_mtu() {
+        assert!(should_split(
             1128,
             Some(100),
             Some(1128),
