@@ -18,6 +18,12 @@ const AUTO_SPLIT_HEALTH_STALE_MS: u64 = 2_500;
 const AUTO_SPLIT_DEGRADE_LAG_PACKETS: u64 = 800;
 const AUTO_WEIGHT_MIN_RAW_SHARE: f64 = 0.01;
 const AUTO_WEIGHT_MIN_LAG_PENALTY: f64 = 0.35;
+const AUTO_WEIGHT_THROUGHPUT_BLEND: f64 = 0.25;
+const AUTO_WEIGHT_MIN_THROUGHPUT_RATIO: f64 = 0.25;
+const AUTO_WEIGHT_MAX_THROUGHPUT_RATIO: f64 = 2.0;
+const AUTO_SPLIT_MIN_AVERAGE_SERVER_MBPS: f32 = 0.25;
+const AUTO_SPLIT_MIN_SERVER_MBPS_RATIO: f32 = 0.15;
+const AUTO_SPLIT_MIN_SERVER_MBPS: f32 = 0.05;
 const TC_BACKLOG_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -347,39 +353,41 @@ impl StrategyState {
             .filter(|interface| !failed.contains(*interface))
             .cloned()
             .collect::<Vec<_>>();
-        if self.weighted_auto_split_enabled() {
-            return (candidates, Vec::new());
-        }
         if candidates.len() < 2 {
             degraded.extend(candidates.iter().cloned());
             return (candidates, degraded);
         }
 
         let health = self.health_by_interface.read();
+        let now = unix_ms_now();
         let fresh = candidates
             .iter()
             .filter_map(|interface| {
                 let state = health.get(interface)?;
-                let age_ms = unix_ms_now().saturating_sub(state.last_unix_ms);
-                (age_ms <= AUTO_SPLIT_HEALTH_STALE_MS)
-                    .then_some((interface.clone(), state.last_seq))
+                let age_ms = now.saturating_sub(state.last_unix_ms);
+                (age_ms <= AUTO_SPLIT_HEALTH_STALE_MS).then_some((interface.clone(), *state))
             })
             .collect::<Vec<_>>();
         if fresh.is_empty() {
-            return (candidates, degraded);
+            degraded.extend(candidates.iter().cloned());
+            return (Vec::new(), degraded);
         }
 
-        let best_last_seq = fresh.iter().filter_map(|(_, last_seq)| *last_seq).max();
+        let best_last_seq = fresh.iter().filter_map(|(_, state)| state.last_seq).max();
         let Some(best_last_seq) = best_last_seq else {
-            return (candidates, degraded);
+            degraded.extend(candidates.iter().cloned());
+            return (Vec::new(), degraded);
         };
+        let average_server_mbps = fresh
+            .iter()
+            .map(|(_, state)| state.server_mbps)
+            .sum::<f32>()
+            / fresh.len() as f32;
 
         let healthy = fresh
             .into_iter()
-            .filter(|(_, last_seq)| {
-                last_seq.is_some_and(|seq| {
-                    best_last_seq.saturating_sub(seq) <= AUTO_SPLIT_DEGRADE_LAG_PACKETS
-                })
+            .filter(|(_, state)| {
+                path_health_allows_split(*state, best_last_seq, average_server_mbps)
             })
             .map(|(interface, _)| interface)
             .collect::<Vec<_>>();
@@ -400,10 +408,26 @@ impl StrategyState {
 
         let health = self.health_by_interface.read();
         let failed = self.recently_failed_interfaces();
+        let now = unix_ms_now();
         let best_last_seq = interfaces
             .iter()
             .filter_map(|interface| health.get(interface).and_then(|state| state.last_seq))
             .max();
+        let fresh_server_mbps = interfaces
+            .iter()
+            .filter(|interface| !failed.contains(*interface))
+            .filter_map(|interface| {
+                let state = health.get(interface)?;
+                let age_ms = now.saturating_sub(state.last_unix_ms);
+                (age_ms <= AUTO_SPLIT_HEALTH_STALE_MS)
+                    .then_some(f64::from(state.server_mbps.max(0.0)))
+            })
+            .collect::<Vec<_>>();
+        let average_server_mbps = if fresh_server_mbps.is_empty() {
+            0.0
+        } else {
+            fresh_server_mbps.iter().sum::<f64>() / fresh_server_mbps.len() as f64
+        };
         let raw = interfaces
             .iter()
             .map(|interface| {
@@ -413,7 +437,7 @@ impl StrategyState {
                 let Some(state) = health.get(interface) else {
                     return AUTO_WEIGHT_MIN_RAW_SHARE;
                 };
-                let age_ms = unix_ms_now().saturating_sub(state.last_unix_ms);
+                let age_ms = now.saturating_sub(state.last_unix_ms);
                 if age_ms > AUTO_SPLIT_HEALTH_STALE_MS {
                     return AUTO_WEIGHT_MIN_RAW_SHARE;
                 }
@@ -426,8 +450,7 @@ impl StrategyState {
                             .clamp(AUTO_WEIGHT_MIN_LAG_PENALTY, 1.0)
                     })
                     .unwrap_or(1.0);
-                let throughput_weight = f64::from(state.server_mbps.max(0.0)).max(0.01);
-                (throughput_weight * lag_penalty).max(AUTO_WEIGHT_MIN_RAW_SHARE)
+                blended_auto_weight(state.server_mbps, average_server_mbps, lag_penalty)
             })
             .collect::<Vec<_>>();
 
@@ -451,7 +474,8 @@ impl StrategyState {
     }
 
     pub fn auto_split_ready(&self, interfaces: &[String]) -> bool {
-        self.auto_path_groups(interfaces).0.len() >= 2
+        let (healthy, degraded) = self.auto_path_groups(interfaces);
+        healthy.len() >= 2 && degraded.is_empty()
     }
 
     pub fn degrade_to_redundant(&self, ctx: &ClientCtx, reason: String) {
@@ -660,6 +684,40 @@ fn normalize_weights_with_fallback(mut weights: Vec<f64>, fallback: f64, total: 
     weights
 }
 
+fn blended_auto_weight(server_mbps: f32, average_server_mbps: f64, lag_penalty: f64) -> f64 {
+    let throughput_ratio = if average_server_mbps <= f64::EPSILON {
+        1.0
+    } else {
+        (f64::from(server_mbps.max(0.0)) / average_server_mbps).clamp(
+            AUTO_WEIGHT_MIN_THROUGHPUT_RATIO,
+            AUTO_WEIGHT_MAX_THROUGHPUT_RATIO,
+        )
+    };
+    let throughput_score =
+        (1.0 - AUTO_WEIGHT_THROUGHPUT_BLEND) + AUTO_WEIGHT_THROUGHPUT_BLEND * throughput_ratio;
+    (throughput_score * lag_penalty).max(AUTO_WEIGHT_MIN_RAW_SHARE)
+}
+
+fn path_health_allows_split(
+    health: InterfaceHealth,
+    best_last_seq: u64,
+    average_server_mbps: f32,
+) -> bool {
+    let Some(last_seq) = health.last_seq else {
+        return false;
+    };
+    if best_last_seq.saturating_sub(last_seq) > AUTO_SPLIT_DEGRADE_LAG_PACKETS {
+        return false;
+    }
+    if average_server_mbps < AUTO_SPLIT_MIN_AVERAGE_SERVER_MBPS {
+        return true;
+    }
+
+    let min_server_mbps =
+        (average_server_mbps * AUTO_SPLIT_MIN_SERVER_MBPS_RATIO).max(AUTO_SPLIT_MIN_SERVER_MBPS);
+    health.server_mbps >= min_server_mbps
+}
+
 async fn tc_backlog(interface: &str) -> Option<u64> {
     let output = tokio::time::timeout(
         TC_BACKLOG_TIMEOUT,
@@ -699,12 +757,60 @@ fn parse_backlog_bytes(value: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_tc_backlog;
+    use super::{
+        InterfaceHealth, blended_auto_weight, normalize_weights, parse_tc_backlog,
+        path_health_allows_split,
+    };
 
     #[test]
     fn parses_tc_backlog_bytes() {
         let output = "qdisc fq_codel 0: root\n Sent 1 bytes 1 pkt\n backlog 1234b 8p requeues 0\n";
 
         assert_eq!(parse_tc_backlog(output), Some(1234));
+    }
+
+    #[test]
+    fn auto_weighting_leans_healthy_paths_toward_even() {
+        let weights = normalize_weights(vec![
+            blended_auto_weight(9.0, 5.0, 1.0),
+            blended_auto_weight(1.0, 5.0, 1.0),
+        ]);
+
+        assert!(weights[0] < 0.65, "{weights:?}");
+        assert!(weights[1] > 0.35, "{weights:?}");
+    }
+
+    #[test]
+    fn auto_weighting_still_penalizes_lagging_paths() {
+        let weights = normalize_weights(vec![
+            blended_auto_weight(5.0, 5.0, 1.0),
+            blended_auto_weight(5.0, 5.0, 0.35),
+        ]);
+
+        assert!(weights[1] < 0.30, "{weights:?}");
+    }
+
+    #[test]
+    fn split_health_rejects_near_zero_server_mbps_when_peers_are_receiving() {
+        let health = InterfaceHealth {
+            last_seq: Some(100),
+            max_seq: Some(100),
+            server_mbps: 0.02,
+            last_unix_ms: 1,
+        };
+
+        assert!(!path_health_allows_split(health, 100, 5.0));
+    }
+
+    #[test]
+    fn split_health_allows_low_server_mbps_when_whole_stream_is_low() {
+        let health = InterfaceHealth {
+            last_seq: Some(100),
+            max_seq: Some(100),
+            server_mbps: 0.02,
+            last_unix_ms: 1,
+        };
+
+        assert!(path_health_allows_split(health, 100, 0.1));
     }
 }
