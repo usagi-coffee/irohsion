@@ -41,6 +41,14 @@ pub struct ServerUiState {
     forwarded_bytes: Arc<AtomicU64>,
     duplicate_packets: Arc<AtomicU64>,
     skipped_packets: Arc<AtomicU64>,
+    skipped_never_received_packets: Arc<AtomicU64>,
+    late_after_skip_packets: Arc<AtomicU64>,
+    fragment_incomplete_packets: Arc<AtomicU64>,
+    repair_requests: Arc<AtomicU64>,
+    fec_recovered_packets: Arc<AtomicU64>,
+    send_pressure_drops: Arc<AtomicU64>,
+    flow_resets: Arc<AtomicU64>,
+    connection_resets: Arc<AtomicU64>,
     invalid_packets: Arc<AtomicU64>,
     buffered_packets: Arc<AtomicU64>,
     last_forwarded_seq: Arc<AtomicU64>,
@@ -129,6 +137,14 @@ impl ServerUiState {
             forwarded_bytes: Arc::new(AtomicU64::new(0)),
             duplicate_packets: Arc::new(AtomicU64::new(0)),
             skipped_packets: Arc::new(AtomicU64::new(0)),
+            skipped_never_received_packets: Arc::new(AtomicU64::new(0)),
+            late_after_skip_packets: Arc::new(AtomicU64::new(0)),
+            fragment_incomplete_packets: Arc::new(AtomicU64::new(0)),
+            repair_requests: Arc::new(AtomicU64::new(0)),
+            fec_recovered_packets: Arc::new(AtomicU64::new(0)),
+            send_pressure_drops: Arc::new(AtomicU64::new(0)),
+            flow_resets: Arc::new(AtomicU64::new(0)),
+            connection_resets: Arc::new(AtomicU64::new(0)),
             invalid_packets: Arc::new(AtomicU64::new(0)),
             buffered_packets: Arc::new(AtomicU64::new(0)),
             last_forwarded_seq: Arc::new(AtomicU64::new(0)),
@@ -183,6 +199,10 @@ impl ServerUiState {
         });
     }
 
+    pub fn record_connection_reset(&self) {
+        self.connection_resets.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_connection_receive(&self, remote: &str, bytes: u64, sequence: u64) {
         let mut connections = self.connections.write();
         let activity = self
@@ -227,10 +247,42 @@ impl ServerUiState {
         self.next_seq.store(next_seq, Ordering::Relaxed);
     }
 
-    pub fn record_reorder_skip(&self, buffered: u64, next_seq: u64) {
+    pub fn record_never_received_skip(&self, buffered: u64, next_seq: u64) {
         self.skipped_packets.fetch_add(1, Ordering::Relaxed);
+        self.skipped_never_received_packets
+            .fetch_add(1, Ordering::Relaxed);
         self.buffered_packets.store(buffered, Ordering::Relaxed);
         self.next_seq.store(next_seq, Ordering::Relaxed);
+    }
+
+    pub fn record_fragment_incomplete_skip(&self, buffered: u64, next_seq: u64) {
+        self.skipped_packets.fetch_add(1, Ordering::Relaxed);
+        self.fragment_incomplete_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.buffered_packets.store(buffered, Ordering::Relaxed);
+        self.next_seq.store(next_seq, Ordering::Relaxed);
+    }
+
+    pub fn record_late_after_skip(&self, buffered: u64, next_seq: u64) {
+        self.late_after_skip_packets.fetch_add(1, Ordering::Relaxed);
+        self.buffered_packets.store(buffered, Ordering::Relaxed);
+        self.next_seq.store(next_seq, Ordering::Relaxed);
+    }
+
+    pub fn record_send_pressure_drop(&self) {
+        self.send_pressure_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_repair_request(&self) {
+        self.repair_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_fec_recovered(&self) {
+        self.fec_recovered_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_flow_reset(&self) {
+        self.flow_resets.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_invalid(&self) {
@@ -244,6 +296,21 @@ impl ServerUiState {
 
     pub fn set_flow_start(&self, next_seq: u64) {
         self.next_seq.store(next_seq, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn skipped_never_received_packets(&self) -> u64 {
+        self.skipped_never_received_packets.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn late_after_skip_packets(&self) -> u64 {
+        self.late_after_skip_packets.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn fragment_incomplete_packets(&self) -> u64 {
+        self.fragment_incomplete_packets.load(Ordering::Relaxed)
     }
 }
 
@@ -326,7 +393,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),
-            Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Min(14),
         ])
         .split(area);
@@ -433,6 +500,20 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
             state.skipped_packets.load(Ordering::Relaxed),
             state.invalid_packets.load(Ordering::Relaxed),
             state.buffered_packets.load(Ordering::Relaxed)
+        )),
+        Line::from(format!(
+            "missing never {:>7}   late {:>7}   frag_incomplete {:>7}",
+            state.skipped_never_received_packets.load(Ordering::Relaxed),
+            state.late_after_skip_packets.load(Ordering::Relaxed),
+            state.fragment_incomplete_packets.load(Ordering::Relaxed)
+        )),
+        Line::from(format!(
+            "fec_recovered {:>5}   repair_req {:>7}   pressure_drop {:>5}   flow_reset {:>5}   connection_reset {:>5}",
+            state.fec_recovered_packets.load(Ordering::Relaxed),
+            state.repair_requests.load(Ordering::Relaxed),
+            state.send_pressure_drops.load(Ordering::Relaxed),
+            state.flow_resets.load(Ordering::Relaxed),
+            state.connection_resets.load(Ordering::Relaxed)
         )),
         Line::from(format!(
             "last_fwd {:>10}   next_seq {:>10}   avg fwd {:>6.2} Mbps",

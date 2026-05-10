@@ -25,6 +25,8 @@ const AUTO_SPLIT_MIN_AVERAGE_SERVER_MBPS: f32 = 0.25;
 const AUTO_SPLIT_MIN_SERVER_MBPS_RATIO: f32 = 0.15;
 const AUTO_SPLIT_MIN_SERVER_MBPS: f32 = 0.05;
 const TC_BACKLOG_TIMEOUT: Duration = Duration::from_secs(1);
+const TC_QDISC_REPLACE_TIMEOUT: Duration = Duration::from_secs(1);
+const TC_QDISC_KIND: &str = "fq_codel";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -112,6 +114,20 @@ struct InterfaceHealth {
 
 #[derive(Debug, Clone, Copy)]
 struct InterfaceFailure;
+
+#[derive(Debug, Clone)]
+pub struct StrategyInterface {
+    pub display_name: String,
+    pub device_name: String,
+    pub endpoint_id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QdiscResetConfig {
+    pub backlog_bytes: u64,
+    pub max_server_mbps: f32,
+    pub cooldown: Duration,
+}
 
 impl StrategyState {
     fn sync_ui(&self, ctx: &ClientCtx) {
@@ -498,30 +514,47 @@ impl StrategyState {
     fn recently_failed_interfaces(&self) -> BTreeSet<String> {
         self.interface_failures.read().keys().cloned().collect()
     }
+
+    fn fresh_health(&self, interface: &str) -> Option<InterfaceHealth> {
+        let health = self.health_by_interface.read().get(interface).copied()?;
+        let age_ms = unix_ms_now().saturating_sub(health.last_unix_ms);
+        (age_ms <= AUTO_SPLIT_HEALTH_STALE_MS).then_some(health)
+    }
 }
 
 pub fn spawn_strategy_loop(
-    interfaces: Vec<(String, String)>,
+    interfaces: Vec<StrategyInterface>,
     poll_interval: Duration,
     degrade_backlog_bytes: u64,
     recover_backlog_bytes: u64,
+    qdisc_reset: Option<QdiscResetConfig>,
     ctx: ClientCtx,
 ) -> StrategyState {
     let endpoint_ids_by_interface = interfaces
         .iter()
-        .map(|(interface, endpoint_id)| (interface.clone(), endpoint_id.clone()))
+        .map(|interface| {
+            (
+                interface.display_name.clone(),
+                interface.endpoint_id.clone(),
+            )
+        })
         .collect();
     let split_percentages = interfaces
         .iter()
-        .map(|(interface, _)| (interface.clone(), None))
+        .map(|interface| (interface.display_name.clone(), None))
         .collect();
     let interface_status = interfaces
         .iter()
-        .map(|(interface, _)| (interface.clone(), InterfaceLinkStatus::Connected))
+        .map(|interface| {
+            (
+                interface.display_name.clone(),
+                InterfaceLinkStatus::Connected,
+            )
+        })
         .collect();
     let interface_traffic = interfaces
         .iter()
-        .map(|(interface, _)| (interface.clone(), InterfaceTraffic::default()))
+        .map(|interface| (interface.display_name.clone(), InterfaceTraffic::default()))
         .collect();
     let state = StrategyState {
         mode: Arc::new(AtomicU8::new(StrategyMode::Auto as u8)),
@@ -547,6 +580,7 @@ pub fn spawn_strategy_loop(
             poll_interval,
             degrade_backlog_bytes,
             recover_backlog_bytes,
+            qdisc_reset,
             loop_state,
             ctx,
         )
@@ -592,37 +626,77 @@ impl InterfaceTraffic {
 }
 
 async fn strategy_loop(
-    interfaces: Vec<(String, String)>,
+    interfaces: Vec<StrategyInterface>,
     poll_interval: Duration,
     degrade_backlog_bytes: u64,
     recover_backlog_bytes: u64,
+    qdisc_reset: Option<QdiscResetConfig>,
     state: StrategyState,
     ctx: ClientCtx,
 ) {
     let mut interval = tokio::time::interval(poll_interval);
+    let mut last_qdisc_reset_by_interface = BTreeMap::<String, Instant>::new();
     loop {
         interval.tick().await;
+
+        let interface_names = interfaces
+            .iter()
+            .map(|interface| interface.display_name.clone())
+            .collect::<Vec<_>>();
+        let mut backlogs = Vec::new();
+        let mut worst = None::<(&str, u64)>;
+        for interface in &interfaces {
+            let Some(backlog) = tc_backlog(&interface.device_name).await else {
+                continue;
+            };
+            backlogs.push((interface, backlog));
+            if worst.is_none_or(|(_, existing)| backlog > existing) {
+                worst = Some((interface.display_name.as_str(), backlog));
+            }
+        }
+
+        if let Some(qdisc_reset) = qdisc_reset {
+            for (interface, backlog) in &backlogs {
+                let health = state.fresh_health(&interface.display_name);
+                if !qdisc_reset_should_run(*backlog, health, qdisc_reset) {
+                    continue;
+                }
+                if last_qdisc_reset_by_interface
+                    .get(&interface.display_name)
+                    .is_some_and(|last| last.elapsed() < qdisc_reset.cooldown)
+                {
+                    continue;
+                }
+
+                last_qdisc_reset_by_interface
+                    .insert(interface.display_name.clone(), Instant::now());
+                let server_mbps = health.map(|health| health.server_mbps).unwrap_or(0.0);
+                match replace_root_qdisc_fq_codel(&interface.device_name).await {
+                    Ok(()) => ctx.record_qdisc_reset(
+                        &interface.display_name,
+                        &interface.device_name,
+                        *backlog,
+                        server_mbps,
+                        TC_QDISC_KIND,
+                    ),
+                    Err(error) => ctx.record_qdisc_reset_failed(
+                        &interface.display_name,
+                        &interface.device_name,
+                        *backlog,
+                        server_mbps,
+                        &error,
+                    ),
+                }
+            }
+        }
+
         if state.mode() != StrategyMode::Auto {
             continue;
         }
 
-        let interface_names = interfaces
-            .iter()
-            .map(|(interface, _)| interface.clone())
-            .collect::<Vec<_>>();
         if state.current() == PathStrategy::Split && !state.auto_split_ready(&interface_names) {
             state.degrade_to_redundant(&ctx, "not enough healthy paths for split".to_string());
             continue;
-        }
-
-        let mut worst = None::<(&str, u64)>;
-        for (interface, _) in &interfaces {
-            let Some(backlog) = tc_backlog(interface).await else {
-                continue;
-            };
-            if worst.is_none_or(|(_, existing)| backlog > existing) {
-                worst = Some((interface, backlog));
-            }
         }
 
         match (state.current(), worst) {
@@ -718,6 +792,15 @@ fn path_health_allows_split(
     health.server_mbps >= min_server_mbps
 }
 
+fn qdisc_reset_should_run(
+    backlog: u64,
+    health: Option<InterfaceHealth>,
+    config: QdiscResetConfig,
+) -> bool {
+    backlog >= config.backlog_bytes
+        && health.is_some_and(|health| health.server_mbps <= config.max_server_mbps)
+}
+
 async fn tc_backlog(interface: &str) -> Option<u64> {
     let output = tokio::time::timeout(
         TC_BACKLOG_TIMEOUT,
@@ -733,6 +816,33 @@ async fn tc_backlog(interface: &str) -> Option<u64> {
     }
 
     parse_tc_backlog(&String::from_utf8_lossy(&output.stdout))
+}
+
+async fn replace_root_qdisc_fq_codel(interface: &str) -> Result<(), String> {
+    let output = tokio::time::timeout(
+        TC_QDISC_REPLACE_TIMEOUT,
+        Command::new("tc")
+            .args(["qdisc", "replace", "dev", interface, "root", TC_QDISC_KIND])
+            .output(),
+    )
+    .await
+    .map_err(|_| "timed out running tc qdisc replace".to_string())?
+    .map_err(|err| format!("failed running tc qdisc replace: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(format!(
+        "tc qdisc replace exited with status={} error={details}",
+        output.status
+    ))
 }
 
 fn parse_tc_backlog(stdout: &str) -> Option<u64> {
@@ -758,9 +868,10 @@ fn parse_backlog_bytes(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InterfaceHealth, blended_auto_weight, normalize_weights, parse_tc_backlog,
-        path_health_allows_split,
+        InterfaceHealth, QdiscResetConfig, blended_auto_weight, normalize_weights,
+        parse_tc_backlog, path_health_allows_split, qdisc_reset_should_run,
     };
+    use std::time::Duration;
 
     #[test]
     fn parses_tc_backlog_bytes() {
@@ -812,5 +923,29 @@ mod tests {
         };
 
         assert!(path_health_allows_split(health, 100, 0.1));
+    }
+
+    #[test]
+    fn qdisc_reset_requires_extreme_backlog_and_low_server_bandwidth() {
+        let config = QdiscResetConfig {
+            backlog_bytes: 1_000,
+            max_server_mbps: 0.10,
+            cooldown: Duration::from_secs(1),
+        };
+        let low_health = InterfaceHealth {
+            last_seq: Some(100),
+            max_seq: Some(100),
+            server_mbps: 0.05,
+            last_unix_ms: 1,
+        };
+        let ok_health = InterfaceHealth {
+            server_mbps: 1.0,
+            ..low_health
+        };
+
+        assert!(qdisc_reset_should_run(2_000, Some(low_health), config));
+        assert!(!qdisc_reset_should_run(500, Some(low_health), config));
+        assert!(!qdisc_reset_should_run(2_000, Some(ok_health), config));
+        assert!(!qdisc_reset_should_run(2_000, None, config));
     }
 }

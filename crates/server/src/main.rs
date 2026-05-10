@@ -4,7 +4,7 @@ mod runtime;
 mod tui;
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -22,7 +22,11 @@ use health::{
 use iroh::{Endpoint, RelayUrl, endpoint::presets};
 use kick_remote::spawn_kick_chat;
 use parking_lot::RwLock;
-use protocol::{DecodedPacket, MAX_SEQUENCE, PacketHeader, decode_packet};
+use protocol::{
+    DecodedPacket, FEC_SEQUENCE, FecFrame, MAX_MEDIA_SEQUENCE, PacketHeader,
+    REPAIR_ALL_FRAGMENTS_MASK, RepairRequest, decode_fec_frame, decode_packet,
+    encode_repair_request,
+};
 use runtime::wait_for_shutdown;
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle, time::timeout};
 use transport::ALPN;
@@ -31,6 +35,11 @@ use twitch_remote::spawn_twitch_chat;
 const MAX_UDP_PACKET_SIZE: usize = 65_507;
 const RESTART_BACKWARD_GAP: u64 = 4_096;
 const RESTART_CONFIRM_PACKETS: usize = protocol::MAX_FRAGMENTS + 1;
+const SKIPPED_SEQUENCE_TRACK_LIMIT: usize = 4_096;
+const REPAIR_STREAM_TIMEOUT: Duration = Duration::from_millis(25);
+const MAX_REPAIR_REQUESTS_PER_TICK: usize = 64;
+const FEC_FRAME_TRACK_LIMIT: usize = 256;
+const FEC_PAYLOAD_TRACK_LIMIT: usize = 4_096;
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -48,6 +57,10 @@ struct Cli {
     flow_idle_reset_secs: u64,
     #[arg(long, default_value_t = 100)]
     max_reorder_delay_ms: u64,
+    #[arg(long, action = ArgAction::SetTrue)]
+    repair: bool,
+    #[arg(long, default_value_t = 20)]
+    repair_request_interval_ms: u64,
     #[arg(long)]
     twitch_channel: Option<String>,
     #[arg(long)]
@@ -65,10 +78,23 @@ struct ReceivedPacket {
 }
 
 #[derive(Debug)]
+enum ReceivedFrame {
+    Packet(ReceivedPacket),
+    Fec(ReceivedFecFrame),
+}
+
+#[derive(Debug)]
+struct ReceivedFecFrame {
+    remote: String,
+    frame: FecFrame,
+}
+
+#[derive(Debug)]
 struct FragmentAssembly {
     fragments: Vec<Option<Vec<u8>>>,
     received: usize,
     first_seen: tokio::time::Instant,
+    last_repair_request: Option<tokio::time::Instant>,
 }
 
 impl FragmentAssembly {
@@ -77,6 +103,7 @@ impl FragmentAssembly {
             fragments: vec![None; fragments as usize],
             received: 0,
             first_seen,
+            last_repair_request: None,
         }
     }
 
@@ -99,6 +126,14 @@ impl FragmentAssembly {
         self.received == self.fragments.len()
     }
 
+    fn missing_mask(&self) -> u8 {
+        self.fragments
+            .iter()
+            .enumerate()
+            .filter(|(_, fragment)| fragment.is_none())
+            .fold(0_u8, |mask, (index, _)| mask | (1_u8 << index))
+    }
+
     fn into_payload(self) -> Vec<u8> {
         let total_len = self
             .fragments
@@ -119,6 +154,14 @@ struct BufferedPacket {
     received_at: tokio::time::Instant,
 }
 
+#[derive(Default)]
+struct FecState {
+    frames: BTreeMap<u64, FecFrame>,
+    frame_order: VecDeque<u64>,
+    payloads: BTreeMap<u64, Vec<u8>>,
+    payload_order: VecDeque<u64>,
+}
+
 #[derive(Clone)]
 struct RegisteredConnection {
     connection: iroh::endpoint::Connection,
@@ -128,6 +171,29 @@ struct RegisteredConnection {
 struct RestartDetector {
     count: usize,
     highest_seq: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SkipReason {
+    NeverReceived,
+    FragmentIncomplete,
+}
+
+#[derive(Default)]
+struct RecentSkippedSequences {
+    order: VecDeque<u64>,
+    lookup: HashSet<u64>,
+}
+
+#[derive(Clone)]
+struct RepairControl {
+    connections: ConnectionRegistry,
+    reply_routes: ReplyRoutes,
+}
+
+struct RepairRuntime {
+    control: RepairControl,
+    request_interval: Duration,
 }
 
 type ConnectionRegistry = Arc<RwLock<BTreeMap<String, BTreeMap<usize, RegisteredConnection>>>>;
@@ -141,6 +207,12 @@ async fn main() -> Result<()> {
     }
     if cli.max_reorder_delay_ms == 0 {
         bail!("--max-reorder-delay-ms must be greater than zero");
+    }
+    if cli.repair && cli.repair_request_interval_ms == 0 {
+        bail!("--repair-request-interval-ms must be greater than zero");
+    }
+    if cli.repair && cli.repair_request_interval_ms >= cli.max_reorder_delay_ms {
+        bail!("--repair-request-interval-ms must be less than --max-reorder-delay-ms");
     }
 
     let secret_key = cli.secret.resolve();
@@ -171,7 +243,7 @@ async fn main() -> Result<()> {
             .await
             .context("failed to bind local UDP output socket")?,
     );
-    let (tx, rx) = mpsc::channel::<ReceivedPacket>(1024);
+    let (tx, rx) = mpsc::channel::<ReceivedFrame>(1024);
     let connections: ConnectionRegistry = Arc::new(RwLock::new(BTreeMap::new()));
     let reply_routes: ReplyRoutes = Arc::new(RwLock::new(Vec::new()));
     let health_connections: HealthConnections = Arc::new(RwLock::new(BTreeMap::new()));
@@ -191,6 +263,13 @@ async fn main() -> Result<()> {
         // Client-to-server packets are deduped/reordered centrally before hitting the UDP target.
         let out_socket = out_socket.clone();
         let reply_routes = reply_routes.clone();
+        let repair = cli.repair.then(|| RepairRuntime {
+            control: RepairControl {
+                connections: connections.clone(),
+                reply_routes: reply_routes.clone(),
+            },
+            request_interval: Duration::from_millis(cli.repair_request_interval_ms),
+        });
         let ctx = ctx.clone();
         let flow_idle_reset = Duration::from_secs(cli.flow_idle_reset_secs);
         let max_reorder_delay = Duration::from_millis(cli.max_reorder_delay_ms);
@@ -200,6 +279,7 @@ async fn main() -> Result<()> {
                 out_socket,
                 udp_dest,
                 reply_routes,
+                repair,
                 ctx,
                 flow_idle_reset,
                 max_reorder_delay,
@@ -213,8 +293,9 @@ async fn main() -> Result<()> {
         let out_socket = out_socket.clone();
         let connections = connections.clone();
         let reply_routes = reply_routes.clone();
+        let ctx = ctx.clone();
         tasks.push(tokio::spawn(async move {
-            let _ = response_loop(out_socket, udp_dest, connections, reply_routes).await;
+            let _ = response_loop(out_socket, udp_dest, connections, reply_routes, ctx).await;
         }));
     }
 
@@ -306,8 +387,8 @@ async fn main() -> Result<()> {
 
             loop {
                 match connection.read_datagram().await {
-                    Ok(data) => match parse_packet(&data, remote_key.clone(), stable_id) {
-                        Ok(packet) => {
+                    Ok(data) => match parse_frame(&data, remote_key.clone(), stable_id) {
+                        Ok(ReceivedFrame::Packet(packet)) => {
                             ctx.record_connection_receive(
                                 &remote_key,
                                 data.len() as u64,
@@ -319,13 +400,20 @@ async fn main() -> Result<()> {
                                 packet.payload.len() as u64,
                                 packet.header.sequence,
                             );
-                            if tx.send(packet).await.is_err() {
+                            if tx.send(ReceivedFrame::Packet(packet)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(fec @ ReceivedFrame::Fec(_)) => {
+                            if tx.send(fec).await.is_err() {
                                 break;
                             }
                         }
                         Err(_) => ctx.record_invalid(),
                     },
                     Err(err) => {
+                        let error = err.to_string();
+                        ctx.record_connection_reset(&remote_key, &error);
                         let remaining_connections =
                             remove_connection_if_current(&connections, &remote_key, stable_id);
                         if health_connections
@@ -336,7 +424,7 @@ async fn main() -> Result<()> {
                             health_connections.write().remove(&remote_key);
                         }
                         if !remaining_connections {
-                            ctx.record_disconnect(remote_key.clone(), err.to_string());
+                            ctx.record_disconnect(remote_key.clone(), error);
                         }
                         break;
                     }
@@ -352,21 +440,29 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_packet(data: &[u8], remote: String, connection_id: usize) -> Result<ReceivedPacket> {
+fn parse_frame(data: &[u8], remote: String, connection_id: usize) -> Result<ReceivedFrame> {
     let DecodedPacket { header, payload } = decode_packet(data)?;
-    Ok(ReceivedPacket {
+    if header.sequence == FEC_SEQUENCE {
+        return Ok(ReceivedFrame::Fec(ReceivedFecFrame {
+            remote,
+            frame: decode_fec_frame(data)?,
+        }));
+    }
+
+    Ok(ReceivedFrame::Packet(ReceivedPacket {
         remote,
         connection_id,
         header,
         payload: payload.to_vec(),
-    })
+    }))
 }
 
 async fn reorder_loop(
-    mut rx: mpsc::Receiver<ReceivedPacket>,
+    mut rx: mpsc::Receiver<ReceivedFrame>,
     out_socket: Arc<UdpSocket>,
     out_udp: SocketAddr,
     reply_routes: ReplyRoutes,
+    repair: Option<RepairRuntime>,
     ctx: ServerCtx,
     flow_idle_reset: Duration,
     max_reorder_delay: Duration,
@@ -376,17 +472,22 @@ async fn reorder_loop(
     let mut buffered = BTreeMap::<u64, BufferedPacket>::new();
     let mut fragments = BTreeMap::<u64, FragmentAssembly>::new();
     let mut seen = HashSet::<u64>::new();
+    let mut skipped_sequences = RecentSkippedSequences::default();
+    let mut gap_repair_requests = BTreeMap::<u64, tokio::time::Instant>::new();
     let mut restart_detector = RestartDetector::default();
     let mut flow_connections = HashSet::<usize>::new();
+    let mut fec_state = FecState::default();
 
     loop {
         let timeout_duration = if has_pending_state(&buffered, &fragments, &seen) {
-            max_reorder_delay
+            repair.as_ref().map_or(max_reorder_delay, |repair| {
+                repair.request_interval.min(max_reorder_delay)
+            })
         } else {
             flow_idle_reset
         };
-        let packet = match timeout(timeout_duration, rx.recv()).await {
-            Ok(Some(packet)) => packet,
+        let frame = match timeout(timeout_duration, rx.recv()).await {
+            Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(_) => {
                 if !initialized {
@@ -399,6 +500,10 @@ async fn reorder_loop(
                         &mut buffered,
                         &mut fragments,
                         &mut seen,
+                        &mut skipped_sequences,
+                        &mut gap_repair_requests,
+                        &mut fec_state,
+                        repair.as_ref(),
                         &out_socket,
                         out_udp,
                         max_reorder_delay,
@@ -409,7 +514,48 @@ async fn reorder_loop(
                     initialized = false;
                     next_seq = 0;
                     restart_detector.clear();
+                    skipped_sequences.clear();
+                    gap_repair_requests.clear();
                     flow_connections.clear();
+                    fec_state.clear();
+                }
+                continue;
+            }
+        };
+
+        let packet = match frame {
+            ReceivedFrame::Packet(packet) => packet,
+            ReceivedFrame::Fec(fec) => {
+                fec_state.insert_frame(fec.frame);
+                if initialized {
+                    set_reply_routes(&reply_routes, &fec.remote, false);
+                    recover_fec_ready(
+                        &mut fec_state,
+                        &mut next_seq,
+                        &mut buffered,
+                        &mut fragments,
+                        &mut seen,
+                        &mut gap_repair_requests,
+                        &out_socket,
+                        out_udp,
+                        &ctx,
+                    )
+                    .await?;
+                    advance_reorder_window(
+                        &mut next_seq,
+                        &mut buffered,
+                        &mut fragments,
+                        &mut seen,
+                        &mut skipped_sequences,
+                        &mut gap_repair_requests,
+                        &mut fec_state,
+                        repair.as_ref(),
+                        &out_socket,
+                        out_udp,
+                        max_reorder_delay,
+                        &ctx,
+                    )
+                    .await?;
                 }
                 continue;
             }
@@ -434,11 +580,21 @@ async fn reorder_loop(
                 buffered.clear();
                 fragments.clear();
                 seen.clear();
+                skipped_sequences.clear();
+                gap_repair_requests.clear();
+                fec_state.clear();
                 flow_connections.clear();
                 flow_connections.insert(packet.connection_id);
                 next_seq = packet.header.sequence;
                 set_reply_routes(&reply_routes, &packet.remote, true);
                 ctx.record_flow_reset(next_seq, "confirmed sequence restart");
+            } else if skipped_sequences.contains(packet.header.sequence) {
+                ctx.record_late_after_skip(
+                    packet.header.sequence,
+                    (buffered.len() + fragments.len()) as u64,
+                    next_seq,
+                );
+                continue;
             } else {
                 ctx.record_duplicate(buffered.len() as u64, next_seq);
                 continue;
@@ -488,6 +644,10 @@ async fn reorder_loop(
                     &mut buffered,
                     &mut fragments,
                     &mut seen,
+                    &mut skipped_sequences,
+                    &mut gap_repair_requests,
+                    &mut fec_state,
+                    repair.as_ref(),
                     &out_socket,
                     out_udp,
                     max_reorder_delay,
@@ -504,41 +664,41 @@ async fn reorder_loop(
             assembly.into_payload()
         };
 
-        if packet.header.sequence == next_seq {
-            forward_payload(&out_socket, out_udp, &payload, packet.header).await?;
-            ctx.record_forwarded(
-                payload.len() as u64,
-                buffered.len() as u64,
-                packet.header.sequence,
-                next_sequence(next_seq),
-            );
-            next_seq = next_sequence(next_seq);
-            seen.remove(&packet.header.sequence);
-            drain_ready(
-                &mut next_seq,
-                &mut buffered,
-                &mut seen,
-                &out_socket,
-                out_udp,
-                &ctx,
-            )
-            .await?;
-        } else {
-            buffered.insert(
-                packet.header.sequence,
-                BufferedPacket {
-                    payload,
-                    received_at: tokio::time::Instant::now(),
-                },
-            );
-            ctx.record_buffered(buffered.len() as u64, next_seq);
-        }
+        accept_complete_payload(
+            packet.header.sequence,
+            payload,
+            &mut next_seq,
+            &mut buffered,
+            &mut seen,
+            &mut gap_repair_requests,
+            &mut fec_state,
+            &out_socket,
+            out_udp,
+            &ctx,
+        )
+        .await?;
+        recover_fec_ready(
+            &mut fec_state,
+            &mut next_seq,
+            &mut buffered,
+            &mut fragments,
+            &mut seen,
+            &mut gap_repair_requests,
+            &out_socket,
+            out_udp,
+            &ctx,
+        )
+        .await?;
 
         advance_reorder_window(
             &mut next_seq,
             &mut buffered,
             &mut fragments,
             &mut seen,
+            &mut skipped_sequences,
+            &mut gap_repair_requests,
+            &mut fec_state,
+            repair.as_ref(),
             &out_socket,
             out_udp,
             max_reorder_delay,
@@ -550,18 +710,174 @@ async fn reorder_loop(
     Ok(())
 }
 
+async fn accept_complete_payload(
+    sequence: u64,
+    payload: Vec<u8>,
+    next_seq: &mut u64,
+    buffered: &mut BTreeMap<u64, BufferedPacket>,
+    seen: &mut HashSet<u64>,
+    gap_repair_requests: &mut BTreeMap<u64, tokio::time::Instant>,
+    fec_state: &mut FecState,
+    out_socket: &UdpSocket,
+    out_udp: SocketAddr,
+    ctx: &ServerCtx,
+) -> Result<()> {
+    seen.insert(sequence);
+    fec_state.insert_payload(sequence, payload.clone());
+    if sequence == *next_seq {
+        gap_repair_requests.remove(&sequence);
+        forward_payload(
+            out_socket,
+            out_udp,
+            &payload,
+            PacketHeader {
+                sequence,
+                fragment: 0,
+                fragments: 1,
+            },
+        )
+        .await?;
+        ctx.record_forwarded(
+            payload.len() as u64,
+            buffered.len() as u64,
+            sequence,
+            next_sequence(*next_seq),
+        );
+        seen.remove(&sequence);
+        *next_seq = next_sequence(*next_seq);
+        drain_ready(
+            next_seq,
+            buffered,
+            seen,
+            gap_repair_requests,
+            fec_state,
+            out_socket,
+            out_udp,
+            ctx,
+        )
+        .await?;
+    } else {
+        buffered.insert(
+            sequence,
+            BufferedPacket {
+                payload,
+                received_at: tokio::time::Instant::now(),
+            },
+        );
+        ctx.record_buffered(buffered.len() as u64, *next_seq);
+    }
+
+    Ok(())
+}
+
+async fn recover_fec_ready(
+    fec_state: &mut FecState,
+    next_seq: &mut u64,
+    buffered: &mut BTreeMap<u64, BufferedPacket>,
+    fragments: &mut BTreeMap<u64, FragmentAssembly>,
+    seen: &mut HashSet<u64>,
+    gap_repair_requests: &mut BTreeMap<u64, tokio::time::Instant>,
+    out_socket: &UdpSocket,
+    out_udp: SocketAddr,
+    ctx: &ServerCtx,
+) -> Result<()> {
+    loop {
+        let recovered = fec_state.recover_ready(*next_seq, buffered);
+        if recovered.is_empty() {
+            break;
+        }
+
+        let mut accepted = false;
+        for (sequence, payload) in recovered {
+            if sequence < *next_seq || seen.contains(&sequence) || buffered.contains_key(&sequence)
+            {
+                continue;
+            }
+
+            fragments.remove(&sequence);
+            ctx.record_fec_recovered(sequence, payload.len() as u64);
+            accept_complete_payload(
+                sequence,
+                payload,
+                next_seq,
+                buffered,
+                seen,
+                gap_repair_requests,
+                fec_state,
+                out_socket,
+                out_udp,
+                ctx,
+            )
+            .await?;
+            accepted = true;
+        }
+
+        if !accepted {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 async fn advance_reorder_window(
     next_seq: &mut u64,
     buffered: &mut BTreeMap<u64, BufferedPacket>,
     fragments: &mut BTreeMap<u64, FragmentAssembly>,
     seen: &mut HashSet<u64>,
+    skipped_sequences: &mut RecentSkippedSequences,
+    gap_repair_requests: &mut BTreeMap<u64, tokio::time::Instant>,
+    fec_state: &mut FecState,
+    repair: Option<&RepairRuntime>,
     out_socket: &UdpSocket,
     out_udp: SocketAddr,
     max_reorder_delay: Duration,
     ctx: &ServerCtx,
 ) -> Result<()> {
-    expire_reorder_gap(next_seq, buffered, fragments, seen, max_reorder_delay, ctx);
-    drain_ready(next_seq, buffered, seen, out_socket, out_udp, ctx).await
+    recover_fec_ready(
+        fec_state,
+        next_seq,
+        buffered,
+        fragments,
+        seen,
+        gap_repair_requests,
+        out_socket,
+        out_udp,
+        ctx,
+    )
+    .await?;
+    if let Some(repair) = repair {
+        request_due_repairs(
+            *next_seq,
+            buffered,
+            fragments,
+            gap_repair_requests,
+            repair.request_interval,
+            &repair.control,
+            ctx,
+        );
+    }
+    expire_reorder_gap(
+        next_seq,
+        buffered,
+        fragments,
+        seen,
+        skipped_sequences,
+        gap_repair_requests,
+        max_reorder_delay,
+        ctx,
+    );
+    drain_ready(
+        next_seq,
+        buffered,
+        seen,
+        gap_repair_requests,
+        fec_state,
+        out_socket,
+        out_udp,
+        ctx,
+    )
+    .await
 }
 
 fn has_pending_state(
@@ -572,11 +888,69 @@ fn has_pending_state(
     !(buffered.is_empty() && fragments.is_empty() && seen.is_empty())
 }
 
+fn request_due_repairs(
+    next_seq: u64,
+    buffered: &BTreeMap<u64, BufferedPacket>,
+    fragments: &mut BTreeMap<u64, FragmentAssembly>,
+    gap_repair_requests: &mut BTreeMap<u64, tokio::time::Instant>,
+    repair_request_interval: Duration,
+    repair_control: &RepairControl,
+    ctx: &ServerCtx,
+) {
+    let now = tokio::time::Instant::now();
+    let mut requests = Vec::new();
+
+    if !buffered.contains_key(&next_seq)
+        && !fragments.contains_key(&next_seq)
+        && (!buffered.is_empty() || !fragments.is_empty())
+        && gap_repair_requests
+            .get(&next_seq)
+            .copied()
+            .is_none_or(|last| now.duration_since(last) >= repair_request_interval)
+    {
+        gap_repair_requests.insert(next_seq, now);
+        requests.push(RepairRequest {
+            sequence: next_seq,
+            missing_mask: REPAIR_ALL_FRAGMENTS_MASK,
+        });
+    }
+
+    for (sequence, assembly) in fragments.iter_mut() {
+        if requests.len() >= MAX_REPAIR_REQUESTS_PER_TICK {
+            break;
+        }
+        if assembly
+            .last_repair_request
+            .is_some_and(|last| now.duration_since(last) < repair_request_interval)
+        {
+            continue;
+        }
+
+        let missing_mask = assembly.missing_mask();
+        if missing_mask == 0 {
+            continue;
+        }
+
+        assembly.last_repair_request = Some(now);
+        requests.push(RepairRequest {
+            sequence: *sequence,
+            missing_mask,
+        });
+    }
+
+    for request in requests {
+        ctx.record_repair_request(request.sequence, request.missing_mask);
+        repair_control.send(request);
+    }
+}
+
 fn expire_reorder_gap(
     next_seq: &mut u64,
     buffered: &mut BTreeMap<u64, BufferedPacket>,
     fragments: &mut BTreeMap<u64, FragmentAssembly>,
     seen: &mut HashSet<u64>,
+    skipped_sequences: &mut RecentSkippedSequences,
+    gap_repair_requests: &mut BTreeMap<u64, tokio::time::Instant>,
     max_reorder_delay: Duration,
     ctx: &ServerCtx,
 ) {
@@ -592,7 +966,15 @@ fn expire_reorder_gap(
 
             fragments.remove(next_seq);
             seen.remove(next_seq);
-            skip_sequence(next_seq, buffered, fragments, ctx);
+            skip_sequence(
+                next_seq,
+                buffered,
+                fragments,
+                skipped_sequences,
+                gap_repair_requests,
+                ctx,
+                SkipReason::FragmentIncomplete,
+            );
             continue;
         }
 
@@ -608,7 +990,15 @@ fn expire_reorder_gap(
             break;
         }
 
-        skip_sequence(next_seq, buffered, fragments, ctx);
+        skip_sequence(
+            next_seq,
+            buffered,
+            fragments,
+            skipped_sequences,
+            gap_repair_requests,
+            ctx,
+            SkipReason::NeverReceived,
+        );
     }
 }
 
@@ -616,26 +1006,39 @@ fn skip_sequence(
     next_seq: &mut u64,
     buffered: &BTreeMap<u64, BufferedPacket>,
     fragments: &BTreeMap<u64, FragmentAssembly>,
+    skipped_sequences: &mut RecentSkippedSequences,
+    gap_repair_requests: &mut BTreeMap<u64, tokio::time::Instant>,
     ctx: &ServerCtx,
+    reason: SkipReason,
 ) {
     let skipped = *next_seq;
     *next_seq = next_sequence(*next_seq);
-    ctx.record_reorder_skip(
-        skipped,
-        (buffered.len() + fragments.len()) as u64,
-        *next_seq,
-    );
+    gap_repair_requests.remove(&skipped);
+    skipped_sequences.insert(skipped);
+    let buffered_count = (buffered.len() + fragments.len()) as u64;
+    match reason {
+        SkipReason::NeverReceived => {
+            ctx.record_never_received_skip(skipped, buffered_count, *next_seq);
+        }
+        SkipReason::FragmentIncomplete => {
+            ctx.record_fragment_incomplete_skip(skipped, buffered_count, *next_seq);
+        }
+    }
 }
 
 async fn drain_ready(
     next_seq: &mut u64,
     buffered: &mut BTreeMap<u64, BufferedPacket>,
     seen: &mut HashSet<u64>,
+    gap_repair_requests: &mut BTreeMap<u64, tokio::time::Instant>,
+    fec_state: &mut FecState,
     out_socket: &UdpSocket,
     out_udp: SocketAddr,
     ctx: &ServerCtx,
 ) -> Result<()> {
     while let Some(packet) = buffered.remove(next_seq) {
+        gap_repair_requests.remove(next_seq);
+        fec_state.insert_payload(*next_seq, packet.payload.clone());
         forward_payload(
             out_socket,
             out_udp,
@@ -661,10 +1064,140 @@ async fn drain_ready(
 }
 
 fn next_sequence(sequence: u64) -> u64 {
-    if sequence == MAX_SEQUENCE {
+    if sequence == MAX_MEDIA_SEQUENCE {
         0
     } else {
         sequence + 1
+    }
+}
+
+fn sequence_after(mut sequence: u64, offset: usize) -> u64 {
+    for _ in 0..offset {
+        sequence = next_sequence(sequence);
+    }
+    sequence
+}
+
+impl FecState {
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.frame_order.clear();
+        self.payloads.clear();
+        self.payload_order.clear();
+    }
+
+    fn insert_frame(&mut self, frame: FecFrame) {
+        let base_sequence = frame.base_sequence;
+        if !self.frames.contains_key(&base_sequence) {
+            self.frame_order.push_back(base_sequence);
+        }
+        self.frames.insert(base_sequence, frame);
+        self.enforce_frame_limit();
+    }
+
+    fn insert_payload(&mut self, sequence: u64, payload: Vec<u8>) {
+        if sequence > MAX_MEDIA_SEQUENCE || self.payloads.contains_key(&sequence) {
+            return;
+        }
+
+        self.payload_order.push_back(sequence);
+        self.payloads.insert(sequence, payload);
+        self.enforce_payload_limit();
+    }
+
+    fn recover_ready(
+        &mut self,
+        next_seq: u64,
+        buffered: &BTreeMap<u64, BufferedPacket>,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let bases = self.frames.keys().copied().collect::<Vec<_>>();
+        let mut recovered = Vec::new();
+
+        for base in bases {
+            let Some(frame) = self.frames.get(&base).cloned() else {
+                continue;
+            };
+
+            let mut parity = frame.parity.to_vec();
+            let mut missing = None::<(u64, usize)>;
+            let mut multiple_missing = false;
+            let mut unusable = false;
+
+            for (index, expected_len) in frame.payload_lengths.iter().copied().enumerate() {
+                let sequence = sequence_after(frame.base_sequence, index);
+                if expected_len > parity.len() {
+                    unusable = true;
+                    break;
+                }
+
+                if let Some(payload) = self.payload_for(sequence, buffered) {
+                    if payload.len() != expected_len || payload.len() > parity.len() {
+                        unusable = true;
+                        break;
+                    }
+
+                    for (byte_index, byte) in payload.iter().enumerate() {
+                        parity[byte_index] ^= *byte;
+                    }
+                } else if missing.is_none() {
+                    missing = Some((sequence, expected_len));
+                } else {
+                    multiple_missing = true;
+                    break;
+                }
+            }
+
+            if unusable {
+                self.frames.remove(&base);
+                continue;
+            }
+            if multiple_missing {
+                continue;
+            }
+
+            self.frames.remove(&base);
+            let Some((sequence, expected_len)) = missing else {
+                continue;
+            };
+            if sequence < next_seq {
+                continue;
+            }
+
+            parity.truncate(expected_len);
+            recovered.push((sequence, parity));
+        }
+
+        recovered
+    }
+
+    fn payload_for<'a>(
+        &'a self,
+        sequence: u64,
+        buffered: &'a BTreeMap<u64, BufferedPacket>,
+    ) -> Option<&'a [u8]> {
+        self.payloads.get(&sequence).map(Vec::as_slice).or_else(|| {
+            buffered
+                .get(&sequence)
+                .map(|packet| packet.payload.as_slice())
+        })
+    }
+
+    fn enforce_frame_limit(&mut self) {
+        while self.frames.len() > FEC_FRAME_TRACK_LIMIT {
+            let Some(sequence) = self.frame_order.pop_front() else {
+                break;
+            };
+            self.frames.remove(&sequence);
+        }
+    }
+
+    fn enforce_payload_limit(&mut self) {
+        while self.payloads.len() > FEC_PAYLOAD_TRACK_LIMIT {
+            let Some(sequence) = self.payload_order.pop_front() else {
+                break;
+            };
+            self.payloads.remove(&sequence);
+        }
     }
 }
 
@@ -692,6 +1225,73 @@ impl RestartDetector {
     }
 }
 
+impl RecentSkippedSequences {
+    fn insert(&mut self, sequence: u64) {
+        if self.lookup.insert(sequence) {
+            self.order.push_back(sequence);
+        }
+
+        while self.order.len() > SKIPPED_SEQUENCE_TRACK_LIMIT {
+            if let Some(expired) = self.order.pop_front() {
+                self.lookup.remove(&expired);
+            }
+        }
+    }
+
+    fn contains(&self, sequence: u64) -> bool {
+        self.lookup.contains(&sequence)
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.lookup.clear();
+    }
+}
+
+impl RepairControl {
+    fn send(&self, request: RepairRequest) {
+        let payload = encode_repair_request(request);
+        let connections = {
+            let routes = self.reply_routes.read().clone();
+            let registry = self.connections.read();
+            routes
+                .iter()
+                .filter_map(|remote| registry.get(remote))
+                .flat_map(|connections| {
+                    connections
+                        .values()
+                        .map(|registered| registered.connection.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for connection in connections {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let _ = send_repair_request_stream(connection, payload).await;
+            });
+        }
+    }
+}
+
+async fn send_repair_request_stream(
+    connection: iroh::endpoint::Connection,
+    payload: Bytes,
+) -> Result<()> {
+    let mut stream = timeout(REPAIR_STREAM_TIMEOUT, connection.open_uni())
+        .await
+        .context("timed out opening repair request stream")?
+        .context("failed opening repair request stream")?;
+    stream
+        .write_all(&payload)
+        .await
+        .context("failed writing repair request stream")?;
+    stream
+        .finish()
+        .context("failed finishing repair request stream")?;
+    Ok(())
+}
+
 async fn forward_payload(
     socket: &UdpSocket,
     out_udp: SocketAddr,
@@ -710,6 +1310,7 @@ async fn response_loop(
     udp_dest: SocketAddr,
     connections: ConnectionRegistry,
     reply_routes: ReplyRoutes,
+    ctx: ServerCtx,
 ) -> Result<()> {
     let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];
     loop {
@@ -749,7 +1350,10 @@ async fn response_loop(
                         sent = true;
                         break;
                     }
-                    Err(_) => failed.push(stable_id),
+                    Err(err) => {
+                        ctx.record_send_pressure_drop(&remote, &err.to_string());
+                        failed.push(stable_id);
+                    }
                 }
             }
             if !failed.is_empty() {
@@ -799,10 +1403,12 @@ fn set_reply_routes(reply_routes: &ReplyRoutes, remote: &str, reset: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReceivedPacket, reorder_loop};
+    use super::{ReceivedFecFrame, ReceivedFrame, ReceivedPacket, reorder_loop};
     use crate::context::ServerCtx;
+    use crate::tui::ServerUiState;
+    use bytes::Bytes;
     use parking_lot::RwLock;
-    use protocol::PacketHeader;
+    use protocol::{FecFrame, PacketHeader};
     use std::{sync::Arc, time::Duration};
     use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
 
@@ -820,6 +1426,7 @@ mod tests {
             out_socket,
             out_udp,
             reply_routes,
+            None,
             ctx,
             Duration::from_secs(30),
             Duration::from_millis(20),
@@ -853,6 +1460,7 @@ mod tests {
             out_socket,
             out_udp,
             reply_routes,
+            None,
             ctx,
             Duration::from_secs(30),
             Duration::from_millis(20),
@@ -881,16 +1489,139 @@ mod tests {
         task.await.unwrap().unwrap();
     }
 
-    fn packet(sequence: u64, payload: &[u8]) -> ReceivedPacket {
+    #[tokio::test]
+    async fn classifies_never_received_gap_and_late_arrival() {
+        let out_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let out_udp = recv_socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let reply_routes = Arc::new(RwLock::new(Vec::new()));
+        let ui = ServerUiState::new("test".to_string());
+        let ctx = ServerCtx::new(Some(ui.clone()));
+
+        let task = tokio::spawn(reorder_loop(
+            rx,
+            out_socket,
+            out_udp,
+            reply_routes,
+            None,
+            ctx,
+            Duration::from_secs(30),
+            Duration::from_millis(20),
+        ));
+
+        tx.send(packet(10, b"first")).await.unwrap();
+        assert_eq!(recv_payload(&recv_socket).await, b"first");
+
+        tx.send(packet(12, b"third")).await.unwrap();
+        assert_eq!(recv_payload(&recv_socket).await, b"third");
+
+        tx.send(packet(11, b"late")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(ui.skipped_never_received_packets(), 1);
+        assert_eq!(ui.late_after_skip_packets(), 1);
+
+        drop(tx);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn classifies_incomplete_fragment_skip() {
+        let out_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let out_udp = recv_socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let reply_routes = Arc::new(RwLock::new(Vec::new()));
+        let ui = ServerUiState::new("test".to_string());
+        let ctx = ServerCtx::new(Some(ui.clone()));
+
+        let task = tokio::spawn(reorder_loop(
+            rx,
+            out_socket,
+            out_udp,
+            reply_routes,
+            None,
+            ctx,
+            Duration::from_secs(30),
+            Duration::from_millis(20),
+        ));
+
+        tx.send(fragment_packet(10, 0, 2, b"half")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        assert_eq!(ui.fragment_incomplete_packets(), 1);
+
+        drop(tx);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fec_recovers_one_missing_live_packet() {
+        let out_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let out_udp = recv_socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let reply_routes = Arc::new(RwLock::new(Vec::new()));
+        let ctx = ServerCtx::default();
+
+        let task = tokio::spawn(reorder_loop(
+            rx,
+            out_socket,
+            out_udp,
+            reply_routes,
+            None,
+            ctx,
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        ));
+
+        tx.send(packet(10, b"one")).await.unwrap();
+        assert_eq!(recv_payload(&recv_socket).await, b"one");
+
+        tx.send(packet(12, b"tri")).await.unwrap();
+        tx.send(fec_frame(
+            10,
+            &[b"one".as_slice(), b"two".as_slice(), b"tri".as_slice()],
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(recv_payload(&recv_socket).await, b"two");
+        assert_eq!(recv_payload(&recv_socket).await, b"tri");
+
+        drop(tx);
+        task.await.unwrap().unwrap();
+    }
+
+    fn packet(sequence: u64, payload: &[u8]) -> ReceivedFrame {
         packet_with_connection(1, sequence, payload)
+    }
+
+    fn fragment_packet(
+        sequence: u64,
+        fragment: u8,
+        fragments: u8,
+        payload: &[u8],
+    ) -> ReceivedFrame {
+        ReceivedFrame::Packet(ReceivedPacket {
+            remote: "test".to_string(),
+            connection_id: 1,
+            header: PacketHeader {
+                sequence,
+                fragment,
+                fragments,
+            },
+            payload: payload.to_vec(),
+        })
     }
 
     fn packet_with_connection(
         connection_id: usize,
         sequence: u64,
         payload: &[u8],
-    ) -> ReceivedPacket {
-        ReceivedPacket {
+    ) -> ReceivedFrame {
+        ReceivedFrame::Packet(ReceivedPacket {
             remote: "test".to_string(),
             connection_id,
             header: PacketHeader {
@@ -899,7 +1630,26 @@ mod tests {
                 fragments: 1,
             },
             payload: payload.to_vec(),
+        })
+    }
+
+    fn fec_frame(base_sequence: u64, payloads: &[&[u8]]) -> ReceivedFrame {
+        let max_len = payloads.iter().map(|payload| payload.len()).max().unwrap();
+        let mut parity = vec![0_u8; max_len];
+        for payload in payloads {
+            for (index, byte) in payload.iter().enumerate() {
+                parity[index] ^= *byte;
+            }
         }
+
+        ReceivedFrame::Fec(ReceivedFecFrame {
+            remote: "test".to_string(),
+            frame: FecFrame {
+                base_sequence,
+                payload_lengths: payloads.iter().map(|payload| payload.len()).collect(),
+                parity: Bytes::from(parity),
+            },
+        })
     }
 
     async fn recv_payload(socket: &UdpSocket) -> Vec<u8> {

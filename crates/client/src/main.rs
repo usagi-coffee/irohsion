@@ -6,10 +6,11 @@ mod runtime;
 mod tui;
 
 use std::{
+    collections::{BTreeMap, VecDeque},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -24,10 +25,15 @@ use context::ClientCtx;
 use health::spawn_health_receivers;
 use iroh::{EndpointId, RelayUrl};
 use obs_remote::{ObsConfig, ObsRemote};
-use parking_lot::RwLock;
-use path_strategy::{PathStrategy, StrategyMode, spawn_strategy_loop};
+use parking_lot::{Mutex, RwLock};
+use path_strategy::{
+    PathStrategy, QdiscResetConfig, StrategyInterface, StrategyMode, spawn_strategy_loop,
+};
 use preview::spawn_preview;
-use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_packet};
+use protocol::{
+    FEC_SEQUENCE, FecFrame, MAX_FEC_GROUP_PACKETS, MAX_FRAGMENTS, MAX_MEDIA_SEQUENCE, PacketHeader,
+    RepairRequest, decode_repair_request, encode_fec_frame, encode_packet,
+};
 use runtime::wait_for_shutdown;
 use tokio::{net::UdpSocket, sync::mpsc};
 use transport::{
@@ -39,6 +45,8 @@ const MAX_UDP_PACKET_SIZE: usize = 65_507;
 const MPEG_TS_PACKET_SIZE: usize = 188;
 const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERFACE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+const REPAIR_REQUEST_STREAM_LIMIT: usize = protocol::REPAIR_REQUEST_LEN;
+const REPAIR_REQUEST_DEDUP_WINDOW: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -72,6 +80,14 @@ struct Cli {
     tc_backlog_degrade_bytes: u64,
     #[arg(long, default_value_t = 16_384)]
     tc_backlog_recover_bytes: u64,
+    #[arg(long, action = ArgAction::SetTrue)]
+    tc_qdisc_reset: bool,
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    tc_qdisc_reset_backlog_bytes: u64,
+    #[arg(long, default_value_t = 0.10)]
+    tc_qdisc_reset_max_server_mbps: f32,
+    #[arg(long, default_value_t = 5000)]
+    tc_qdisc_reset_cooldown_ms: u64,
     #[arg(long)]
     remote: bool,
     #[arg(long, default_value = "irohsion")]
@@ -92,6 +108,252 @@ struct Cli {
     obs_recording_bitrate_category: String,
     #[arg(long, default_value = "FFVBitrate")]
     obs_recording_bitrate_name: String,
+    #[arg(long, default_value_t = 500)]
+    repair_cache_ms: u64,
+    #[arg(long, default_value_t = 4096)]
+    repair_cache_packets: usize,
+    #[arg(long, default_value_t = 0)]
+    fec_group_packets: usize,
+}
+
+#[derive(Clone)]
+struct CachedFragment {
+    packet: Arc<Bytes>,
+    payload_len: u64,
+}
+
+struct CachedPacket {
+    fragments: Vec<CachedFragment>,
+    stored_at: Instant,
+}
+
+struct RepairCache {
+    ttl: Duration,
+    max_packets: usize,
+    inner: Mutex<RepairCacheInner>,
+}
+
+#[derive(Default)]
+struct RepairCacheInner {
+    packets: BTreeMap<u64, CachedPacket>,
+    order: VecDeque<u64>,
+    recent_requests: BTreeMap<(u64, u8), Instant>,
+    request_order: VecDeque<(u64, u8)>,
+}
+
+struct FecSourcePacket {
+    sequence: u64,
+    payload: Vec<u8>,
+}
+
+struct FecEncoder {
+    group_size: Option<usize>,
+    packets: Vec<FecSourcePacket>,
+}
+
+impl RepairCache {
+    fn new(ttl: Duration, max_packets: usize) -> Self {
+        Self {
+            ttl,
+            max_packets,
+            inner: Mutex::new(RepairCacheInner::default()),
+        }
+    }
+
+    fn insert(&self, sequence: u64, fragments: Vec<CachedFragment>) {
+        if fragments.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+        Self::expire_locked(&mut inner, now, self.ttl);
+        if !inner.packets.contains_key(&sequence) {
+            inner.order.push_back(sequence);
+        }
+        inner.packets.insert(
+            sequence,
+            CachedPacket {
+                fragments,
+                stored_at: now,
+            },
+        );
+        Self::enforce_limit_locked(&mut inner, self.max_packets);
+    }
+
+    fn fragments_for(&self, request: RepairRequest) -> Vec<CachedFragment> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+        Self::expire_locked(&mut inner, now, self.ttl);
+        Self::expire_recent_requests_locked(&mut inner, now);
+        if !inner.packets.contains_key(&request.sequence) {
+            return Vec::new();
+        }
+        let request_key = (request.sequence, request.missing_mask);
+        if inner
+            .recent_requests
+            .get(&request_key)
+            .is_some_and(|last| now.duration_since(*last) < REPAIR_REQUEST_DEDUP_WINDOW)
+        {
+            return Vec::new();
+        }
+        if !inner.recent_requests.contains_key(&request_key) {
+            inner.request_order.push_back(request_key);
+        }
+        inner.recent_requests.insert(request_key, now);
+        Self::enforce_recent_request_limit_locked(&mut inner, self.max_packets);
+
+        let packet = inner
+            .packets
+            .get(&request.sequence)
+            .expect("packet exists after contains_key check");
+        if packet.fragments.len() == 1 {
+            return packet.fragments.clone();
+        }
+
+        packet
+            .fragments
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| request.missing_mask & (1_u8 << index) != 0)
+            .map(|(_, fragment)| fragment.clone())
+            .collect()
+    }
+
+    fn expire_locked(inner: &mut RepairCacheInner, now: Instant, ttl: Duration) {
+        while let Some(sequence) = inner.order.front().copied() {
+            let expired = inner
+                .packets
+                .get(&sequence)
+                .is_none_or(|packet| now.duration_since(packet.stored_at) >= ttl);
+            if !expired {
+                break;
+            }
+
+            inner.order.pop_front();
+            inner.packets.remove(&sequence);
+        }
+    }
+
+    fn enforce_limit_locked(inner: &mut RepairCacheInner, max_packets: usize) {
+        while inner.packets.len() > max_packets {
+            let Some(sequence) = inner.order.pop_front() else {
+                break;
+            };
+            inner.packets.remove(&sequence);
+        }
+    }
+
+    fn expire_recent_requests_locked(inner: &mut RepairCacheInner, now: Instant) {
+        while let Some(request) = inner.request_order.front().copied() {
+            let expired = inner
+                .recent_requests
+                .get(&request)
+                .is_none_or(|last| now.duration_since(*last) >= REPAIR_REQUEST_DEDUP_WINDOW);
+            if !expired {
+                break;
+            }
+
+            inner.request_order.pop_front();
+            inner.recent_requests.remove(&request);
+        }
+    }
+
+    fn enforce_recent_request_limit_locked(inner: &mut RepairCacheInner, max_packets: usize) {
+        let max_requests = max_packets.saturating_mul(4).max(1);
+        while inner.recent_requests.len() > max_requests {
+            let Some(request) = inner.request_order.pop_front() else {
+                break;
+            };
+            inner.recent_requests.remove(&request);
+        }
+    }
+}
+
+impl FecEncoder {
+    fn new(group_size: usize) -> Result<Self> {
+        let group_size = match group_size {
+            0 => None,
+            1 => bail!("--fec-group-packets must be 0 or at least 2"),
+            count if count > MAX_FEC_GROUP_PACKETS => {
+                bail!("--fec-group-packets must be <= {MAX_FEC_GROUP_PACKETS}")
+            }
+            count => Some(count),
+        };
+
+        Ok(Self {
+            group_size,
+            packets: Vec::new(),
+        })
+    }
+
+    fn record(
+        &mut self,
+        sequence: u64,
+        payload: &[u8],
+        paths: &[transport::PathConnection],
+        strategy: &path_strategy::StrategyState,
+        ctx: &ClientCtx,
+    ) {
+        let Some(group_size) = self.group_size else {
+            return;
+        };
+        if payload.len() > u16::MAX as usize {
+            return;
+        }
+
+        if self.packets.is_empty() {
+            self.packets.reserve(group_size);
+        }
+        self.packets.push(FecSourcePacket {
+            sequence,
+            payload: payload.to_vec(),
+        });
+
+        if self.packets.len() == group_size {
+            self.flush(paths, strategy, ctx);
+        }
+    }
+
+    fn flush(
+        &mut self,
+        paths: &[transport::PathConnection],
+        strategy: &path_strategy::StrategyState,
+        ctx: &ClientCtx,
+    ) {
+        if self.packets.is_empty() {
+            return;
+        }
+
+        let max_len = self
+            .packets
+            .iter()
+            .map(|packet| packet.payload.len())
+            .max()
+            .unwrap_or(0);
+        if max_len == 0 {
+            self.packets.clear();
+            return;
+        }
+
+        let mut parity = vec![0_u8; max_len];
+        let mut payload_lengths = Vec::with_capacity(self.packets.len());
+        for packet in &self.packets {
+            payload_lengths.push(packet.payload.len());
+            for (index, byte) in packet.payload.iter().enumerate() {
+                parity[index] ^= *byte;
+            }
+        }
+
+        let frame = FecFrame {
+            base_sequence: self.packets[0].sequence,
+            payload_lengths,
+            parity: Bytes::from(parity),
+        };
+        let packet = Arc::new(encode_fec_frame(&frame));
+        send_fec_packet(packet, paths, strategy, ctx);
+        self.packets.clear();
+    }
 }
 
 #[tokio::main]
@@ -108,6 +370,12 @@ async fn main() -> Result<()> {
     }
     if cli.mtu == Some(0) {
         bail!("--mtu must be greater than zero when set");
+    }
+    if cli.repair_cache_ms == 0 {
+        bail!("--repair-cache-ms must be greater than zero");
+    }
+    if cli.repair_cache_packets == 0 {
+        bail!("--repair-cache-packets must be greater than zero");
     }
 
     let listen_udp = SocketAddr::V4(SocketAddrV4::new(
@@ -216,17 +484,46 @@ async fn main() -> Result<()> {
     if cli.tc_backlog_recover_bytes > cli.tc_backlog_degrade_bytes {
         bail!("--tc-backlog-recover-bytes must be <= --tc-backlog-degrade-bytes");
     }
+    if cli.tc_qdisc_reset {
+        if cli.tc_qdisc_reset_backlog_bytes == 0 {
+            bail!("--tc-qdisc-reset-backlog-bytes must be greater than zero");
+        }
+        if !(cli.tc_qdisc_reset_max_server_mbps.is_finite()
+            && cli.tc_qdisc_reset_max_server_mbps >= 0.0)
+        {
+            bail!("--tc-qdisc-reset-max-server-mbps must be a finite non-negative number");
+        }
+        if cli.tc_qdisc_reset_cooldown_ms == 0 {
+            bail!("--tc-qdisc-reset-cooldown-ms must be greater than zero");
+        }
+    }
+    let qdisc_reset = cli.tc_qdisc_reset.then(|| QdiscResetConfig {
+        backlog_bytes: cli.tc_qdisc_reset_backlog_bytes,
+        max_server_mbps: cli.tc_qdisc_reset_max_server_mbps,
+        cooldown: Duration::from_millis(cli.tc_qdisc_reset_cooldown_ms),
+    });
     let strategy = spawn_strategy_loop(
         paths
             .iter()
             .zip(health_endpoint_ids.iter())
-            .map(|(path, endpoint_id)| (path.display_name.clone(), endpoint_id.clone()))
+            .map(|(path, endpoint_id)| StrategyInterface {
+                display_name: path.display_name.clone(),
+                device_name: path.interface_name.clone(),
+                endpoint_id: endpoint_id.clone(),
+            })
             .collect(),
         Duration::from_millis(cli.tc_backlog_poll_ms),
         cli.tc_backlog_degrade_bytes,
         cli.tc_backlog_recover_bytes,
+        qdisc_reset,
         ctx.clone(),
     );
+    let repair_cache = Arc::new(RepairCache::new(
+        Duration::from_millis(cli.repair_cache_ms),
+        cli.repair_cache_packets,
+    ));
+    let mut fec = FecEncoder::new(cli.fec_group_packets)?;
+    spawn_repair_control(&paths, repair_cache.clone(), strategy.clone(), ctx.clone());
     let health = spawn_health_receivers(&paths, ctx.clone(), strategy.clone());
     for path in &paths {
         if path.reconnect_requested() {
@@ -432,10 +729,71 @@ async fn main() -> Result<()> {
             &path_names,
             &strategy,
             &ctx,
+            Some(repair_cache.as_ref()),
+            &mut fec,
         );
     }
 
     Ok(())
+}
+
+fn spawn_repair_control(
+    paths: &[transport::PathConnection],
+    repair_cache: Arc<RepairCache>,
+    strategy: path_strategy::StrategyState,
+    ctx: ClientCtx,
+) {
+    let all_paths = Arc::new(paths.to_vec());
+    for path in paths.iter().cloned() {
+        let all_paths = all_paths.clone();
+        let repair_cache = repair_cache.clone();
+        let strategy = strategy.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            loop {
+                let Some(connection) = path.connection() else {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                };
+                let connection_id = connection.stable_id();
+
+                loop {
+                    let mut stream = match connection.accept_uni().await {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    let Ok(payload) = stream.read_to_end(REPAIR_REQUEST_STREAM_LIMIT).await else {
+                        continue;
+                    };
+                    let Ok(request) = decode_repair_request(&payload) else {
+                        continue;
+                    };
+
+                    let fragments = repair_cache.fragments_for(request);
+                    if fragments.is_empty() {
+                        continue;
+                    }
+
+                    for fragment in fragments {
+                        for repair_path in all_paths.iter().filter(|path| path.is_connected()) {
+                            send_on_path(
+                                repair_path,
+                                fragment.packet.clone(),
+                                &strategy,
+                                &ctx,
+                                request.sequence,
+                                fragment.payload_len,
+                            );
+                        }
+                    }
+
+                    if path.connection_id() != Some(connection_id) {
+                        break;
+                    }
+                }
+            }
+        });
+    }
 }
 
 fn spawn_interface_watchers(
@@ -640,15 +998,36 @@ fn send_payload(
     path_names: &[String],
     strategy: &path_strategy::StrategyState,
     ctx: &ClientCtx,
+    repair_cache: Option<&RepairCache>,
+    fec: &mut FecEncoder,
 ) -> u64 {
-    if let Some(next_seq) =
-        send_mpeg_ts_chunks(payload, seq, src, cli, paths, path_names, strategy, ctx)
-    {
+    if let Some(next_seq) = send_mpeg_ts_chunks(
+        payload,
+        seq,
+        src,
+        cli,
+        paths,
+        path_names,
+        strategy,
+        ctx,
+        repair_cache,
+        fec,
+    ) {
         return next_seq;
     }
 
     ctx.ingested_packet(seq, payload.len(), src);
-    send_packet(payload, seq, cli, paths, path_names, strategy, ctx);
+    send_packet(
+        payload,
+        seq,
+        cli,
+        paths,
+        path_names,
+        strategy,
+        ctx,
+        repair_cache,
+        fec,
+    );
     next_sequence(seq)
 }
 
@@ -661,6 +1040,8 @@ fn send_mpeg_ts_chunks(
     path_names: &[String],
     strategy: &path_strategy::StrategyState,
     ctx: &ClientCtx,
+    repair_cache: Option<&RepairCache>,
+    fec: &mut FecEncoder,
 ) -> Option<u64> {
     let chunk_bytes = cli.mpeg_ts_chunk_bytes?;
     if payload.len() <= chunk_bytes || !is_mpeg_ts_payload(payload) {
@@ -683,6 +1064,14 @@ fn send_mpeg_ts_chunks(
         for chunk in chunks {
             ctx.ingested_packet(next_seq, chunk.len(), src);
             let packet = single_fragment_packet(next_seq, chunk);
+            cache_repair_fragments(
+                repair_cache,
+                next_seq,
+                vec![CachedFragment {
+                    packet: packet.clone(),
+                    payload_len: chunk.len() as u64,
+                }],
+            );
             let index = strategy.next_round_robin_index(active_paths.len());
             send_on_path(
                 active_paths[index],
@@ -692,6 +1081,7 @@ fn send_mpeg_ts_chunks(
                 next_seq,
                 chunk.len() as u64,
             );
+            fec.record(next_seq, chunk, paths, strategy, ctx);
             next_seq = next_sequence(next_seq);
         }
         return Some(next_seq);
@@ -701,6 +1091,14 @@ fn send_mpeg_ts_chunks(
         for chunk in chunks {
             ctx.ingested_packet(next_seq, chunk.len(), src);
             let packet = single_fragment_packet(next_seq, chunk);
+            cache_repair_fragments(
+                repair_cache,
+                next_seq,
+                vec![CachedFragment {
+                    packet: packet.clone(),
+                    payload_len: chunk.len() as u64,
+                }],
+            );
             for path in &active_paths {
                 send_on_path(
                     path,
@@ -711,6 +1109,7 @@ fn send_mpeg_ts_chunks(
                     chunk.len() as u64,
                 );
             }
+            fec.record(next_seq, chunk, paths, strategy, ctx);
             next_seq = next_sequence(next_seq);
         }
         return Some(next_seq);
@@ -747,7 +1146,16 @@ fn send_mpeg_ts_chunks(
         for chunk in &chunks[start..end] {
             ctx.ingested_packet(next_seq, chunk.len(), src);
             let packet = single_fragment_packet(next_seq, chunk);
+            cache_repair_fragments(
+                repair_cache,
+                next_seq,
+                vec![CachedFragment {
+                    packet: packet.clone(),
+                    payload_len: chunk.len() as u64,
+                }],
+            );
             send_on_path(path, packet, strategy, ctx, next_seq, chunk.len() as u64);
+            fec.record(next_seq, chunk, paths, strategy, ctx);
             next_seq = next_sequence(next_seq);
         }
     }
@@ -773,6 +1181,8 @@ fn send_packet(
     path_names: &[String],
     strategy: &path_strategy::StrategyState,
     ctx: &ClientCtx,
+    repair_cache: Option<&RepairCache>,
+    fec: &mut FecEncoder,
 ) {
     let active_paths = paths
         .iter()
@@ -852,6 +1262,8 @@ fn send_packet(
             return;
         };
         let fragments = u8::try_from(split_ranges.len()).expect("fragment count fits in u8");
+        let mut sends = Vec::with_capacity(split_ranges.len());
+        let mut cached_fragments = Vec::with_capacity(split_ranges.len());
         for (fragment, (path_index, start, end)) in split_ranges.into_iter().enumerate() {
             let path = split_paths[path_index];
             let packet = Arc::new(encode_packet(
@@ -862,7 +1274,16 @@ fn send_packet(
                 },
                 &payload[start..end],
             ));
-            send_on_path(path, packet, strategy, ctx, seq, (end - start) as u64);
+            let payload_len = (end - start) as u64;
+            cached_fragments.push(CachedFragment {
+                packet: packet.clone(),
+                payload_len,
+            });
+            sends.push((path, packet, payload_len));
+        }
+        cache_repair_fragments(repair_cache, seq, cached_fragments);
+        for (path, packet, payload_len) in sends {
+            send_on_path(path, packet, strategy, ctx, seq, payload_len);
         }
 
         if !rescue_paths.is_empty() {
@@ -874,6 +1295,14 @@ fn send_packet(
                 },
                 payload,
             ));
+            cache_repair_fragments(
+                repair_cache,
+                seq,
+                vec![CachedFragment {
+                    packet: packet.clone(),
+                    payload_len: payload.len() as u64,
+                }],
+            );
             for path in rescue_paths {
                 send_on_path(
                     path,
@@ -885,6 +1314,7 @@ fn send_packet(
                 );
             }
         }
+        fec.record(seq, payload, paths, strategy, ctx);
         return;
     }
 
@@ -896,10 +1326,19 @@ fn send_packet(
         },
         payload,
     ));
+    cache_repair_fragments(
+        repair_cache,
+        seq,
+        vec![CachedFragment {
+            packet: packet.clone(),
+            payload_len: payload.len() as u64,
+        }],
+    );
     if matches!(effective, PathStrategy::RoundRobin) {
         let index = strategy.next_round_robin_index(active_paths.len());
         let path = active_paths[index];
         send_on_path(path, packet, strategy, ctx, seq, payload.len() as u64);
+        fec.record(seq, payload, paths, strategy, ctx);
         return;
     }
 
@@ -913,6 +1352,40 @@ fn send_packet(
             seq,
             payload.len() as u64,
         );
+    }
+    fec.record(seq, payload, paths, strategy, ctx);
+}
+
+fn send_fec_packet(
+    packet: Arc<Bytes>,
+    paths: &[transport::PathConnection],
+    strategy: &path_strategy::StrategyState,
+    ctx: &ClientCtx,
+) {
+    let packet_len = packet.len() as u64;
+    for path in paths.iter().filter(|path| path.is_connected()) {
+        let connection_id = path.connection_id();
+        match path.send(packet.clone()) {
+            Ok(()) => {
+                strategy.record_interface_success(&path.display_name);
+                strategy.record_interface_send(&path.display_name, packet_len);
+                ctx.record_send(path.display_name.clone(), packet_len);
+            }
+            Err(err) => {
+                strategy.record_interface_failure(&path.display_name);
+                if let Some(endpoint) = path.mark_failed(connection_id) {
+                    tokio::spawn(async move {
+                        endpoint.close().await;
+                    });
+                }
+                ctx.record_send_error(path.display_name.clone(), format!("fec send failed: {err}"));
+                ctx.send_failure(&path.display_name, FEC_SEQUENCE, &err.to_string());
+                strategy.degrade_to_redundant(
+                    ctx,
+                    format!("fec send error interface={} error={err}", path.display_name),
+                );
+            }
+        }
     }
 }
 
@@ -952,6 +1425,16 @@ fn send_on_path(
     }
 }
 
+fn cache_repair_fragments(
+    repair_cache: Option<&RepairCache>,
+    sequence: u64,
+    fragments: Vec<CachedFragment>,
+) {
+    if let Some(repair_cache) = repair_cache {
+        repair_cache.insert(sequence, fragments);
+    }
+}
+
 fn should_split(
     packet_len: usize,
     threshold: Option<usize>,
@@ -979,7 +1462,7 @@ fn should_split(
 }
 
 fn next_sequence(sequence: u64) -> u64 {
-    if sequence == MAX_SEQUENCE {
+    if sequence == MAX_MEDIA_SEQUENCE {
         0
     } else {
         sequence + 1
@@ -1059,8 +1542,61 @@ fn mtu_chunked_split_ranges(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_mpeg_ts_payload, packet_split_ranges, should_split, weighted_split_ranges};
+    use super::{
+        CachedFragment, RepairCache, is_mpeg_ts_payload, packet_split_ranges, should_split,
+        weighted_split_ranges,
+    };
     use crate::path_strategy::{PathStrategy, StrategyMode};
+    use bytes::Bytes;
+    use protocol::RepairRequest;
+    use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn repair_cache_returns_requested_split_fragments() {
+        let cache = RepairCache::new(Duration::from_secs(1), 8);
+        cache.insert(
+            7,
+            vec![
+                CachedFragment {
+                    packet: Arc::new(Bytes::from_static(b"first")),
+                    payload_len: 5,
+                },
+                CachedFragment {
+                    packet: Arc::new(Bytes::from_static(b"second")),
+                    payload_len: 6,
+                },
+            ],
+        );
+
+        let fragments = cache.fragments_for(RepairRequest {
+            sequence: 7,
+            missing_mask: 0b0000_0010,
+        });
+
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(&fragments[0].packet[..], b"second");
+        assert_eq!(fragments[0].payload_len, 6);
+    }
+
+    #[test]
+    fn repair_cache_uses_full_packet_for_any_fragment_request() {
+        let cache = RepairCache::new(Duration::from_secs(1), 8);
+        cache.insert(
+            9,
+            vec![CachedFragment {
+                packet: Arc::new(Bytes::from_static(b"full")),
+                payload_len: 4,
+            }],
+        );
+
+        let fragments = cache.fragments_for(RepairRequest {
+            sequence: 9,
+            missing_mask: 0b0000_0100,
+        });
+
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(&fragments[0].packet[..], b"full");
+    }
 
     #[test]
     fn weighted_ranges_cover_packet_once() {

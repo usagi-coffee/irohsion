@@ -207,6 +207,42 @@ impl ClientCtx {
         }
     }
 
+    pub fn record_qdisc_reset(
+        &self,
+        interface: &str,
+        device: &str,
+        backlog_bytes: u64,
+        server_mbps: f32,
+        qdisc: &str,
+    ) {
+        let line = format!(
+            "WARN reset interface qdisc interface={interface} device={device} qdisc={qdisc} backlog_bytes={backlog_bytes} server_mbps={server_mbps:.2}"
+        );
+        if let Some(ui) = &self.ui {
+            ui.push_log_line(line);
+        } else {
+            eprintln!("{line}");
+        }
+    }
+
+    pub fn record_qdisc_reset_failed(
+        &self,
+        interface: &str,
+        device: &str,
+        backlog_bytes: u64,
+        server_mbps: f32,
+        error: &str,
+    ) {
+        let line = format!(
+            "ERROR failed resetting interface qdisc interface={interface} device={device} backlog_bytes={backlog_bytes} server_mbps={server_mbps:.2} error={error}"
+        );
+        if let Some(ui) = &self.ui {
+            ui.push_log_line(line);
+        } else {
+            eprintln!("{line}");
+        }
+    }
+
     pub fn record_strategy_state(&self, mode: &str, effective: &str) {
         if let Some(ui) = &self.ui {
             ui.record_strategy_state(mode.to_string(), effective.to_string());

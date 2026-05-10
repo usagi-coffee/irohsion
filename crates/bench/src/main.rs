@@ -1,9 +1,13 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Result, bail};
+use bytes::Bytes;
 use clap::Parser;
 use iroh::{EndpointId, RelayUrl};
-use protocol::{MAX_FRAGMENTS, MAX_SEQUENCE, PacketHeader, encode_packet};
+use protocol::{
+    FEC_SEQUENCE, FecFrame, MAX_FEC_GROUP_PACKETS, MAX_FRAGMENTS, MAX_MEDIA_SEQUENCE, PacketHeader,
+    encode_fec_frame, encode_packet,
+};
 use tokio::time::{Instant, sleep_until};
 use tracing::{error, info};
 use transport::{build_server_addr, connect_path, resolve_interface_ipv4, transport_kind};
@@ -26,6 +30,101 @@ struct Cli {
     duration_secs: Option<u64>,
     #[arg(long)]
     split_threshold_bytes: Option<usize>,
+    #[arg(long, default_value_t = 0)]
+    fec_group_packets: usize,
+}
+
+struct FecSourcePacket {
+    sequence: u64,
+    payload: Vec<u8>,
+}
+
+struct FecEncoder {
+    group_size: Option<usize>,
+    packets: Vec<FecSourcePacket>,
+}
+
+impl FecEncoder {
+    fn new(group_size: usize) -> Result<Self> {
+        let group_size = match group_size {
+            0 => None,
+            1 => bail!("--fec-group-packets must be 0 or at least 2"),
+            count if count > MAX_FEC_GROUP_PACKETS => {
+                bail!("--fec-group-packets must be <= {MAX_FEC_GROUP_PACKETS}")
+            }
+            count => Some(count),
+        };
+
+        Ok(Self {
+            group_size,
+            packets: Vec::new(),
+        })
+    }
+
+    fn record(&mut self, sequence: u64, payload: &[u8], paths: &[transport::PathConnection]) {
+        let Some(group_size) = self.group_size else {
+            return;
+        };
+        if payload.len() > u16::MAX as usize {
+            return;
+        }
+
+        if self.packets.is_empty() {
+            self.packets.reserve(group_size);
+        }
+        self.packets.push(FecSourcePacket {
+            sequence,
+            payload: payload.to_vec(),
+        });
+
+        if self.packets.len() == group_size {
+            self.flush(paths);
+        }
+    }
+
+    fn flush(&mut self, paths: &[transport::PathConnection]) {
+        if self.packets.is_empty() {
+            return;
+        }
+
+        let max_len = self
+            .packets
+            .iter()
+            .map(|packet| packet.payload.len())
+            .max()
+            .unwrap_or(0);
+        if max_len == 0 {
+            self.packets.clear();
+            return;
+        }
+
+        let mut parity = vec![0_u8; max_len];
+        let mut payload_lengths = Vec::with_capacity(self.packets.len());
+        for packet in &self.packets {
+            payload_lengths.push(packet.payload.len());
+            for (index, byte) in packet.payload.iter().enumerate() {
+                parity[index] ^= *byte;
+            }
+        }
+
+        let frame = FecFrame {
+            base_sequence: self.packets[0].sequence,
+            payload_lengths,
+            parity: Bytes::from(parity),
+        };
+        let packet = Arc::new(encode_fec_frame(&frame));
+        for path in paths {
+            if let Err(err) = path.send(packet.clone()) {
+                error!(
+                    interface = %path.interface_name,
+                    seq = FEC_SEQUENCE,
+                    error = %err,
+                    "failed to send bench fec packet"
+                );
+            }
+        }
+        self.packets.clear();
+    }
 }
 
 #[tokio::main]
@@ -33,6 +132,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    let mut fec = FecEncoder::new(cli.fec_group_packets)?;
 
     let interface_bindings = cli
         .interfaces
@@ -121,6 +221,7 @@ async fn main() -> Result<()> {
             }
         }
 
+        fec.record(seq, &payload, &paths);
         seq = next_sequence(seq);
         sent_packets += 1;
         sent_payload_bytes += cli.packet_size as u64;
@@ -167,7 +268,7 @@ fn should_split(packet_len: usize, threshold: Option<usize>, path_count: usize) 
 }
 
 fn next_sequence(sequence: u64) -> u64 {
-    if sequence == MAX_SEQUENCE {
+    if sequence == MAX_MEDIA_SEQUENCE {
         0
     } else {
         sequence + 1

@@ -61,6 +61,14 @@ impl ServerCtx {
         }
     }
 
+    pub fn record_connection_reset(&self, remote: &str, error: &str) {
+        if let Some(ui) = &self.ui {
+            ui.record_connection_reset();
+        } else {
+            eprintln!("WARN connection reset remote={remote} error={error}");
+        }
+    }
+
     pub fn record_connection_receive(&self, remote: &str, bytes: u64, sequence: u64) {
         if let Some(ui) = &self.ui {
             ui.record_connection_receive(remote, bytes, sequence);
@@ -85,11 +93,33 @@ impl ServerCtx {
         }
     }
 
-    pub fn record_reorder_skip(&self, skipped_seq: u64, buffered: u64, next_seq: u64) {
+    pub fn record_never_received_skip(&self, skipped_seq: u64, buffered: u64, next_seq: u64) {
         if let Some(ui) = &self.ui {
-            ui.record_reorder_skip(buffered, next_seq);
+            ui.record_never_received_skip(buffered, next_seq);
         } else {
-            eprintln!("WARN skipped missing packet sequence={skipped_seq} next_seq={next_seq}");
+            eprintln!(
+                "WARN skipped never-received packet sequence={skipped_seq} next_seq={next_seq}"
+            );
+        }
+    }
+
+    pub fn record_fragment_incomplete_skip(&self, skipped_seq: u64, buffered: u64, next_seq: u64) {
+        if let Some(ui) = &self.ui {
+            ui.record_fragment_incomplete_skip(buffered, next_seq);
+        } else {
+            eprintln!(
+                "WARN skipped incomplete fragmented packet sequence={skipped_seq} next_seq={next_seq}"
+            );
+        }
+    }
+
+    pub fn record_late_after_skip(&self, sequence: u64, buffered: u64, next_seq: u64) {
+        if let Some(ui) = &self.ui {
+            ui.record_late_after_skip(buffered, next_seq);
+        } else {
+            eprintln!(
+                "WARN received stale packet after skip sequence={sequence} next_seq={next_seq}"
+            );
         }
     }
 
@@ -116,8 +146,33 @@ impl ServerCtx {
     pub fn record_flow_reset(&self, next_seq: u64, reason: &str) {
         if let Some(ui) = &self.ui {
             ui.set_flow_start(next_seq);
+            ui.record_flow_reset();
         } else {
             eprintln!("WARN reset packet reorder flow next_seq={next_seq} reason=\"{reason}\"");
+        }
+    }
+
+    pub fn record_send_pressure_drop(&self, remote: &str, error: &str) {
+        if let Some(ui) = &self.ui {
+            ui.record_send_pressure_drop();
+        } else {
+            eprintln!("WARN dropped return datagram remote={remote} error={error}");
+        }
+    }
+
+    pub fn record_repair_request(&self, sequence: u64, missing_mask: u8) {
+        if let Some(ui) = &self.ui {
+            ui.record_repair_request();
+        } else {
+            let _ = (sequence, missing_mask);
+        }
+    }
+
+    pub fn record_fec_recovered(&self, sequence: u64, bytes: u64) {
+        if let Some(ui) = &self.ui {
+            ui.record_fec_recovered();
+        } else {
+            eprintln!("INFO fec recovered packet sequence={sequence} bytes={bytes}");
         }
     }
 }
