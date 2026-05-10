@@ -10,7 +10,9 @@ cargo run -p server -- \
   --port 1935 \
   --secret <server_secret_hex> \
   --flow-idle-reset-secs 30 \
-  --max-reorder-delay-ms 100 \
+  --max-reorder-delay-ms 80 \
+  --repair \
+  --repair-request-interval-ms 12 \
   --relay <relay_url> \
   --relay <relay_url>
 ```
@@ -29,12 +31,10 @@ cargo run -p client -- \
   --endpoint <server_id> \
   --relay <server_relay_url> \
   --split-threshold-bytes 100 \
-  --mtu 1200 \
-  --burst-max-delay-ms 4 \
-  --burst-max-bytes 16384 \
-  --tc-backlog-poll-ms 500 \
-  --tc-backlog-degrade-bytes 65536 \
-  --tc-backlog-recover-bytes 16384 \
+  --mtu 1128 \
+  --tc-backlog-poll-ms 250 \
+  --tc-backlog-degrade-bytes 144384 \
+  --tc-backlog-recover-bytes 36096 \
   --remote \
   --remote-name irohsion \
   --interfaces eth0:<secret_hex> eth1
@@ -46,8 +46,8 @@ cargo run -p client -- \
 - In `redundant` mode, packets are always duplicated across all active interfaces.
 - In `roundrobin` mode, each whole packet is sent on one active interface at a time in rotation.
 - In `auto` mode, `--split-threshold-bytes` and `--mtu` decide when packets split; otherwise packets are duplicated.
-- When `--burst-max-delay-ms` is greater than zero, the client batches outgoing UDP packets for up to that many milliseconds before flushing them. `--burst-max-bytes` optionally forces an earlier flush once the queued burst reaches that many bytes.
 - The `tc` backlog options control a Linux qdisc heuristic for split mode: if any interface backlog reaches `--tc-backlog-degrade-bytes`, the client falls back to redundant full-packet sends for future packets; it returns to split mode when the worst observed backlog is at or below `--tc-backlog-recover-bytes`.
+- Defaults are tuned for a typical 4-5 Mbps 720p60 stream with about 1128-byte UDP payloads.
 - Send errors also force future packets into redundant mode.
 - `--remote` exposes a Linux/BlueZ BLE control service for phones. Media still goes over iroh networking; BLE is only for monitoring and tuning the running client.
 
@@ -82,8 +82,8 @@ cargo run -p bench -- \
   --endpoint <server_id> \
   --relay <server_relay_url> \
   --interfaces eth0 eth1 \
-  --throughput-mbps 20 \
-  --packet-size 1316 \
+  --throughput-mbps 5 \
+  --packet-size 1128 \
   --split-threshold-bytes 100 \
   --duration-secs 30
 ```

@@ -14,8 +14,8 @@ use tokio::process::Command;
 use crate::context::ClientCtx;
 use transport::HealthReport;
 
-const AUTO_SPLIT_HEALTH_STALE_MS: u64 = 2_500;
-const AUTO_SPLIT_DEGRADE_LAG_PACKETS: u64 = 800;
+const AUTO_SPLIT_HEALTH_STALE_MS: u64 = 1_500;
+const AUTO_SPLIT_DEGRADE_LAG_PACKETS: u64 = 120;
 const AUTO_WEIGHT_MIN_RAW_SHARE: f64 = 0.01;
 const AUTO_WEIGHT_MIN_LAG_PENALTY: f64 = 0.35;
 const AUTO_WEIGHT_THROUGHPUT_BLEND: f64 = 0.25;
@@ -24,6 +24,15 @@ const AUTO_WEIGHT_MAX_THROUGHPUT_RATIO: f64 = 2.0;
 const AUTO_SPLIT_MIN_AVERAGE_SERVER_MBPS: f32 = 0.25;
 const AUTO_SPLIT_MIN_SERVER_MBPS_RATIO: f32 = 0.15;
 const AUTO_SPLIT_MIN_SERVER_MBPS: f32 = 0.05;
+const ADAPTIVE_FEC_GOOD_GROUP_PACKETS: usize = 6;
+const ADAPTIVE_FEC_DEGRADED_GROUP_PACKETS: usize = 4;
+const ADAPTIVE_FEC_BAD_GROUP_PACKETS: usize = 3;
+const ADAPTIVE_FEC_DEGRADED_LAG_PACKETS: u64 = 40;
+const ADAPTIVE_FEC_BAD_LAG_PACKETS: u64 = 120;
+const ADAPTIVE_FEC_DEGRADED_SERVER_MBPS_RATIO: f32 = 0.40;
+const ADAPTIVE_FEC_BAD_SERVER_MBPS_RATIO: f32 = 0.15;
+const ADAPTIVE_FEC_MIN_DEGRADED_SERVER_MBPS: f32 = 0.10;
+const ADAPTIVE_FEC_MIN_BAD_SERVER_MBPS: f32 = 0.05;
 const TC_BACKLOG_TIMEOUT: Duration = Duration::from_secs(1);
 const TC_QDISC_REPLACE_TIMEOUT: Duration = Duration::from_secs(1);
 const TC_QDISC_KIND: &str = "fq_codel";
@@ -520,6 +529,17 @@ impl StrategyState {
         let age_ms = unix_ms_now().saturating_sub(health.last_unix_ms);
         (age_ms <= AUTO_SPLIT_HEALTH_STALE_MS).then_some(health)
     }
+
+    pub fn adaptive_fec_group_packets(&self) -> usize {
+        let health = self.health_by_interface.read();
+        let now = unix_ms_now();
+        let fresh = health
+            .values()
+            .copied()
+            .filter(|state| now.saturating_sub(state.last_unix_ms) <= AUTO_SPLIT_HEALTH_STALE_MS)
+            .collect::<Vec<_>>();
+        adaptive_fec_group_packets_for_health(&fresh)
+    }
 }
 
 pub fn spawn_strategy_loop(
@@ -801,6 +821,43 @@ fn qdisc_reset_should_run(
         && health.is_some_and(|health| health.server_mbps <= config.max_server_mbps)
 }
 
+fn adaptive_fec_group_packets_for_health(health: &[InterfaceHealth]) -> usize {
+    if health.is_empty() {
+        return ADAPTIVE_FEC_DEGRADED_GROUP_PACKETS;
+    }
+
+    let best_last_seq = health.iter().filter_map(|state| state.last_seq).max();
+    let worst_lag = best_last_seq
+        .map(|best| {
+            health
+                .iter()
+                .filter_map(|state| state.last_seq.map(|last| best.saturating_sub(last)))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let average_server_mbps =
+        health.iter().map(|state| state.server_mbps).sum::<f32>() / health.len() as f32;
+    let min_server_mbps = health
+        .iter()
+        .map(|state| state.server_mbps)
+        .fold(f32::INFINITY, f32::min);
+    let bad_server_mbps = (average_server_mbps * ADAPTIVE_FEC_BAD_SERVER_MBPS_RATIO)
+        .max(ADAPTIVE_FEC_MIN_BAD_SERVER_MBPS);
+    let degraded_server_mbps = (average_server_mbps * ADAPTIVE_FEC_DEGRADED_SERVER_MBPS_RATIO)
+        .max(ADAPTIVE_FEC_MIN_DEGRADED_SERVER_MBPS);
+
+    if worst_lag >= ADAPTIVE_FEC_BAD_LAG_PACKETS || min_server_mbps <= bad_server_mbps {
+        ADAPTIVE_FEC_BAD_GROUP_PACKETS
+    } else if worst_lag >= ADAPTIVE_FEC_DEGRADED_LAG_PACKETS
+        || min_server_mbps <= degraded_server_mbps
+    {
+        ADAPTIVE_FEC_DEGRADED_GROUP_PACKETS
+    } else {
+        ADAPTIVE_FEC_GOOD_GROUP_PACKETS
+    }
+}
+
 async fn tc_backlog(interface: &str) -> Option<u64> {
     let output = tokio::time::timeout(
         TC_BACKLOG_TIMEOUT,
@@ -868,7 +925,9 @@ fn parse_backlog_bytes(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InterfaceHealth, QdiscResetConfig, blended_auto_weight, normalize_weights,
+        ADAPTIVE_FEC_BAD_GROUP_PACKETS, ADAPTIVE_FEC_DEGRADED_GROUP_PACKETS,
+        ADAPTIVE_FEC_GOOD_GROUP_PACKETS, InterfaceHealth, QdiscResetConfig,
+        adaptive_fec_group_packets_for_health, blended_auto_weight, normalize_weights,
         parse_tc_backlog, path_health_allows_split, qdisc_reset_should_run,
     };
     use std::time::Duration;
@@ -947,5 +1006,74 @@ mod tests {
         assert!(!qdisc_reset_should_run(500, Some(low_health), config));
         assert!(!qdisc_reset_should_run(2_000, Some(ok_health), config));
         assert!(!qdisc_reset_should_run(2_000, None, config));
+    }
+
+    #[test]
+    fn adaptive_fec_group_shrinks_when_path_lags() {
+        let health = [
+            InterfaceHealth {
+                last_seq: Some(2_000),
+                max_seq: Some(2_000),
+                server_mbps: 5.0,
+                last_unix_ms: 1,
+            },
+            InterfaceHealth {
+                last_seq: Some(1_860),
+                max_seq: Some(1_860),
+                server_mbps: 5.0,
+                last_unix_ms: 1,
+            },
+        ];
+
+        assert_eq!(
+            adaptive_fec_group_packets_for_health(&health),
+            ADAPTIVE_FEC_BAD_GROUP_PACKETS
+        );
+    }
+
+    #[test]
+    fn adaptive_fec_group_uses_larger_groups_when_paths_are_healthy() {
+        let health = [
+            InterfaceHealth {
+                last_seq: Some(2_000),
+                max_seq: Some(2_000),
+                server_mbps: 5.0,
+                last_unix_ms: 1,
+            },
+            InterfaceHealth {
+                last_seq: Some(1_980),
+                max_seq: Some(1_980),
+                server_mbps: 4.9,
+                last_unix_ms: 1,
+            },
+        ];
+
+        assert_eq!(
+            adaptive_fec_group_packets_for_health(&health),
+            ADAPTIVE_FEC_GOOD_GROUP_PACKETS
+        );
+    }
+
+    #[test]
+    fn adaptive_fec_group_uses_middle_group_for_moderate_degradation() {
+        let health = [
+            InterfaceHealth {
+                last_seq: Some(2_000),
+                max_seq: Some(2_000),
+                server_mbps: 5.0,
+                last_unix_ms: 1,
+            },
+            InterfaceHealth {
+                last_seq: Some(1_940),
+                max_seq: Some(1_940),
+                server_mbps: 4.0,
+                last_unix_ms: 1,
+            },
+        ];
+
+        assert_eq!(
+            adaptive_fec_group_packets_for_health(&health),
+            ADAPTIVE_FEC_DEGRADED_GROUP_PACKETS
+        );
     }
 }

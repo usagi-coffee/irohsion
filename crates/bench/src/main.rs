@@ -22,9 +22,9 @@ struct Cli {
     relays: Vec<RelayUrl>,
     #[arg(long = "interfaces", required = true, num_args = 1..)]
     interfaces: Vec<String>,
-    #[arg(long, default_value_t = 8.0)]
+    #[arg(long, default_value_t = 5.0)]
     throughput_mbps: f64,
-    #[arg(long, default_value_t = 1316)]
+    #[arg(long, default_value_t = 1128)]
     packet_size: usize,
     #[arg(long)]
     duration_secs: Option<u64>,

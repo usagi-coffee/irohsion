@@ -45,7 +45,7 @@ const FEC_PAYLOAD_TRACK_LIMIT: usize = 4_096;
 struct Cli {
     #[arg(long)]
     port: u16,
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 250)]
     health_interval_ms: u64,
     #[arg(long = "relay")]
     relays: Vec<RelayUrl>,
@@ -55,11 +55,11 @@ struct Cli {
     tui: bool,
     #[arg(long, default_value_t = 30)]
     flow_idle_reset_secs: u64,
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 80)]
     max_reorder_delay_ms: u64,
     #[arg(long, action = ArgAction::SetTrue)]
     repair: bool,
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 12)]
     repair_request_interval_ms: u64,
     #[arg(long)]
     twitch_channel: Option<String>,

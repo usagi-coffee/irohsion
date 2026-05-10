@@ -92,8 +92,10 @@ The system should:
 - accept server repair requests on iroh uni streams
 - resend only requested cached fragments/full packets, bounded by cache TTL and packet count
 - dedupe repeated repair requests for a short window to avoid resend storms
-- expose `--fec-group-packets`; `0` disables FEC, `2..=32` currently emits one XOR parity frame per group
+- expose `--fec-group-packets`; `0` means adaptive FEC, `2..=32` pins a fixed XOR parity group size
+- expose `--no-fec` to disable client FEC entirely
 - currently sends FEC parity frames redundantly over all active paths
+- adaptive FEC currently uses smaller groups under path lag or low server Mbps and larger groups when fresh server health looks clean
 - record FEC overhead in send counters
 - support `--remote` to run an in-process Linux/BlueZ BLE GATT control server
 - BLE remote exposes status and accepts JSON control patches for mode, packet monitoring, target Mbps, and split percentages

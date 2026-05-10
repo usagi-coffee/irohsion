@@ -47,6 +47,7 @@ const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERFACE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const REPAIR_REQUEST_STREAM_LIMIT: usize = protocol::REPAIR_REQUEST_LEN;
 const REPAIR_REQUEST_DEDUP_WINDOW: Duration = Duration::from_millis(10);
+const TYPICAL_LIVE_PACKET_BYTES: u64 = 1_128;
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -74,19 +75,19 @@ struct Cli {
     mtu: Option<usize>,
     #[arg(long)]
     mpeg_ts_chunk_bytes: Option<usize>,
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 250)]
     tc_backlog_poll_ms: u64,
-    #[arg(long, default_value_t = 65_536)]
+    #[arg(long, default_value_t = TYPICAL_LIVE_PACKET_BYTES * 128)]
     tc_backlog_degrade_bytes: u64,
-    #[arg(long, default_value_t = 16_384)]
+    #[arg(long, default_value_t = TYPICAL_LIVE_PACKET_BYTES * 32)]
     tc_backlog_recover_bytes: u64,
     #[arg(long, action = ArgAction::SetTrue)]
     tc_qdisc_reset: bool,
-    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    #[arg(long, default_value_t = TYPICAL_LIVE_PACKET_BYTES * 512)]
     tc_qdisc_reset_backlog_bytes: u64,
-    #[arg(long, default_value_t = 0.10)]
+    #[arg(long, default_value_t = 0.25)]
     tc_qdisc_reset_max_server_mbps: f32,
-    #[arg(long, default_value_t = 5000)]
+    #[arg(long, default_value_t = 3000)]
     tc_qdisc_reset_cooldown_ms: u64,
     #[arg(long)]
     remote: bool,
@@ -112,6 +113,8 @@ struct Cli {
     repair_cache_ms: u64,
     #[arg(long, default_value_t = 4096)]
     repair_cache_packets: usize,
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_fec: bool,
     #[arg(long, default_value_t = 0)]
     fec_group_packets: usize,
 }
@@ -146,8 +149,14 @@ struct FecSourcePacket {
     payload: Vec<u8>,
 }
 
+enum FecGroupMode {
+    Disabled,
+    Adaptive,
+    Fixed(usize),
+}
+
 struct FecEncoder {
-    group_size: Option<usize>,
+    mode: FecGroupMode,
     packets: Vec<FecSourcePacket>,
 }
 
@@ -271,18 +280,19 @@ impl RepairCache {
 }
 
 impl FecEncoder {
-    fn new(group_size: usize) -> Result<Self> {
-        let group_size = match group_size {
-            0 => None,
-            1 => bail!("--fec-group-packets must be 0 or at least 2"),
-            count if count > MAX_FEC_GROUP_PACKETS => {
+    fn new(disabled: bool, group_size: usize) -> Result<Self> {
+        let mode = match (disabled, group_size) {
+            (true, _) => FecGroupMode::Disabled,
+            (false, 0) => FecGroupMode::Adaptive,
+            (false, 1) => bail!("--fec-group-packets must be 0 for adaptive or at least 2"),
+            (false, count) if count > MAX_FEC_GROUP_PACKETS => {
                 bail!("--fec-group-packets must be <= {MAX_FEC_GROUP_PACKETS}")
             }
-            count => Some(count),
+            (false, count) => FecGroupMode::Fixed(count),
         };
 
         Ok(Self {
-            group_size,
+            mode,
             packets: Vec::new(),
         })
     }
@@ -295,7 +305,7 @@ impl FecEncoder {
         strategy: &path_strategy::StrategyState,
         ctx: &ClientCtx,
     ) {
-        let Some(group_size) = self.group_size else {
+        let Some(group_size) = self.target_group_size(strategy) else {
             return;
         };
         if payload.len() > u16::MAX as usize {
@@ -312,6 +322,14 @@ impl FecEncoder {
 
         if self.packets.len() == group_size {
             self.flush(paths, strategy, ctx);
+        }
+    }
+
+    fn target_group_size(&self, strategy: &path_strategy::StrategyState) -> Option<usize> {
+        match self.mode {
+            FecGroupMode::Disabled => None,
+            FecGroupMode::Adaptive => Some(strategy.adaptive_fec_group_packets()),
+            FecGroupMode::Fixed(group_size) => Some(group_size),
         }
     }
 
@@ -522,7 +540,7 @@ async fn main() -> Result<()> {
         Duration::from_millis(cli.repair_cache_ms),
         cli.repair_cache_packets,
     ));
-    let mut fec = FecEncoder::new(cli.fec_group_packets)?;
+    let mut fec = FecEncoder::new(cli.no_fec, cli.fec_group_packets)?;
     spawn_repair_control(&paths, repair_cache.clone(), strategy.clone(), ctx.clone());
     let health = spawn_health_receivers(&paths, ctx.clone(), strategy.clone());
     for path in &paths {
