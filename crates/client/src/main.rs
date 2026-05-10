@@ -48,6 +48,7 @@ const INTERFACE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const REPAIR_REQUEST_STREAM_LIMIT: usize = protocol::REPAIR_REQUEST_LEN;
 const REPAIR_REQUEST_DEDUP_WINDOW: Duration = Duration::from_millis(10);
 const TYPICAL_LIVE_PACKET_BYTES: u64 = 1_128;
+const FEC_FRAME_PAYLOAD_OVERHEAD_WITHOUT_LENGTHS: usize = 5 + 4 + 1;
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -157,6 +158,7 @@ enum FecGroupMode {
 
 struct FecEncoder {
     mode: FecGroupMode,
+    mtu: Option<usize>,
     packets: Vec<FecSourcePacket>,
 }
 
@@ -280,7 +282,7 @@ impl RepairCache {
 }
 
 impl FecEncoder {
-    fn new(disabled: bool, group_size: usize) -> Result<Self> {
+    fn new(disabled: bool, group_size: usize, mtu: Option<usize>) -> Result<Self> {
         let mode = match (disabled, group_size) {
             (true, _) => FecGroupMode::Disabled,
             (false, 0) => FecGroupMode::Adaptive,
@@ -293,6 +295,7 @@ impl FecEncoder {
 
         Ok(Self {
             mode,
+            mtu,
             packets: Vec::new(),
         })
     }
@@ -309,7 +312,19 @@ impl FecEncoder {
             return;
         };
         if payload.len() > u16::MAX as usize {
+            self.flush_or_clear(paths, strategy, ctx);
             return;
+        }
+        if !fec_payload_fits(payload.len(), group_size, self.mtu) {
+            self.flush_or_clear(paths, strategy, ctx);
+            return;
+        }
+        if self
+            .packets
+            .last()
+            .is_some_and(|packet| next_sequence(packet.sequence) != sequence)
+        {
+            self.flush_or_clear(paths, strategy, ctx);
         }
 
         if self.packets.is_empty() {
@@ -320,7 +335,7 @@ impl FecEncoder {
             payload: payload.to_vec(),
         });
 
-        if self.packets.len() == group_size {
+        if self.packets.len() >= group_size {
             self.flush(paths, strategy, ctx);
         }
     }
@@ -371,6 +386,19 @@ impl FecEncoder {
         let packet = Arc::new(encode_fec_frame(&frame));
         send_fec_packet(packet, paths, strategy, ctx);
         self.packets.clear();
+    }
+
+    fn flush_or_clear(
+        &mut self,
+        paths: &[transport::PathConnection],
+        strategy: &path_strategy::StrategyState,
+        ctx: &ClientCtx,
+    ) {
+        if self.packets.len() >= 2 {
+            self.flush(paths, strategy, ctx);
+        } else {
+            self.packets.clear();
+        }
     }
 }
 
@@ -540,7 +568,7 @@ async fn main() -> Result<()> {
         Duration::from_millis(cli.repair_cache_ms),
         cli.repair_cache_packets,
     ));
-    let mut fec = FecEncoder::new(cli.no_fec, cli.fec_group_packets)?;
+    let mut fec = FecEncoder::new(cli.no_fec, cli.fec_group_packets, cli.mtu)?;
     spawn_repair_control(&paths, repair_cache.clone(), strategy.clone(), ctx.clone());
     let health = spawn_health_receivers(&paths, ctx.clone(), strategy.clone());
     for path in &paths {
@@ -1304,7 +1332,7 @@ fn send_packet(
             send_on_path(path, packet, strategy, ctx, seq, payload_len);
         }
 
-        if !rescue_paths.is_empty() {
+        if !rescue_paths.is_empty() && !packet_exceeds_mtu(payload.len(), cli.mtu) {
             let packet = Arc::new(encode_packet(
                 PacketHeader {
                     sequence: seq,
@@ -1461,7 +1489,7 @@ fn should_split(
     mode: StrategyMode,
     strategy: PathStrategy,
 ) -> bool {
-    if matches!(mtu, Some(mtu) if packet_len >= mtu) {
+    if packet_exceeds_mtu(packet_len, mtu) {
         return true;
     }
 
@@ -1517,7 +1545,7 @@ fn packet_split_ranges(
     weights: &[f64],
     mtu: Option<usize>,
 ) -> Option<Vec<(usize, usize, usize)>> {
-    if let Some(max_payload) = mtu.filter(|mtu| packet_len >= *mtu) {
+    if let Some(max_payload) = mtu.filter(|mtu| packet_len > *mtu) {
         return mtu_chunked_split_ranges(packet_len, weights, max_payload);
     }
 
@@ -1532,11 +1560,19 @@ fn packet_split_ranges(
     (ranges.len() <= MAX_FRAGMENTS).then_some(ranges)
 }
 
+fn packet_exceeds_mtu(packet_len: usize, mtu: Option<usize>) -> bool {
+    matches!(mtu, Some(mtu) if packet_len > mtu)
+}
+
 fn mtu_chunked_split_ranges(
     packet_len: usize,
     weights: &[f64],
     max_payload: usize,
 ) -> Option<Vec<(usize, usize, usize)>> {
+    if max_payload == 0 {
+        return None;
+    }
+
     let chunks = (0..packet_len)
         .step_by(max_payload)
         .map(|start| (start, (start + max_payload).min(packet_len)))
@@ -1558,11 +1594,19 @@ fn mtu_chunked_split_ranges(
     Some(ranges)
 }
 
+fn max_fec_source_payload_len(mtu: Option<usize>, group_size: usize) -> Option<usize> {
+    mtu.map(|mtu| mtu.saturating_sub(FEC_FRAME_PAYLOAD_OVERHEAD_WITHOUT_LENGTHS + group_size * 2))
+}
+
+fn fec_payload_fits(payload_len: usize, group_size: usize, mtu: Option<usize>) -> bool {
+    max_fec_source_payload_len(mtu, group_size).is_none_or(|max_len| payload_len <= max_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedFragment, RepairCache, is_mpeg_ts_payload, packet_split_ranges, should_split,
-        weighted_split_ranges,
+        CachedFragment, RepairCache, fec_payload_fits, is_mpeg_ts_payload,
+        max_fec_source_payload_len, packet_split_ranges, should_split, weighted_split_ranges,
     };
     use crate::path_strategy::{PathStrategy, StrategyMode};
     use bytes::Bytes;
@@ -1653,6 +1697,19 @@ mod tests {
     }
 
     #[test]
+    fn fec_payload_cap_keeps_encoded_parity_under_mtu() {
+        assert_eq!(max_fec_source_payload_len(Some(1128), 6), Some(1106));
+        assert!(fec_payload_fits(1106, 6, Some(1128)));
+        assert!(!fec_payload_fits(1107, 6, Some(1128)));
+        assert!(!fec_payload_fits(2256, 6, Some(1128)));
+    }
+
+    #[test]
+    fn fec_payload_has_no_size_cap_without_mtu() {
+        assert!(fec_payload_fits(2256, 6, None));
+    }
+
+    #[test]
     fn detects_mpeg_ts_payloads() {
         let mut payload = vec![0_u8; 376];
         payload[0] = 0x47;
@@ -1733,8 +1790,8 @@ mod tests {
     }
 
     #[test]
-    fn packets_at_mtu_split_even_when_strategy_is_redundant() {
-        assert!(should_split(
+    fn packets_at_mtu_do_not_split_when_strategy_is_redundant() {
+        assert!(!should_split(
             1128,
             Some(10_000),
             Some(1128),
@@ -1758,7 +1815,7 @@ mod tests {
 
     #[test]
     fn explicit_redundant_mode_still_honors_mtu() {
-        assert!(should_split(
+        assert!(!should_split(
             1128,
             Some(100),
             Some(1128),
@@ -1770,7 +1827,7 @@ mod tests {
 
     #[test]
     fn explicit_round_robin_mode_still_honors_mtu() {
-        assert!(should_split(
+        assert!(!should_split(
             1128,
             Some(100),
             Some(1128),
