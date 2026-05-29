@@ -28,6 +28,7 @@ clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
 data-encoding = "2.10"
 iroh = { git = "https://github.com/usagi-coffee/iroh", branch = "bindtodevice" }
+iroh-tickets = "1.0.0-rc.1"
 libc = "0.2"
 modular-bitfield = "0.12"
 obs-remote = { path = "crates/obs-remote" }
@@ -49,4 +50,5 @@ twitch-remote = { path = "crates/twitch-remote" }
 kick-remote = { path = "crates/kick-remote" }
 
 [patch.crates-io]
+iroh-base = { git = "https://github.com/usagi-coffee/iroh", branch = "bindtodevice" }
 netwatch = { git = "https://github.com/usagi-coffee/net-tools" }

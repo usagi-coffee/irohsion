@@ -20,6 +20,7 @@ use health::{
     maintain_health_connection, record_health_sample,
 };
 use iroh::{Endpoint, RelayUrl, endpoint::presets};
+use iroh_tickets::endpoint::EndpointTicket;
 use kick_remote::spawn_kick_chat;
 use parking_lot::RwLock;
 use protocol::{
@@ -49,6 +50,8 @@ struct Cli {
     health_interval_ms: u64,
     #[arg(long = "relay")]
     relays: Vec<RelayUrl>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    ticket: bool,
     #[arg(long, default_value = "", hide_default_value = true)]
     secret: SecretArg,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
@@ -234,8 +237,12 @@ async fn main() -> Result<()> {
 
     endpoint.online().await;
     let server_addrs = tui::server_addrs(&endpoint);
+    let server_ticket = cli
+        .ticket
+        .then(|| EndpointTicket::new(endpoint.addr()).to_string());
     ctx.set_endpoint(endpoint.id().to_string());
     ctx.set_health_endpoint(Some("auto".to_string()));
+    ctx.set_ticket(server_ticket);
     ctx.set_server_addrs(server_addrs);
 
     let out_socket = Arc::new(

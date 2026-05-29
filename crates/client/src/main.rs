@@ -24,6 +24,7 @@ use client_remote::{
 use context::ClientCtx;
 use health::spawn_health_receivers;
 use iroh::{EndpointId, RelayUrl};
+use iroh_tickets::endpoint::EndpointTicket;
 use obs_remote::{ObsConfig, ObsRemote};
 use parking_lot::{Mutex, RwLock};
 use path_strategy::{
@@ -57,7 +58,9 @@ struct Cli {
     #[arg(long, default_value = "", hide_default_value = true)]
     secret: SecretArg,
     #[arg(long)]
-    endpoint: EndpointId,
+    endpoint: Option<EndpointId>,
+    #[arg(long)]
+    ticket: Option<EndpointTicket>,
     #[arg(long = "addr")]
     addrs: Vec<SocketAddr>,
     #[arg(long = "relay")]
@@ -424,11 +427,28 @@ async fn main() -> Result<()> {
         bail!("--repair-cache-packets must be greater than zero");
     }
 
+    if cli.ticket.is_some() && (cli.endpoint.is_some() || !cli.addrs.is_empty()) {
+        bail!("--ticket cannot be combined with --endpoint or --addr");
+    }
+
     let listen_udp = SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::LOCALHOST,
         cli.port.unwrap_or(0),
     ));
-    let server_addr = build_server_addr(cli.endpoint, &cli.addrs, &cli.relays)?;
+    let server_addr = if let Some(ticket) = cli.ticket.clone() {
+        ticket.into()
+    } else {
+        let endpoint = cli.endpoint.context("--endpoint is required unless --ticket is used")?;
+        build_server_addr(endpoint, &cli.addrs, &cli.relays)?
+    };
+    let server_endpoint = server_addr.id.to_string();
+    let server_addrs = server_addr.ip_addrs().copied().collect::<Vec<_>>();
+    let server_relays = server_addr.relay_urls().cloned().collect::<Vec<_>>();
+    let connect_relays = if cli.relays.is_empty() {
+        server_relays.clone()
+    } else {
+        cli.relays.clone()
+    };
     let listen_socket = Arc::new(
         UdpSocket::bind(listen_udp)
             .await
@@ -441,7 +461,7 @@ async fn main() -> Result<()> {
                 .local_addr()
                 .expect("listen socket has local addr")
                 .port(),
-            cli.endpoint.to_string(),
+            server_endpoint.clone(),
             "-".to_string(),
             interface_configs
                 .iter()
@@ -484,7 +504,7 @@ async fn main() -> Result<()> {
             binding.clone(),
             server_addr.clone(),
             secret_key.clone(),
-            &cli.relays,
+            &connect_relays,
         )
         .await
         {
@@ -514,7 +534,7 @@ async fn main() -> Result<()> {
                     format!("initial connect failed, retrying: {err}"),
                 );
                 ctx.reconnect_failed(&binding.display_name, &err.to_string());
-                PathConnection::pending(binding, server_addr.clone(), secret_key, &cli.relays)
+                PathConnection::pending(binding, server_addr.clone(), secret_key, &connect_relays)
             }
         };
         paths.push(path);
@@ -659,9 +679,9 @@ async fn main() -> Result<()> {
         spawn_remote_server(RemoteServer {
             config: RemoteConfig {
                 name: cli.remote_name.clone(),
-                endpoint: cli.endpoint,
-                addrs: cli.addrs.clone(),
-                relays: cli.relays.clone(),
+                endpoint: server_addr.id,
+                addrs: server_addrs.clone(),
+                relays: server_relays.clone(),
             },
             control,
             preview: remote_preview,

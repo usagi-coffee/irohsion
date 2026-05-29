@@ -32,6 +32,7 @@ pub struct ServerUiState {
     started_at: Instant,
     endpoint: Arc<RwLock<String>>,
     health_endpoint: Arc<RwLock<String>>,
+    ticket: Arc<RwLock<Option<String>>>,
     udp_dest: String,
     server_addrs: Arc<RwLock<Vec<String>>>,
     quit_requested: Arc<AtomicBool>,
@@ -115,6 +116,7 @@ impl ServerUiState {
             started_at: Instant::now(),
             endpoint: Arc::new(RwLock::new("-".to_string())),
             health_endpoint: Arc::new(RwLock::new("-".to_string())),
+            ticket: Arc::new(RwLock::new(None)),
             udp_dest,
             server_addrs: Arc::new(RwLock::new(Vec::new())),
             quit_requested: Arc::new(AtomicBool::new(false)),
@@ -147,6 +149,10 @@ impl ServerUiState {
 
     pub fn set_server_addrs(&self, addrs: Vec<String>) {
         *self.server_addrs.write() = addrs;
+    }
+
+    pub fn set_ticket(&self, ticket: Option<String>) {
+        *self.ticket.write() = ticket;
     }
 
     pub fn set_health_endpoint(&self, endpoint: Option<String>) {
@@ -462,6 +468,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ServerUiState, snapshot: &mut Sn
         Line::from(format!(
             "relay  {}",
             format_addrs(&state.server_addrs.read(), "relay:")
+        )),
+        Line::from(format!(
+            "ticket {}",
+            state.ticket.read().as_deref().unwrap_or("-")
         )),
     ])
     .block(Block::default().borders(Borders::ALL).title("Overview"))

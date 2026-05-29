@@ -32,6 +32,15 @@ impl ServerCtx {
         }
     }
 
+    pub fn set_ticket(&self, ticket: Option<String>) {
+        if let Some(ui) = &self.ui {
+            ui.set_ticket(ticket.clone());
+        }
+        if let Some(ticket) = ticket {
+            println!("INFO server_ticket={ticket}");
+        }
+    }
+
     pub fn set_health_endpoint(&self, endpoint: Option<String>) {
         if let Some(ui) = &self.ui {
             ui.set_health_endpoint(endpoint.clone());

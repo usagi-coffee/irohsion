@@ -11,6 +11,7 @@ client-remote.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 iroh.workspace = true
+iroh-tickets.workspace = true
 libc.workspace = true
 obs-remote.workspace = true
 parking_lot.workspace = true
