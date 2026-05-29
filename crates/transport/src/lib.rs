@@ -297,7 +297,7 @@ pub fn resolve_interface_ipv4(name: &str) -> Result<InterfaceBinding> {
     })
 }
 
-pub fn transport_kind(path: &iroh::endpoint::PathInfo) -> &'static str {
+pub fn transport_kind(path: &iroh::endpoint::Path<'_>) -> &'static str {
     if path.is_ip() {
         "direct"
     } else if path.is_relay() {

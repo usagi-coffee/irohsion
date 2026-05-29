@@ -276,11 +276,11 @@ fn next_sequence(sequence: u64) -> u64 {
 }
 
 fn log_connection_paths(interface_name: &str, connection: &iroh::endpoint::Connection) {
-    for path in connection.paths() {
+    let paths = connection.paths();
+    for path in &paths {
         info!(
             interface = interface_name,
             selected = path.is_selected(),
-            closed = path.is_closed(),
             transport = transport_kind(&path),
             remote_addr = %path.remote_addr(),
             "bench connection path"

@@ -80,8 +80,11 @@ pub struct ClientUi {
 }
 
 pub fn describe_paths(connection: &iroh::endpoint::Connection, endpoint_id: &str) -> Vec<PathRow> {
-    let paths = selected_paths(connection);
+    let paths = connection.paths();
+    let has_selected = paths.iter().any(|path| path.is_selected());
     paths
+        .iter()
+        .filter(|path| !has_selected || path.is_selected())
         .map(|path| PathRow {
             endpoint_id: endpoint_id.to_string(),
             split_percentage: None,
@@ -90,25 +93,9 @@ pub fn describe_paths(connection: &iroh::endpoint::Connection, endpoint_id: &str
             remote_addr: path.remote_addr().to_string(),
             transport: transport_kind(&path).to_string(),
             selected: path.is_selected(),
-            status: if path.is_closed() { "closed" } else { "up" }.to_string(),
+            status: "up".to_string(),
         })
         .collect()
-}
-
-fn selected_paths(
-    connection: &iroh::endpoint::Connection,
-) -> impl Iterator<Item = iroh::endpoint::PathInfo> {
-    let paths = connection.paths().into_iter().collect::<Vec<_>>();
-    let selected = paths
-        .iter()
-        .filter(|path| path.is_selected())
-        .cloned()
-        .collect::<Vec<_>>();
-    if selected.is_empty() {
-        paths.into_iter()
-    } else {
-        selected.into_iter()
-    }
 }
 
 impl ClientUiState {

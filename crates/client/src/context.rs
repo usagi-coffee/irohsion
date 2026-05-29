@@ -281,32 +281,22 @@ impl ClientCtx {
         log_paths: bool,
     ) {
         if log_paths {
-            let paths = connection.paths().into_iter().collect::<Vec<_>>();
-            let selected_paths = paths
-                .iter()
-                .filter(|path| path.is_selected())
-                .collect::<Vec<_>>();
-            let paths_to_log = if selected_paths.is_empty() {
-                paths.iter().collect::<Vec<_>>()
-            } else {
-                selected_paths
-            };
-            for path in paths_to_log {
+            let paths = connection.paths();
+            let has_selected = paths.iter().any(|path| path.is_selected());
+            for path in paths.iter().filter(|path| !has_selected || path.is_selected()) {
                 if let Some(ui) = &self.ui {
                     ui.push_log_line(format!(
-                        "INFO connection path interface={} selected={} closed={} transport={} remote_addr={}",
+                        "INFO connection path interface={} selected={} transport={} remote_addr={}",
                         interface,
                         path.is_selected(),
-                        path.is_closed(),
                         transport_kind(&path),
                         path.remote_addr()
                     ));
                 } else {
                     println!(
-                        "INFO connection path interface={} selected={} closed={} transport={} remote_addr={}",
+                        "INFO connection path interface={} selected={} transport={} remote_addr={}",
                         interface,
                         path.is_selected(),
-                        path.is_closed(),
                         transport_kind(&path),
                         path.remote_addr()
                     );
